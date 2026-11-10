@@ -208,9 +208,7 @@ Use the server's base URL: iu2u appends `/v1/systemone`. The API key is sent as 
 
 ## Codex
 
-**Experimental: this integration has not been tested end to end.**
-
-The intended setup uses `iu2u mcp` as an MCP server in `~/.codex/config.toml`, with `IU2U_MODEL` and the other server settings available to the process. The guard integration uses `iu2u hook guard` as a `PreToolUse` command hook with matcher `Bash`.
+Add `iu2u mcp` as an MCP server in `~/.codex/config.toml`, with `IU2U_MODEL` and the other server settings available to the process. For the guard, register `iu2u hook guard` as a `PreToolUse` command hook with matcher `Bash`.
 
 The Codex adapter cannot request approval from a hook: it **blocks** commands it would ask about in Claude Code. If the model cannot judge, it makes **no permission decision**, leaving Codex's own rules in charge.
 
