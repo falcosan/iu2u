@@ -1,0 +1,82 @@
+{
+  "name": "iu2u",
+  "displayName": "iu2u",
+  "version": "0.1.0",
+  "description": "Powers for coding agents backed by any fast decision model, local or hosted: a shell-command guard that never auto-allows, proof before claiming done, output trimming, skill hints, compaction guidance, and tools to weigh, rank, seek and lint",
+  "author": {
+    "name": "Daniele Falchetti"
+  },
+  "repository": "https://github.com/falcosan/iu2u",
+  "license": "Apache-2.0",
+  "keywords": [
+    "decision-model",
+    "mcp",
+    "hooks",
+    "guardrails",
+    "classification"
+  ],
+  "userConfig": {
+    "base_url": {
+      "type": "string",
+      "title": "Decision model URL",
+      "description": "Any server that answers POST /v1/systemone, local or hosted. The default is a local server on port 11435",
+      "default": "http://127.0.0.1:11435"
+    },
+    "model": {
+      "type": "string",
+      "title": "Model",
+      "description": "Model name on that server",
+      "required": true
+    },
+    "api_key": {
+      "type": "string",
+      "title": "API key",
+      "description": "Bearer key for hosted servers; leave empty for a local one",
+      "sensitive": true,
+      "default": ""
+    },
+    "guard": {
+      "type": "boolean",
+      "title": "Guard shell commands",
+      "description": "Block or escalate risky shell commands before they run; never auto-allows",
+      "default": true
+    },
+    "proof": {
+      "type": "boolean",
+      "title": "Require proof before done",
+      "description": "Stop the agent from declaring work done without reporting checks it ran",
+      "default": true
+    },
+    "trim": {
+      "type": "boolean",
+      "title": "Trim long command output",
+      "description": "Hide irrelevant parts of long command output; the full output is saved to a file. Do not combine with another hook that redacts command output: only one rewrite is kept",
+      "default": false
+    },
+    "compass": {
+      "type": "boolean",
+      "title": "Skill hints",
+      "description": "Suggest the personal or project skill that fits each request",
+      "default": false
+    },
+    "prune": {
+      "type": "boolean",
+      "title": "Compaction guidance",
+      "description": "Tell compaction which steps to keep in detail and which to drop",
+      "default": false
+    }
+  },
+  "mcpServers": {
+    "iu2u": {
+      "command": "iu2u",
+      "args": [
+        "mcp"
+      ],
+      "env": {
+        "IU2U_BASE_URL": "${user_config.base_url}",
+        "IU2U_MODEL": "${user_config.model}",
+        "IU2U_API_KEY": "${user_config.api_key}"
+      }
+    }
+  }
+}

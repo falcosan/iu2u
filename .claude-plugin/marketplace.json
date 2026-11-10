@@ -1,0 +1,14 @@
+{
+  "name": "iu2u",
+  "description": "Decision-model powers for coding agents",
+  "owner": {
+    "name": "Daniele Falchetti"
+  },
+  "plugins": [
+    {
+      "name": "iu2u",
+      "source": "./plugins/iu2u",
+      "description": "Powers for coding agents backed by any fast decision model, local or hosted"
+    }
+  ]
+}
