@@ -1,4 +1,4 @@
-<img src="assets/iu2u.svg" alt="iu2u logo" width="200">
+<p align="center"><img src="assets/iu2u.svg" alt="iu2u logo" width="200"></p>
 
 # iu2u
 
@@ -80,33 +80,6 @@ echo '{"goal":"log in","screen":"...","actions":{"login":"Click Log in","help":"
 ```
 
 `filter` prints each matching line as soon as it is judged and, like grep, exits with 1 when no line matches and 2 on an error. `next` returns the action, its confidence, and the probabilities that the goal is done or stuck.
-
-## Safety
-
-- Everything you send goes to the model server you configure. Use a local server for private code.
-- Text inside the judged material can steer a decision model. iu2u keeps each state minimal and treats it as data, but never let a decision alone approve an action that moves money, data, access or code.
-- `seek` and `lint` read the files the agent passes them, with your user's permissions. Claude Code's permission rules, such as a `Read` deny rule, do not apply to them.
-- Do not turn on `trim` next to another hook that rewrites or redacts command output. Claude Code runs those hooks on the original output and keeps only the last rewrite, so `trim` can bring back what the other hook hid.
-
-## Development
-
-```text
-.claude-plugin/marketplace.json   marketplace that lists the plugin
-plugins/iu2u/                     the plugin: manifest, hooks, skills
-src/model/                        decision model client and our question and answer types
-src/hooks/                        one file per hook power
-src/tools/                        one file per tool
-src/commands/                     command line powers
-src/mcp.rs                        MCP server over the tools
-tests/                            integration tests against a mocked model server
-```
-
-```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-claude plugin validate .
-claude plugin validate plugins/iu2u
-```
 
 ## License
 
