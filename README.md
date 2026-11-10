@@ -1,3 +1,5 @@
+<img src="assets/iu2u.svg" alt="iu2u logo" width="200">
+
 # iu2u
 
 Powers for coding agents, backed by a fast decision model of your choice.
