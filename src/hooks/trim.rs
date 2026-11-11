@@ -43,7 +43,7 @@ pub(super) async fn run(input: &Value, client: &Client) -> Result<String> {
     let question = Questions::from([(
         "matters".into(),
         Question::yesno(&format!(
-            "This part of the output of `{}` matters for why it was run ({}): errors, failures, warnings, results or values that purpose needs.",
+            "Does this part of the output of `{}` contain an error, a failure, a warning, or a result or value needed for this purpose: {}?",
             clip(command, ITEM_CHARS),
             clip(purpose, ITEM_CHARS)
         )),

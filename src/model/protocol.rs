@@ -13,7 +13,9 @@ pub type Answers = BTreeMap<String, Answer>;
 #[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Question {
-    #[schemars(description = "A statement; the answer is the probability that it is true")]
+    #[schemars(
+        description = "A statement or a yes-or-no question; the answer is the probability that it is true, or that the answer is yes"
+    )]
     Yesno { text: String },
     #[schemars(description = "Pick one option; options map each label to a one-line description")]
     Pick {
@@ -57,7 +59,15 @@ impl Question {
     }
 
     pub(super) fn to_wire(&self) -> Value {
-        let instructions = |text: &str| format!("{text} {DATA_ONLY}");
+        let instructions = |text: &str| {
+            let text = text.trim_end();
+            let stop = if text.ends_with(['.', '!', '?']) {
+                ""
+            } else {
+                "."
+            };
+            format!("{text}{stop} {DATA_ONLY}")
+        };
         match self {
             Self::Yesno { text } => json!({ "type": "noul", "instructions": instructions(text) }),
             Self::Pick { text, options } => {
@@ -137,6 +147,7 @@ mod tests {
         let questions = Questions::from([
             ("a".into(), Question::yesno("It rains.")),
             ("b".into(), Question::scale("How bad?", &["low", "high"])),
+            ("d".into(), Question::yesno("It snows ")),
             (
                 "c".into(),
                 Question::Pick {
@@ -150,7 +161,8 @@ mod tests {
             json!({
                 "a": { "type": "noul", "instructions": format!("It rains. {DATA_ONLY}") },
                 "b": { "type": "score", "instructions": format!("How bad? {DATA_ONLY}"), "criteria": ["low", "high"] },
-                "c": { "type": "choice", "instructions": format!("Team? {DATA_ONLY}"), "criteria": { "x": "X" } }
+                "c": { "type": "choice", "instructions": format!("Team? {DATA_ONLY}"), "criteria": { "x": "X" } },
+                "d": { "type": "noul", "instructions": format!("It snows. {DATA_ONLY}") }
             })
         );
     }

@@ -23,7 +23,7 @@ Do not use them for summaries, explanations, plans, code, or anything that needs
 
 ## How to ask with `weigh`
 
-- `yesno`: `text` is a statement ("The email asks for a refund."). The answer `yes` is the probability that it is true.
+- `yesno`: `text` is a statement ("The email asks for a refund.") or a yes-or-no question ("Does the email ask for a refund?"). The answer `yes` is the probability that it is true, or that the answer is yes.
 - `pick`: `options` maps each label to a one-line description, 2 to 255 options.
 - `scale`: `levels` lists 2 to 10 levels from lowest to highest. The answer `level` is the expected level.
 - One fact per question. Several small questions beat one compound question.

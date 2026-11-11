@@ -353,7 +353,7 @@ async fn an_inconclusive_claim_fails_the_script_and_records_nothing() {
     )
     .await;
     let script = script(
-        "unsure",
+        "inconclusive",
         "<!doctype html><p>Hello</p>",
         "open PAGE\nexpect the page greets the visitor\n",
     );
@@ -869,7 +869,7 @@ async fn act_waits_out_a_screen_that_is_still_loading_and_replays_it_locked() {
         ],
     )
     .await;
-    let page = r#"<!doctype html><button onclick="out.textContent = 'Loading'; setTimeout(() => { out.textContent = 'Finished'; setTimeout(() => { out.textContent = 'Expired'; }, 4000); }, 6000)">Save</button><p id="out"></p>"#;
+    let page = r#"<!doctype html><button onclick="out.textContent = 'Loading'; setTimeout(() => { out.textContent = 'Finished'; setTimeout(() => { out.textContent = 'Expired'; }, 4000); }, 8000)">Save</button><p id="out"></p>"#;
     let script = script("slow", page, "open PAGE\ndo save the draft\n");
     let (output, report) = act(&script, Some(&model), false);
     assert_eq!(output.status.code(), Some(0), "{report}");
@@ -880,7 +880,7 @@ async fn act_waits_out_a_screen_that_is_still_loading_and_replays_it_locked() {
     assert_eq!(locked.status.code(), Some(0), "{replayed}");
     assert_eq!(vias(&replayed), ["browser", "replay"]);
 
-    edit_page(&script, "}, 6000)", "}, 0)");
+    edit_page(&script, "}, 8000)", "}, 0)");
     let (fast, replayed) = act(&script, None, true);
     assert_eq!(fast.status.code(), Some(0), "{replayed}");
 }
