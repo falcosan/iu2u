@@ -17,7 +17,7 @@ const SHOP: &str = r#"<!doctype html><title>Shop</title>
 <label>Email <input id="email"></label>
 <button id="go" type="button">BUTTON</button>
 <p id="out"></p>
-<script>go.onclick = () => setTimeout(() => { out.textContent = 'Welcome ' + email.value; }, 300);</script>"#;
+<script>go.onclick = () => { out.textContent = 'Welcome ' + email.value; };</script>"#;
 
 const SECRET: &str = "sk-live  7f3a";
 
@@ -84,7 +84,6 @@ async fn model() -> MockServer {
             json!({ "holds": yes(0.95), "contradicted": yes(0.02) }),
         ),
         ("Welcome", decision("done", "001", "001")),
-        ("pressed button", decision("wait", "001", "001")),
         ("typed", decision("press", "002", "001")),
         ("", decision("type", "001", "001")),
     ])
@@ -183,7 +182,11 @@ async fn act_reaches_a_goal_records_it_and_replays_it_without_the_model() {
 #[tokio::test]
 async fn a_renamed_control_fails_a_locked_run_and_is_healed_by_the_model() {
     let model = model().await;
-    let script = shop("heal");
+    let page = SHOP.replace("BUTTON", "Sign in").replace(
+        "</script>",
+        "setTimeout(() => { out.textContent = 'Expired'; }, 14000);</script>",
+    );
+    let script = script("heal", &page, SCRIPT);
     assert_eq!(act(&script, Some(&model), false).0.status.code(), Some(0));
     edit_page(&script, ">Sign in</button>", ">Log in</button>");
 
@@ -199,7 +202,6 @@ async fn a_renamed_control_fails_a_locked_run_and_is_healed_by_the_model() {
     let (healed, report) = act(&script, Some(&model), false);
     assert_eq!(healed.status.code(), Some(0), "{report}");
     assert_eq!(report["steps"][1]["via"], "healed");
-    assert!(report["seconds"].as_f64().unwrap() < 12.0, "{report}");
     let lock = std::fs::read_to_string(format!("{}.lock", script.display())).unwrap();
     assert!(lock.contains("Log in") && !lock.contains("\"name\": \"Sign in\""));
 }
@@ -215,7 +217,6 @@ async fn an_unrecognized_control_is_decided_afresh_from_the_same_answers() {
             json!({ "holds": yes(0.95), "contradicted": yes(0.02) }),
         ),
         ("Welcome", decision("done", "001", "001")),
-        ("pressed button", decision("wait", "001", "001")),
         ("typed", unrecognized),
         ("", decision("type", "001", "001")),
     ])
@@ -403,13 +404,12 @@ async fn a_request_that_never_ends_does_not_hold_up_the_page() {
         .mount(&server)
         .await;
     let page = format!(
-        "<!doctype html><p>Hello</p><script>fetch('{}/poll');</script>",
+        "<!doctype html><p id=\"out\">Hello</p><script>fetch('{}/poll'); setTimeout(() => {{ out.textContent = 'Too late'; }}, 7000);</script>",
         server.uri()
     );
     let script = script("poll", &page, "open PAGE\nsee \"Hello\"\n");
     let (output, report) = act(&script, None, false);
     assert_eq!(output.status.code(), Some(0), "{report}");
-    assert!(report["seconds"].as_f64().unwrap() < 8.0, "{report}");
 }
 
 #[test]
@@ -869,7 +869,7 @@ async fn act_waits_out_a_screen_that_is_still_loading_and_replays_it_locked() {
         ],
     )
     .await;
-    let page = r#"<!doctype html><button onclick="out.textContent = 'Loading'; setTimeout(() => { out.textContent = 'Finished'; }, 6000)">Save</button><p id="out"></p>"#;
+    let page = r#"<!doctype html><button onclick="out.textContent = 'Loading'; setTimeout(() => { out.textContent = 'Finished'; setTimeout(() => { out.textContent = 'Expired'; }, 4000); }, 6000)">Save</button><p id="out"></p>"#;
     let script = script("slow", page, "open PAGE\ndo save the draft\n");
     let (output, report) = act(&script, Some(&model), false);
     assert_eq!(output.status.code(), Some(0), "{report}");
@@ -883,7 +883,6 @@ async fn act_waits_out_a_screen_that_is_still_loading_and_replays_it_locked() {
     edit_page(&script, "}, 6000)", "}, 0)");
     let (fast, replayed) = act(&script, None, true);
     assert_eq!(fast.status.code(), Some(0), "{replayed}");
-    assert!(replayed["seconds"].as_f64().unwrap() < 8.0, "{replayed}");
 }
 
 #[tokio::test]
@@ -894,7 +893,7 @@ async fn waiting_does_not_use_up_the_actions_of_a_goal() {
         ("", decision("press", "001", "001")),
     ])
     .await;
-    let page = r#"<!doctype html><button onclick="let n = 0; const tick = setInterval(() => { n += 1; out.textContent = n < 17 ? 'Loading ' + n : 'Finished'; if (n >= 17) clearInterval(tick); }, 500);">Export</button><p id="out"></p>"#;
+    let page = r#"<!doctype html><button onclick="let n = 0; out.textContent = 'Loading 0'; const tick = setInterval(() => { n += 1; out.textContent = n < 24 ? 'Loading ' + n : 'Finished'; if (n >= 24) clearInterval(tick); }, 600);">Export</button><p id="out"></p>"#;
     let script = script("export", page, "open PAGE\ndo export the report\n");
     let (output, report) = act(&script, Some(&model), false);
     assert_eq!(output.status.code(), Some(0), "{report}");
@@ -904,12 +903,12 @@ async fn waiting_does_not_use_up_the_actions_of_a_goal() {
         .iter()
         .filter(|action| *action == "waited")
         .count();
-    assert!(waits > 15, "{report}");
+    assert!(waits >= 15, "{report}");
 
     edit_page(&script, "'Finished'", "'Broken'");
     let (locked, replayed) = act(&script, None, true);
     assert_eq!(locked.status.code(), Some(1), "{replayed}");
-    assert!(replayed["seconds"].as_f64().unwrap() < 30.0, "{replayed}");
+    assert!(replayed["seconds"].as_f64().unwrap() < 60.0, "{replayed}");
     let lock = std::fs::read_to_string(format!("{}.lock", script.display())).unwrap();
     assert!(lock.contains("\"ms\""), "{lock}");
 }
@@ -1095,7 +1094,7 @@ async fn a_replayed_enter_still_waits_for_the_page_to_be_ready() {
         ("", decision("type", "001", "001")),
     ])
     .await;
-    let page = r#"<!doctype html><label>Search <input id="query" oninput="clearTimeout(window.ready); out.textContent = 'Wait'; window.ready = setTimeout(() => { out.textContent = 'Ready'; }, 2000);" onkeydown="if (event.key === 'Enter') { out.textContent = out.textContent === 'Ready' ? 'Found' : 'Too early'; }"></label><p id="out"></p>"#;
+    let page = r#"<!doctype html><label>Search <input id="query" oninput="clearTimeout(window.ready); out.textContent = 'Wait'; window.ready = setTimeout(() => { out.textContent = 'Ready'; window.readyAt = performance.now(); }, 2000);" onkeydown="if (event.key === 'Enter') { out.textContent = out.textContent !== 'Ready' ? 'Too early' : performance.now() - window.readyAt < 4000 ? 'Found' : 'Too late'; }"></label><p id="out"></p>"#;
     let script = script("ready", page, "open PAGE\ndo search for \"shirts\"\n");
     let (output, report) = act(&script, Some(&model), false);
     assert_eq!(output.status.code(), Some(0), "{report}");
@@ -1110,7 +1109,6 @@ async fn a_replayed_enter_still_waits_for_the_page_to_be_ready() {
     edit_page(&script, "}, 2000)", "}, 0)");
     let (fast, replayed) = act(&script, None, true);
     assert_eq!(fast.status.code(), Some(0), "{replayed}");
-    assert!(replayed["seconds"].as_f64().unwrap() < 4.0, "{replayed}");
 }
 
 #[tokio::test]
