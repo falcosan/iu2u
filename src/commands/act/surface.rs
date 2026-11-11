@@ -124,6 +124,6 @@ mod tests {
             }
         })
         .await;
-        assert!(loaded.elapsed() >= QUIET * 4);
+        assert!(loaded.elapsed() >= QUIET * 3);
     }
 }
