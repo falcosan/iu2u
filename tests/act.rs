@@ -606,11 +606,29 @@ async fn a_press_blocked_for_a_moment_is_tried_again_after_a_wait() {
 
 #[tokio::test]
 async fn act_types_into_the_parts_of_a_date_field() {
-    let model = mock([
-        ("typed", decision("done", "001", "001")),
-        ("", decision("type", "001", "003")),
-    ])
-    .await;
+    let model = mock([("typed", decision("done", "001", "001"))]).await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            let day = |question: &str| {
+                body["questions"][question]["criteria"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .find(|(_, target)| {
+                        target
+                            .as_str()
+                            .unwrap()
+                            .starts_with("spinbutton \"Day Day\"")
+                    })
+                    .unwrap()
+                    .0
+                    .clone()
+            };
+            reply(decision("type", &day("type"), &day("type_reversed")))
+        })
+        .mount(&model)
+        .await;
     let script = script(
         "date",
         r#"<!doctype html><label>Birth <input type="date"></label>"#,
