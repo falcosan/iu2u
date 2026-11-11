@@ -29,8 +29,7 @@ const MAX_DECISIONS: usize = 30;
 const SEE_WITHIN: Duration = Duration::from_secs(5);
 const SEE_EVERY: Duration = Duration::from_millis(200);
 const REPORT_SCREEN_CHARS: usize = 3000;
-const CHANGED: &str =
-    "the screen changed since the lock file was written; run without --locked to update it";
+const CHANGED: &str = "the screen does not match the lock file; run without --locked to update it";
 const NOT_LOCKED: &str = "this step is not in the lock file; run without --locked to record it";
 
 pub struct Outcome {
@@ -47,7 +46,6 @@ struct Report {
 struct Progress {
     moves: Vec<Move>,
     via: &'static str,
-    prefetched: Option<(Screen, Answers)>,
 }
 
 enum Replayed {
@@ -246,13 +244,14 @@ impl Run {
         }
     }
 
-    async fn observe(&mut self) -> Result<Screen> {
-        let nodes = self
-            .surface
+    fn surface(&mut self) -> Result<&mut Surface> {
+        self.surface
             .as_mut()
-            .context("start the script with open or app")?
-            .observe()
-            .await?;
+            .context("start the script with open or app")
+    }
+
+    async fn observe(&mut self) -> Result<Screen> {
+        let nodes = self.surface()?.observe().await?;
         let secrets: Vec<(&str, String)> = self
             .inputs
             .iter()
@@ -291,13 +290,16 @@ impl Run {
     }
 
     async fn act(&mut self, action: &Action) -> Result<()> {
-        self.surface
-            .as_mut()
-            .context("start the script with open or app")?
-            .act(action)
-            .await?;
+        self.surface()?.act(action).await?;
         self.done.push(action.describe());
         Ok(())
+    }
+
+    fn refused(&mut self, action: &Action, error: &anyhow::Error) {
+        self.done.push(format!(
+            "tried but could not do this: {} ({error:#})",
+            action.describe()
+        ));
     }
 
     async fn wait(&mut self) -> Result<u64> {
@@ -341,15 +343,9 @@ impl Run {
     }
 
     async fn replay(&mut self, key: &str, goal: &str, inputs: &[Input]) -> Result<Replayed> {
-        let afresh = |moves, via, prefetched| {
-            Ok(Replayed::Afresh(Progress {
-                moves,
-                via,
-                prefetched,
-            }))
-        };
+        let afresh = |moves, via| Ok(Replayed::Afresh(Progress { moves, via }));
         let Some(recorded) = self.old.get(key).cloned() else {
-            return afresh(Vec::new(), "model", None);
+            return afresh(Vec::new(), "model");
         };
         if let Some(value) = recorded.missing(inputs) {
             if self.locked {
@@ -360,7 +356,7 @@ impl Run {
                     ),
                 )));
             }
-            return afresh(Vec::new(), "model", None);
+            return afresh(Vec::new(), "model");
         }
         let (mut moves, mut via, mut skipped, mut skipped_ms) = (Vec::new(), "replay", 0, 0);
         for recorded_move in &recorded.moves {
@@ -396,19 +392,17 @@ impl Run {
                     return Ok(Replayed::Settled(Report::failed("replay", CHANGED.into())));
                 }
                 Replay::Missing(control) => {
-                    let step = decide::Step::new(goal, &screen, inputs);
-                    let (mut questions, recognized) = decide::recognize(&control, &screen);
-                    questions.extend(step.questions());
-                    let state = step.state(&self.done);
-                    let answers = self.ask(&state, &questions).await?;
-                    match recognized(&answers)
-                        .and_then(|element| recorded_move.with(element, inputs))
-                    {
+                    let state = decide::Step::new(goal, &screen, inputs).state(&self.done);
+                    let recognized = decide::recognize(&control, &screen, async |questions| {
+                        self.ask(&state, &questions).await
+                    })
+                    .await?;
+                    match recognized.and_then(|element| recorded_move.with(element, inputs)) {
                         Some(action) => {
                             via = "healed";
                             action
                         }
-                        None => return afresh(moves, via, Some((screen, answers))),
+                        None => return afresh(moves, via),
                     }
                 }
             };
@@ -429,11 +423,8 @@ impl Run {
                         format!("{error:#}"),
                     )));
                 }
-                self.done.push(format!(
-                    "tried but could not do this: {} ({error:#})",
-                    action.describe()
-                ));
-                return afresh(moves, via, None);
+                self.refused(&action, &error);
+                return afresh(moves, via);
             }
             moves.push(Move::of(&action, &screen));
         }
@@ -447,7 +438,7 @@ impl Run {
             self.record(key, moves, &screen);
             return Ok(Replayed::Settled(Report::passed(via, None)));
         }
-        afresh(moves, via, None)
+        afresh(moves, via)
     }
 
     async fn plan(
@@ -457,28 +448,20 @@ impl Run {
         inputs: &[Input],
         progress: Progress,
     ) -> Result<Report> {
-        let Progress {
-            mut moves,
-            mut via,
-            mut prefetched,
-        } = progress;
+        let Progress { mut moves, mut via } = progress;
         if via == "replay" {
             via = "model";
         }
         let mut seen = HashSet::new();
         let mut unsure_before = false;
         for _ in 0..MAX_DECISIONS {
-            let (screen, answers) = match prefetched.take() {
-                Some(pair) => pair,
-                None => {
-                    let screen = self.observe().await?;
-                    let step = decide::Step::new(goal, &screen, inputs);
-                    let state = step.state(&self.done);
-                    let answers = self.ask(&state, &step.questions()).await?;
-                    (screen, answers)
-                }
-            };
-            match decide::Step::new(goal, &screen, inputs).decide(&answers) {
+            let screen = self.observe().await?;
+            let step = decide::Step::new(goal, &screen, inputs);
+            let state = step.state(&self.done);
+            let decision = step
+                .decide(async |questions| self.ask(&state, &questions).await)
+                .await?;
+            match decision {
                 Decision::Done => {
                     self.record(key, moves, &screen);
                     return Ok(Report::passed(via, None));
@@ -530,10 +513,7 @@ impl Run {
                     }
                     match self.act(&action).await {
                         Ok(()) => moves.push(Move::of(&action, &screen)),
-                        Err(error) => self.done.push(format!(
-                            "tried but could not do this: {} ({error:#})",
-                            action.describe()
-                        )),
+                        Err(error) => self.refused(&action, &error),
                     }
                 }
             }
@@ -561,8 +541,8 @@ impl Run {
         let screen = self.observe().await?;
         let state = decide::screen_state(&screen);
         let answers = self.ask(&state, &decide::claim(claim)).await?;
-        let (verdict, holds, contradicted) = decide::verdict(&answers);
-        let mut detail = format!("holds {holds:.2}, contradicted {contradicted:.2}");
+        let (verdict, holds) = decide::verdict(&answers)?;
+        let mut detail = format!("holds {holds:.2}");
         if decide::cut(&screen) {
             write!(detail, "; {}", decide::cut_note()).ok();
         }

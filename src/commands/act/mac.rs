@@ -74,51 +74,61 @@ impl Mac {
             .await?;
         anyhow::ensure!(opened.success(), "no app named {name:?}");
         let folder = executables_of(name)?;
+        let manual = CFString::from_str("AXManualAccessibility");
         let started = Instant::now();
-        let pid = loop {
-            if let Some(pid) = running()
+        let (mut asked, mut running_here) = (Vec::<(i32, bool)>::new(), false);
+        let shown = loop {
+            let shown = running()
                 .into_iter()
                 .rev()
-                .find(|&pid| executable(pid).to_lowercase().contains(&folder))
-            {
-                break pid;
-            }
-            if started.elapsed() >= LAUNCH_WITHIN {
-                bail!("{name} did not start");
+                .filter(|&pid| executable(pid).to_lowercase().contains(&folder))
+                .find_map(|pid| {
+                    running_here = true;
+                    let app = unsafe { AXUIElement::new_application(pid) };
+                    unsafe { app.set_messaging_timeout(MESSAGING_TIMEOUT) };
+                    let mut windows = 0;
+                    let counted = unsafe {
+                        app.attribute_value_count(
+                            &CFString::from_str("AXWindows"),
+                            NonNull::from(&mut windows),
+                        )
+                    };
+                    if counted != AXError::Success {
+                        return None;
+                    }
+                    if asked.iter().all(|&(known, _)| known != pid) {
+                        asked.push((pid, switched_on(&app, &manual)));
+                        unsafe { app.set_attribute_value(&manual, CFBoolean::new(true)) };
+                    }
+                    (windows > 0).then_some((pid, app))
+                });
+            if shown.is_some() || started.elapsed() >= LAUNCH_WITHIN {
+                break shown;
             }
             tokio::time::sleep(POLL).await;
         };
-        let app = unsafe { AXUIElement::new_application(pid) };
-        let manual = CFString::from_str("AXManualAccessibility");
-        unsafe { app.set_messaging_timeout(MESSAGING_TIMEOUT) };
-        let (mut windows, mut shown, mut was_manual) = (0, false, None);
-        while !shown && started.elapsed() < LAUNCH_WITHIN {
-            let counted = unsafe {
-                app.attribute_value_count(
-                    &CFString::from_str("AXWindows"),
-                    NonNull::from(&mut windows),
-                )
-            };
-            if counted == AXError::Success && was_manual.is_none() {
-                was_manual = Some(switched_on(&app, &manual));
-                unsafe { app.set_attribute_value(&manual, CFBoolean::new(true)) };
-            }
-            shown = counted == AXError::Success && windows > 0;
-            if !shown {
-                tokio::time::sleep(POLL).await;
+        let driven = shown.as_ref().map(|(pid, _)| *pid);
+        for &(pid, was_manual) in &asked {
+            if !was_manual && driven != Some(pid) {
+                unsafe {
+                    AXUIElement::new_application(pid)
+                        .set_attribute_value(&manual, CFBoolean::new(false));
+                }
             }
         }
-        if !shown && was_manual == Some(false) {
-            unsafe { app.set_attribute_value(&manual, CFBoolean::new(false)) };
-        }
-        anyhow::ensure!(shown, "{name} showed no window it would describe");
+        let Some((pid, app)) = shown else {
+            if running_here {
+                bail!("{name} showed no window it would describe");
+            }
+            bail!("{name} did not start");
+        };
         Ok(Self {
             pid,
             app,
             attributes: CFArray::from_retained_objects(&ATTRIBUTES.map(CFString::from_str)),
             handles: Vec::new(),
             fingerprint: String::new(),
-            was_manual: was_manual.unwrap_or_default(),
+            was_manual: asked.contains(&(pid, true)),
             limit: MAX_NODES,
         })
     }

@@ -80,7 +80,7 @@ struct PageState {
     main_frame: String,
     requests: HashMap<String, Instant>,
     loading: bool,
-    dialogs: Vec<String>,
+    dialogs: Vec<(String, bool)>,
 }
 
 struct Connection {
@@ -241,11 +241,11 @@ impl Browser {
             .iter()
             .map(|node| to_node(node, nodes, &index))
             .collect();
-        let dialogs = self.connection.page.lock().unwrap().dialogs.clone();
-        for name in dialogs {
+        for (name, shown) in &mut self.connection.page.lock().unwrap().dialogs {
+            *shown = true;
             arena.push(Node {
                 role: "dialog".into(),
-                name,
+                name: name.clone(),
                 ..Node::default()
             });
             let added = arena.len() - 1;
@@ -255,7 +255,12 @@ impl Browser {
     }
 
     pub(super) async fn act(&mut self, action: &Action) -> Result<()> {
-        self.connection.page.lock().unwrap().dialogs.clear();
+        self.connection
+            .page
+            .lock()
+            .unwrap()
+            .dialogs
+            .retain(|(_, shown)| !shown);
         let before = self.revision().await;
         let started = Instant::now();
         match action {
@@ -516,7 +521,7 @@ impl Connection {
                 if page.dialogs.len() < MAX_DIALOGS {
                     let handled = if accept { "accepted" } else { "dismissed" };
                     page.dialogs
-                        .push(format!("{} ({handled})", text(&params["message"])));
+                        .push((format!("{} ({handled})", text(&params["message"])), false));
                 }
                 let connection = self.clone();
                 let session = event["sessionId"].as_str().map(str::to_owned);

@@ -41,7 +41,7 @@ enum Command {
         #[arg(
             long,
             requires = "scripts",
-            help = "Never ask the decision model: replay the lock files and fail where the screen changed"
+            help = "Never ask the decision model: replay the lock files and fail where the screen does not match them"
         )]
         locked: bool,
         #[arg(long, help = "Show the browser window instead of running it headless")]
@@ -98,10 +98,7 @@ async fn run(command: Command) -> Result<ExitCode> {
             return Ok(match filter(&statement, at).await {
                 Ok(true) => ExitCode::SUCCESS,
                 Ok(false) => ExitCode::from(1),
-                Err(error) => {
-                    eprintln!("Error: {error:#}");
-                    ExitCode::from(2)
-                }
+                Err(error) => failed(&error),
             });
         }
         #[cfg(unix)]
@@ -109,9 +106,18 @@ async fn run(command: Command) -> Result<ExitCode> {
             scripts,
             locked,
             headful,
-        } => return act(&scripts, locked, headful).await,
+        } => {
+            return Ok(act(&scripts, locked, headful)
+                .await
+                .unwrap_or_else(|error| failed(&error)));
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn failed(error: &anyhow::Error) -> ExitCode {
+    writeln!(std::io::stderr(), "Error: {error:#}").ok();
+    ExitCode::from(2)
 }
 
 async fn filter(statement: &str, at: f64) -> Result<bool> {

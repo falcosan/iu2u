@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::mem::discriminant;
+
+use anyhow::{Context, Result};
 
 use super::screen::{Element, Kind, MAX_ELEMENTS, Screen};
 use super::surface::Action;
@@ -12,7 +15,6 @@ const TARGET_AT: f64 = 0.3;
 const RECOGNIZED_AT: f64 = 0.6;
 const MARGIN: f64 = 0.1;
 const HOLDS_AT: f64 = 0.75;
-const CONTRADICTED_AT: f64 = 0.5;
 const NONE: &str = "none";
 const REVERSED: &str = "_reversed";
 
@@ -136,9 +138,12 @@ impl<'a> Step<'a> {
         state
     }
 
-    pub(super) fn questions(&self) -> Questions {
+    pub(super) async fn decide(
+        &self,
+        mut ask: impl AsyncFnMut(Questions) -> Result<Answers>,
+    ) -> Result<Decision> {
         let goal = self.goal;
-        let mut questions = Questions::from([(
+        let answers = ask(Questions::from([(
             "operation".into(),
             Question::Pick {
                 text: format!("Which operation brings the screen closest to this goal: {goal}"),
@@ -148,58 +153,15 @@ impl<'a> Step<'a> {
                     .map(|operation| (operation.name.into(), operation.description.into()))
                     .collect(),
             },
-        )]);
-        for operation in self
-            .operations
-            .iter()
-            .filter(|operation| !operation.targets.is_empty())
-        {
-            let text = format!(
-                "Which of these is the one to {} to get closest to this goal: {goal}",
-                operation.name
-            );
-            let descriptions: Vec<String> = operation
-                .targets
-                .iter()
-                .map(|element| element.describe())
-                .collect();
-            questions.extend(both_orders(operation.name, &text, &descriptions));
-            for (index, element) in operation.targets.iter().enumerate() {
-                let values = self.values(operation.name, element);
-                if values.is_empty() {
-                    continue;
-                }
-                let mut text = format!(
-                    "Which of these to {} in {} to get closest to this goal: {goal}",
-                    operation.name,
-                    element.describe()
-                );
-                if values.len() > MAX_ELEMENTS {
-                    write!(
-                        text,
-                        " ({} more are not listed)",
-                        values.len() - MAX_ELEMENTS
-                    )
-                    .ok();
-                }
-                let id = format!("{}_{}", operation.name, forward(index));
-                let shown = &values[..values.len().min(MAX_ELEMENTS)];
-                questions.extend(both_orders(&id, &text, shown));
-            }
-        }
-        questions
-    }
-
-    pub(super) fn decide(&self, answers: &Answers) -> Decision {
-        let names: Vec<&str> = self
-            .operations
-            .iter()
-            .map(|operation| operation.name)
-            .collect();
+        )]))
+        .await?;
         let chosen = match ranked(answers.get("operation")) {
             Some((pick, top, margin)) if top >= OPERATION_AT && margin >= MARGIN => pick,
             ranking => {
-                return Decision::Unsure(format!("which operation to use ({})", shown(ranking)));
+                return Ok(Decision::Unsure(format!(
+                    "which operation to use ({})",
+                    shown(ranking)
+                )));
             }
         };
         let Some(operation) = self
@@ -207,44 +169,67 @@ impl<'a> Step<'a> {
             .iter()
             .find(|operation| operation.name == chosen)
         else {
-            return Decision::Unsure(format!(
+            let names: Vec<&str> = self
+                .operations
+                .iter()
+                .map(|operation| operation.name)
+                .collect();
+            return Ok(Decision::Unsure(format!(
                 "which operation to use: {chosen:?} is not one of {names:?}"
-            ));
+            )));
         };
-        match operation.name {
-            "done" => return Decision::Done,
-            "stuck" => return Decision::Stuck,
-            "enter" => return Decision::Act(Box::new(Action::Enter)),
-            "scroll" => return Decision::Act(Box::new(Action::Scroll)),
-            "wait" => return Decision::Act(Box::new(Action::Wait)),
+        let name = operation.name;
+        match name {
+            "done" => return Ok(Decision::Done),
+            "stuck" => return Ok(Decision::Stuck),
+            "enter" => return Ok(Decision::Act(Box::new(Action::Enter))),
+            "scroll" => return Ok(Decision::Act(Box::new(Action::Scroll))),
+            "wait" => return Ok(Decision::Act(Box::new(Action::Wait))),
             _ => {}
         }
-        let index = match agreed(answers, operation.name, operation.targets.len(), TARGET_AT) {
+        let descriptions: Vec<String> = operation
+            .targets
+            .iter()
+            .map(|element| element.describe())
+            .collect();
+        let text =
+            format!("Which of these is the one to {name} to get closest to this goal: {goal}");
+        let index = match agree(&mut ask, name, &text, &descriptions, TARGET_AT).await? {
             Ok(index) => index,
-            Err(reason) => {
-                return Decision::Unsure(format!("what to {}: {reason}", operation.name));
-            }
+            Err(reason) => return Ok(Decision::Unsure(format!("what to {name}: {reason}"))),
         };
         let element = operation.targets[index];
-        if operation.name == "press" {
-            return Decision::Act(Box::new(Action::Press(element.clone())));
+        if name == "press" {
+            return Ok(Decision::Act(Box::new(Action::Press(element.clone()))));
         }
-        let id = format!("{}_{}", operation.name, forward(index));
-        let count = self.values(operation.name, element).len().min(MAX_ELEMENTS);
-        let value = match agreed(answers, &id, count, TARGET_AT) {
+        let values = self.values(name, element);
+        let mut text = format!(
+            "Which of these to {name} in {} to get closest to this goal: {goal}",
+            element.describe()
+        );
+        if values.len() > MAX_ELEMENTS {
+            write!(
+                text,
+                " ({} more are not listed)",
+                values.len() - MAX_ELEMENTS
+            )
+            .ok();
+        }
+        let id = format!("{name}_{}", forward(index));
+        let offered = &values[..values.len().min(MAX_ELEMENTS)];
+        let value = match agree(&mut ask, &id, &text, offered, TARGET_AT).await? {
             Ok(value) => value,
             Err(reason) => {
-                return Decision::Unsure(format!(
-                    "what to {} in {}: {reason}",
-                    operation.name,
+                return Ok(Decision::Unsure(format!(
+                    "what to {name} in {}: {reason}",
                     element.describe()
-                ));
+                )));
             }
         };
-        Decision::Act(Box::new(match &element.kind {
+        Ok(Decision::Act(Box::new(match &element.kind {
             Kind::Choose(options) => Action::Choose(element.clone(), options[value].clone()),
             _ => Action::Type(element.clone(), self.inputs[value].clone()),
-        }))
+        })))
     }
 }
 
@@ -268,17 +253,15 @@ pub(super) fn cut_note() -> String {
     format!("the model saw only the first {SCREEN_CHARS} characters of the screen")
 }
 
-pub(super) fn recognize(
+pub(super) async fn recognize(
     recorded: &Element,
     screen: &Screen,
-) -> (Questions, impl Fn(&Answers) -> Option<Element> + use<>) {
+    mut ask: impl AsyncFnMut(Questions) -> Result<Answers>,
+) -> Result<Option<Element>> {
     let candidates: Vec<&Element> = screen
         .elements
         .iter()
-        .filter(|element| {
-            element.kind == recorded.kind
-                || (recorded.kind != Kind::Type && element.kind != Kind::Type)
-        })
+        .filter(|element| discriminant(&element.kind) == discriminant(&recorded.kind))
         .filter(|_| recorded.among == 1)
         .collect();
     let descriptions: Vec<String> = candidates
@@ -289,44 +272,69 @@ pub(super) fn recognize(
         "Which of these is the same control as the one previously seen as: {}",
         recorded.describe()
     );
-    let questions = if descriptions.is_empty() {
-        Questions::new()
-    } else {
-        both_orders("recorded", &text, &descriptions).collect()
-    };
-    let matched: Vec<Element> = candidates.into_iter().cloned().collect();
-    let found = move |answers: &Answers| {
-        agreed(answers, "recorded", matched.len(), RECOGNIZED_AT)
-            .ok()
-            .map(|index| matched[index].clone())
-    };
-    (questions, found)
+    let index = agree(&mut ask, "recorded", &text, &descriptions, RECOGNIZED_AT).await?;
+    Ok(index.ok().map(|index| candidates[index].clone()))
 }
 
 pub(super) fn claim(statement: &str) -> Questions {
-    Questions::from([
-        (
-            "holds".into(),
-            Question::yesno(&format!("The screen shows that this is true: {statement}")),
-        ),
-        (
-            "contradicted".into(),
-            Question::yesno(&format!("The screen shows that this is false: {statement}")),
-        ),
-    ])
+    Questions::from([(
+        "holds".into(),
+        Question::yesno(&format!("The screen shows that this is true: {statement}")),
+    )])
 }
 
-pub(super) fn verdict(answers: &Answers) -> (Verdict, f64, f64) {
-    let probability = |id: &str| answers.get(id).and_then(Answer::yes).unwrap_or(0.0);
-    let (holds, contradicted) = (probability("holds"), probability("contradicted"));
-    let verdict = if contradicted >= CONTRADICTED_AT || holds < 1.0 - HOLDS_AT {
+pub(super) fn verdict(answers: &Answers) -> Result<(Verdict, f64)> {
+    let holds = answers
+        .get("holds")
+        .and_then(Answer::yes)
+        .context("the decision model did not answer the claim with yes or no")?;
+    let verdict = if holds < 1.0 - HOLDS_AT {
         Verdict::Contradicted
     } else if holds >= HOLDS_AT {
         Verdict::Holds
     } else {
         Verdict::Inconclusive
     };
-    (verdict, holds, contradicted)
+    Ok((verdict, holds))
+}
+
+async fn agree(
+    ask: &mut impl AsyncFnMut(Questions) -> Result<Answers>,
+    id: &str,
+    text: &str,
+    descriptions: &[String],
+    at: f64,
+) -> Result<Result<usize, String>> {
+    if descriptions.is_empty() {
+        return Ok(Err("there is nothing to pick from".into()));
+    }
+    let count = descriptions.len();
+    let orders = count.min(2);
+    let mut picks = Vec::new();
+    for (id, question) in both_orders(id, text, descriptions).take(orders) {
+        let reply = ask(Questions::from([(id.clone(), question)])).await?;
+        match ranked(reply.get(&id)) {
+            Some((pick, top, margin)) if top >= at && margin >= MARGIN => {
+                if pick == NONE && picks.is_empty() {
+                    return Ok(Err("none of the options fits".into()));
+                }
+                picks.push(pick);
+            }
+            ranking => return Ok(Err(format!("unsure ({})", shown(ranking)))),
+        }
+    }
+    let index = |label: &str| {
+        label
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .filter(|&n| n < count)
+    };
+    let (first, last) = (&picks[0], &picks[orders - 1]);
+    Ok(match (index(first), index(last).map(|n| count - 1 - n)) {
+        (Some(a), Some(b)) if a == b => Ok(a),
+        _ => Err(format!("the two orderings disagree ({first} and {last})")),
+    })
 }
 
 fn both_orders(
@@ -360,30 +368,6 @@ fn both_orders(
             },
         )
     })
-}
-
-fn agreed(answers: &Answers, id: &str, count: usize, at: f64) -> Result<usize, String> {
-    let index = |label: &str| {
-        label
-            .parse::<usize>()
-            .ok()
-            .and_then(|n| n.checked_sub(1))
-            .filter(|&n| n < count)
-    };
-    let first = ranked(answers.get(id));
-    let second = ranked(answers.get(&format!("{id}{REVERSED}")));
-    match (&first, &second) {
-        (Some((a, top_a, margin_a)), Some((b, top_b, margin_b)))
-            if top_a.min(*top_b) >= at && margin_a.min(*margin_b) >= MARGIN =>
-        {
-            match (index(a), index(b).map(|n| count - 1 - n)) {
-                (Some(a), Some(b)) if a == b => Ok(a),
-                _ if a == NONE && b == NONE => Err("none of the options fits".into()),
-                _ => Err(format!("the two orderings disagree ({a} and {b})")),
-            }
-        }
-        _ => Err(format!("unsure ({}; {})", shown(first), shown(second))),
-    }
 }
 
 fn ranked(answer: Option<&Answer>) -> Option<(String, f64, f64)> {
@@ -440,8 +424,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_same_target_in_both_orders_is_acted_on() {
+    async fn decide(step: &Step<'_>, answers: &Answers) -> (Decision, Vec<Questions>) {
+        let mut asked = Vec::new();
+        let decision = step
+            .decide(async |questions| {
+                asked.push(questions);
+                Ok(answers.clone())
+            })
+            .await
+            .unwrap();
+        (decision, asked)
+    }
+
+    async fn recognized(recorded: &Element, screen: &Screen) -> (Option<Element>, usize) {
+        let mut asked = 0;
+        let element = recognize(recorded, screen, async |_| {
+            asked += 1;
+            Ok(Answers::new())
+        })
+        .await
+        .unwrap();
+        (element, asked)
+    }
+
+    #[tokio::test]
+    async fn the_same_target_in_both_orders_is_acted_on() {
         let screen = screen();
         let step = Step::new("pay", &screen, &[]);
         let answers = Answers::from([
@@ -459,13 +466,13 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            step.decide(&answers),
+            decide(&step, &answers).await.0,
             Decision::Act(Box::new(Action::Press(screen.elements[1].clone())))
         );
     }
 
-    #[test]
-    fn orderings_that_disagree_or_a_close_call_leave_the_step_unsure() {
+    #[tokio::test]
+    async fn orderings_that_disagree_or_a_close_call_leave_the_step_unsure() {
         let screen = screen();
         let step = Step::new("pay", &screen, &[]);
         let operation = ("operation".to_string(), pick("press", &[("press", 0.9)]));
@@ -479,81 +486,156 @@ mod tests {
             pick("press", &[("press", 0.5), ("type", 0.45)]),
         )]);
         assert!(
-            matches!(step.decide(&disagree), Decision::Unsure(reason) if reason.contains("disagree"))
+            matches!(decide(&step, &disagree).await.0, Decision::Unsure(reason) if reason.contains("disagree"))
         );
-        assert!(matches!(step.decide(&close), Decision::Unsure(_)));
+        assert!(matches!(decide(&step, &close).await.0, Decision::Unsure(_)));
     }
 
-    #[test]
-    fn values_are_offered_per_field_and_secrets_stay_hidden() {
+    #[tokio::test]
+    async fn a_target_the_first_order_does_not_settle_is_not_asked_about_again() {
+        let screen = screen();
+        let step = Step::new("pay", &screen, &[]);
+        for (first, reason) in [
+            (pick("none", &[("none", 0.9)]), "none of the options fits"),
+            (pick("002", &[("002", 0.2)]), "unsure"),
+        ] {
+            let answers = Answers::from([
+                ("operation".into(), pick("press", &[("press", 0.9)])),
+                ("press".into(), first),
+            ]);
+            let (decision, asked) = decide(&step, &answers).await;
+            assert!(matches!(decision, Decision::Unsure(said) if said.contains(reason)));
+            assert_eq!(asked.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn each_request_asks_one_question_and_secrets_stay_hidden() {
         let screen = Screen {
-            elements: vec![Element::new("textbox", "Password", Kind::Type)],
+            elements: vec![
+                Element::new("textbox", "Password", Kind::Type),
+                Element::new("textbox", "Email", Kind::Type),
+            ],
             ..Screen::default()
         };
-        let inputs = [Input {
-            key: "password".into(),
-            text: "hunter2".into(),
-            secret: true,
-        }];
+        let inputs = [
+            ("password", "hunter2", true),
+            ("email", "qa@example.com", false),
+        ]
+        .map(|(key, text, secret)| Input {
+            key: key.into(),
+            text: text.into(),
+            secret,
+        });
         let step = Step::new("sign in", &screen, &inputs);
-        let questions =
-            serde_json::to_string(&step.questions().keys().collect::<Vec<_>>()).unwrap();
-        let state = format!("{:?}", step.questions());
-        assert!(
-            questions.contains("\"type_reversed\"") && questions.contains("\"type_001_reversed\"")
+        let picked = |id: &str, label: &str| (id.to_string(), pick(label, &[(label, 0.9)]));
+        let answers = Answers::from([
+            picked("operation", "type"),
+            picked("type", "001"),
+            picked("type_reversed", "002"),
+            picked("type_001", "001"),
+            picked("type_001_reversed", "002"),
+        ]);
+        let (decision, asked) = decide(&step, &answers).await;
+        let ids: Vec<Vec<&String>> = asked
+            .iter()
+            .map(|questions| questions.keys().collect())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ["operation"],
+                ["type"],
+                ["type_reversed"],
+                ["type_001"],
+                ["type_001_reversed"]
+            ]
         );
-        assert!(state.contains("(secret \\\"password\\\")") && !state.contains("hunter2"));
+        let questions = format!("{asked:?}");
+        assert!(questions.contains("(secret \\\"password\\\")") && !questions.contains("hunter2"));
+        assert_eq!(
+            decision,
+            Decision::Act(Box::new(Action::Type(
+                screen.elements[0].clone(),
+                inputs[0].clone()
+            )))
+        );
     }
 
-    #[test]
-    fn every_option_of_every_drop_down_can_be_chosen() {
+    #[tokio::test]
+    async fn a_lone_option_is_asked_about_once() {
+        let screen = Screen {
+            elements: vec![Element::new("button", "Pay", Kind::Press)],
+            ..Screen::default()
+        };
+        let step = Step::new("pay", &screen, &[]);
+        let answers = Answers::from([
+            ("operation".into(), pick("press", &[("press", 0.9)])),
+            ("press".into(), pick("001", &[("001", 0.9)])),
+        ]);
+        let (decision, asked) = decide(&step, &answers).await;
+        assert_eq!(
+            decision,
+            Decision::Act(Box::new(Action::Press(screen.elements[0].clone())))
+        );
+        assert_eq!(asked.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn every_option_of_every_drop_down_can_be_chosen() {
         let countries = (0..MAX_ELEMENTS).map(|n| format!("Country {n}")).collect();
         let sizes = vec!["S".to_string(), "M".into(), "XXL".into()];
         let screen = Screen {
             elements: vec![
-                Element::new("combobox", "Country", Kind::Choose(countries)),
                 Element::new("combobox", "Size", Kind::Choose(sizes)),
+                Element::new("combobox", "Country", Kind::Choose(countries)),
             ],
             ..Screen::default()
         };
-        let step = Step::new("pick the biggest size", &screen, &[]);
+        let step = Step::new("pick the last country", &screen, &[]);
+        let last = forward(MAX_ELEMENTS - 1);
         let answers = Answers::from([
             ("operation".into(), pick("choose", &[("choose", 0.9)])),
             ("choose".into(), pick("002", &[("002", 0.9)])),
             ("choose_reversed".into(), pick("001", &[("001", 0.9)])),
-            ("choose_002".into(), pick("003", &[("003", 0.9)])),
+            ("choose_002".into(), pick(&last, &[(&last, 0.9)])),
             ("choose_002_reversed".into(), pick("001", &[("001", 0.9)])),
         ]);
-        let questions = step.questions();
-        let offered = |id: &str| match &questions[id] {
+        let (decision, asked) = decide(&step, &answers).await;
+        let offered = match &asked[3]["choose_002"] {
             Question::Pick { options, .. } => options.len(),
             _ => 0,
         };
+        assert_eq!(offered, MAX_ELEMENTS + 1);
         assert_eq!(
-            (offered("choose_001"), offered("choose_002")),
-            (MAX_ELEMENTS + 1, 4)
-        );
-        assert_eq!(
-            step.decide(&answers),
+            decision,
             Decision::Act(Box::new(Action::Choose(
                 screen.elements[1].clone(),
-                "XXL".into()
+                format!("Country {}", MAX_ELEMENTS - 1)
             )))
         );
     }
 
     #[test]
     fn claims_fall_into_three_bands() {
-        let answers = |holds: f64, contradicted: f64| {
-            Answers::from([
-                ("holds".into(), Answer::Yesno { yes: holds }),
-                ("contradicted".into(), Answer::Yesno { yes: contradicted }),
-            ])
+        let band = |holds: f64| {
+            verdict(&Answers::from([(
+                "holds".into(),
+                Answer::Yesno { yes: holds },
+            )]))
+            .unwrap()
+            .0
         };
-        assert_eq!(verdict(&answers(0.9, 0.05)).0, Verdict::Holds);
-        assert_eq!(verdict(&answers(0.6, 0.1)).0, Verdict::Inconclusive);
-        assert_eq!(verdict(&answers(0.9, 0.6)).0, Verdict::Contradicted);
-        assert_eq!(verdict(&answers(0.1, 0.1)).0, Verdict::Contradicted);
+        assert_eq!(band(0.75), Verdict::Holds);
+        assert_eq!(band(0.74), Verdict::Inconclusive);
+        assert_eq!(band(0.25), Verdict::Inconclusive);
+        assert_eq!(band(0.24), Verdict::Contradicted);
+    }
+
+    #[test]
+    fn a_claim_answered_with_anything_but_yes_or_no_is_an_error() {
+        let answers = Answers::from([("holds".into(), pick("001", &[("001", 0.9)]))]);
+        assert!(verdict(&answers).is_err());
     }
 
     #[test]
@@ -569,16 +651,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_control_with_no_candidates_is_not_asked_about() {
+    #[tokio::test]
+    async fn a_control_with_no_candidates_is_not_asked_about() {
         let field = Element::new("textbox", "Email", Kind::Type);
-        let (questions, recognized) = recognize(&field, &screen());
-        assert!(questions.is_empty());
-        assert_eq!(recognized(&Answers::new()), None);
+        assert_eq!(recognized(&field, &screen()).await, (None, 0));
         let twin = Element {
             among: 3,
             ..Element::new("button", "Delete", Kind::Press)
         };
-        assert!(recognize(&twin, &screen()).0.is_empty());
+        assert_eq!(recognized(&twin, &screen()).await, (None, 0));
+        let drop_down = Screen {
+            elements: vec![Element::new(
+                "combobox",
+                "Pay",
+                Kind::Choose(vec!["Card".into()]),
+            )],
+            ..Screen::default()
+        };
+        let button = Element::new("button", "Pay", Kind::Press);
+        assert_eq!(recognized(&button, &drop_down).await, (None, 0));
     }
 }

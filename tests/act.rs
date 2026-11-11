@@ -79,10 +79,7 @@ async fn mock_after(
 
 async fn model() -> MockServer {
     mock([
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.95), "contradicted": yes(0.02) }),
-        ),
+        ("\"holds\"", json!({ "holds": yes(0.95) })),
         ("Welcome", decision("done", "001", "001")),
         ("typed", decision("press", "002", "001")),
         ("", decision("type", "001", "001")),
@@ -180,7 +177,7 @@ async fn act_reaches_a_goal_records_it_and_replays_it_without_the_model() {
             "pressed button \"Sign in\" · in \"Sign in\""
         ])
     );
-    assert_eq!(report["model_calls"], 4);
+    assert_eq!(report["model_calls"], 8);
     let lock = std::fs::read_to_string(format!("{}.lock", script.display())).unwrap();
     assert!(lock.contains("\"move\": \"press\""));
 
@@ -219,20 +216,18 @@ async fn a_renamed_control_fails_a_locked_run_and_is_healed_by_the_model() {
     let (healed, report) = act(&script, Some(&model), false);
     assert_eq!(healed.status.code(), Some(0), "{report}");
     assert_eq!(report["steps"][1]["via"], "healed");
+    assert_eq!(report["model_calls"], 3);
     let lock = std::fs::read_to_string(format!("{}.lock", script.display())).unwrap();
     assert!(lock.contains("Log in") && !lock.contains("\"name\": \"Sign in\""));
 }
 
 #[tokio::test]
-async fn an_unrecognized_control_is_decided_afresh_from_the_same_answers() {
+async fn an_unrecognized_control_is_decided_afresh() {
     let mut unrecognized = decision("press", "002", "001");
     unrecognized["recorded"] = choice("none");
     unrecognized["recorded_reversed"] = choice("none");
     let model = mock([
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.95), "contradicted": yes(0.02) }),
-        ),
+        ("\"holds\"", json!({ "holds": yes(0.95) })),
         ("Welcome", decision("done", "001", "001")),
         ("typed", unrecognized),
         ("", decision("type", "001", "001")),
@@ -246,7 +241,6 @@ async fn an_unrecognized_control_is_decided_afresh_from_the_same_answers() {
     let (output, report) = act(&script, Some(&model), false);
     assert_eq!(output.status.code(), Some(0), "{report}");
     assert_eq!(report["steps"][1]["via"], "model");
-    assert_eq!(report["model_calls"], 4);
     assert_eq!(
         report["steps"][1]["actions"][1],
         "pressed button \"Log in\" · in \"Sign in\""
@@ -256,11 +250,7 @@ async fn an_unrecognized_control_is_decided_afresh_from_the_same_answers() {
 #[tokio::test]
 async fn a_script_on_stdin_reports_a_broken_claim_and_exits_one() {
     let model = MockServer::start().await;
-    answer_always(
-        &model,
-        json!({ "holds": yes(0.1), "contradicted": yes(0.9) }),
-    )
-    .await;
+    answer_always(&model, json!({ "holds": yes(0.1) })).await;
     let page = temp_path("claim.html");
     std::fs::write(&page, SHOP.replace("BUTTON", "Sign in")).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_iu2u"))
@@ -288,11 +278,7 @@ async fn a_script_on_stdin_reports_a_broken_claim_and_exits_one() {
 #[tokio::test]
 async fn a_claim_about_a_long_screen_says_how_much_the_model_saw() {
     let model = MockServer::start().await;
-    answer_always(
-        &model,
-        json!({ "holds": yes(0.1), "contradicted": yes(0.9) }),
-    )
-    .await;
+    answer_always(&model, json!({ "holds": yes(0.1) })).await;
     let links: String = (0..300)
         .map(|index| format!("<a href=\"#{index}\">Menu entry {index}</a>"))
         .collect();
@@ -339,6 +325,33 @@ fn a_closed_output_ends_act_with_its_own_exit_code() {
 }
 
 #[test]
+fn a_report_that_cannot_be_written_exits_two() {
+    for (redirect, reported) in [("> \"$1\"", true), ("> \"$1\" 2>&1", false)] {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "trap '' XFSZ; ulimit -f 0; exec \"$0\" act {redirect}"
+            ))
+            .arg(env!("CARGO_BIN_EXE_iu2u"))
+            .arg(temp_path("unwritten.json"))
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"click the button\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{said}");
+        assert_eq!(said.starts_with("Error:"), reported, "{said}");
+    }
+}
+
+#[test]
 fn an_empty_secret_stops_the_script_before_it_runs() {
     let script = script(
         "empty",
@@ -364,11 +377,7 @@ fn an_empty_secret_stops_the_script_before_it_runs() {
 #[tokio::test]
 async fn an_inconclusive_claim_fails_the_script_and_records_nothing() {
     let model = MockServer::start().await;
-    answer_always(
-        &model,
-        json!({ "holds": yes(0.6), "contradicted": yes(0.1) }),
-    )
-    .await;
+    answer_always(&model, json!({ "holds": yes(0.6) })).await;
     let script = script(
         "inconclusive",
         "<!doctype html><p>Hello</p>",
@@ -381,14 +390,31 @@ async fn an_inconclusive_claim_fails_the_script_and_records_nothing() {
 }
 
 #[tokio::test]
+async fn a_claim_about_a_changed_screen_is_asked_again() {
+    let model = MockServer::start().await;
+    answer_always(&model, json!({ "holds": yes(0.95) })).await;
+    let script = script(
+        "reclaim",
+        "<!doctype html><p>Order shipped</p>",
+        "open PAGE\nexpect the order is on its way\n",
+    );
+    assert_eq!(act(&script, Some(&model), false).0.status.code(), Some(0));
+    edit_page(&script, "shipped", "cancelled");
+
+    let (locked, report) = act(&script, None, true);
+    assert_eq!(locked.status.code(), Some(1), "{report}");
+    assert_eq!(report["steps"][1]["via"], "cache");
+
+    let (asked, report) = act(&script, Some(&model), false);
+    assert_eq!(asked.status.code(), Some(0), "{report}");
+    assert_eq!(report["steps"][1]["via"], "model");
+}
+
+#[tokio::test]
 async fn a_lock_that_cannot_be_written_keeps_the_report() {
     use std::os::unix::fs::PermissionsExt;
     let model = MockServer::start().await;
-    answer_always(
-        &model,
-        json!({ "holds": yes(0.95), "contradicted": yes(0.02) }),
-    )
-    .await;
+    answer_always(&model, json!({ "holds": yes(0.95) })).await;
     let folder = temp_path("read-only");
     std::fs::create_dir_all(&folder).unwrap();
     let page = folder.join("page.html");
@@ -644,17 +670,15 @@ async fn act_types_into_the_parts_of_a_date_field() {
             let day = |question: &str| {
                 body["questions"][question]["criteria"]
                     .as_object()
-                    .unwrap()
-                    .iter()
+                    .into_iter()
+                    .flatten()
                     .find(|(_, target)| {
                         target
                             .as_str()
                             .unwrap()
                             .starts_with("spinbutton \"Day Day\"")
                     })
-                    .unwrap()
-                    .0
-                    .clone()
+                    .map_or("001".into(), |(label, _)| label.clone())
             };
             reply(decision("type", &day("type"), &day("type_reversed")))
         })
@@ -753,12 +777,49 @@ async fn a_press_does_not_hold_the_mouse_button_while_moving() {
 
 #[tokio::test]
 async fn a_dismissed_alert_stays_on_the_screen_until_the_next_action() {
-    press_and_see(
+    let model = mock([
+        ("pressed", decision("done", "001", "001")),
+        ("Goal: close", decision("press", "002", "001")),
+        ("", decision("press", "001", "002")),
+    ])
+    .await;
+    let script = script(
         "alert",
-        r#"<!doctype html><button onclick="alert('Saved')">Save</button>"#,
-        "Saved (dismissed)",
+        r#"<!doctype html><button onclick="alert('Saved')">Save</button><button onclick="out.textContent = 'Closed'">Close</button><p id="out"></p>"#,
+        "open PAGE\ndo save\nsee \"Saved (dismissed)\"\ndo close\nsee \"Closed\"\n",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert!(
+        !report["screen"].as_str().unwrap().contains("Saved"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn an_alert_raised_while_the_model_decides_is_still_shown() {
+    let model = mock_after(
+        Duration::from_millis(2500),
+        [
+            ("pressed", decision("done", "001", "001")),
+            ("", decision("press", "001", "001")),
+        ],
     )
     .await;
+    let script = script(
+        "late-alert",
+        r#"<!doctype html><button onclick="out.textContent = 'Pressed'">Go</button><p id="out"></p><script>setTimeout(() => alert('Card expired'), 2000);</script>"#,
+        "open PAGE\ndo press the button\n",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    let asked = model.received_requests().await.unwrap();
+    assert!(
+        asked.iter().any(|request| {
+            String::from_utf8_lossy(&request.body).contains("Card expired (dismissed)")
+        }),
+        "{report}"
+    );
 }
 
 #[tokio::test]
@@ -964,11 +1025,11 @@ async fn an_error_mid_script_keeps_what_was_already_done() {
     let model = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(reply(decision("type", "001", "001")))
-        .up_to_n_times(1)
+        .up_to_n_times(3)
         .mount(&model)
         .await;
     common::fail_always(&model, 503).await;
-    let (output, report) = act(&shop("broken"), Some(&model), false);
+    let (output, report) = act(&shop("midway"), Some(&model), false);
     assert_eq!(output.status.code(), Some(2), "{report}");
     assert_eq!(report["status"], "error");
     assert_eq!(report["steps"][0]["status"], "passed");
@@ -1104,7 +1165,7 @@ async fn a_step_stops_after_too_many_decisions() {
         let (forward, reversed) = (format!("{:03}", index + 1), format!("{:03}", 30 - index));
         Mock::given(method("POST"))
             .respond_with(reply(decision("press", &forward, &reversed)))
-            .up_to_n_times(1)
+            .up_to_n_times(3)
             .mount(&model)
             .await;
     }
@@ -1281,17 +1342,22 @@ fn mac_app(name: &str, source: &str) -> (std::path::PathBuf, Quit) {
     let executable = bundle.join("Contents/MacOS").join(name);
     std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
     std::fs::write(bundle.join("Contents/Info.plist"), format!("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>{name}</string><key>CFBundleIdentifier</key><string>dev.iu2u.{name}</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>")).unwrap();
-    let swift = temp_path(&format!("{name}.swift"));
-    std::fs::write(&swift, source).unwrap();
+    swift(source, &executable);
+    let bundle = std::fs::canonicalize(bundle).unwrap();
+    (bundle.clone(), Quit(bundle))
+}
+
+#[cfg(target_os = "macos")]
+fn swift(source: &str, executable: &Path) {
+    let file = executable.with_extension("swift");
+    std::fs::write(&file, source).unwrap();
     let built = Command::new("swiftc")
-        .arg(&swift)
+        .arg(&file)
         .arg("-o")
-        .arg(&executable)
+        .arg(executable)
         .status()
         .unwrap();
     assert!(built.success());
-    let bundle = std::fs::canonicalize(bundle).unwrap();
-    (bundle.clone(), Quit(bundle))
 }
 
 #[cfg(target_os = "macos")]
@@ -1336,6 +1402,43 @@ fn a_mac_app_with_no_window_gets_its_accessibility_switch_back() {
     assert_eq!(output.status.code(), Some(2), "{report}");
     assert!(error.contains("showed no window"), "{report}");
     let manual = std::fs::read_to_string(bundle.with_file_name("windowless.log")).unwrap();
+    assert_eq!(manual, "false");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_mac_app_is_driven_past_a_helper_that_started_after_it() {
+    let once_the_helper_is_asked = r#"Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { timer in
+            let asked = URL(fileURLWithPath: Bundle.main.bundlePath).deletingLastPathComponent().appendingPathComponent("helper.log")
+            guard FileManager.default.fileExists(atPath: asked.path) else { return }
+            timer.invalidate()
+            self.window.makeKeyAndOrderFront(nil)
+        }"#;
+    let source = FIXTURE
+        .replace("manual.log", "helped.log")
+        .replace("window.makeKeyAndOrderFront(nil)", once_the_helper_is_asked);
+    let (bundle, _quit) = mac_app("Helped", &source);
+    let helper = bundle.join("Contents/MacOS/Helper");
+    swift(&WINDOWLESS.replace("windowless.log", "helper.log"), &helper);
+    let opened = Command::new("open")
+        .arg("-g")
+        .arg(&bundle)
+        .status()
+        .unwrap();
+    assert!(opened.success());
+    let mut helper = Command::new(helper).spawn().unwrap();
+    let script = temp_path("helped.e2e");
+    std::fs::write(&script, format!("app {}\nsee \"echo\"\n", bundle.display())).unwrap();
+    let (output, report) = act(&script, None, false);
+    helper.kill().ok();
+    helper.wait().ok();
+    let error = report["error"].as_str().unwrap_or_default();
+    if error.contains("Privacy & Security") {
+        eprintln!("skipped: this process may not use the accessibility API");
+        return;
+    }
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    let manual = std::fs::read_to_string(bundle.with_file_name("helper.log")).unwrap();
     assert_eq!(manual, "false");
 }
 
@@ -1392,10 +1495,7 @@ impl Drop for Quit {
 async fn act_drives_a_mac_app_through_its_accessibility_tree() {
     let (bundle, _quit) = mac_app("Fixture", FIXTURE);
     let model = mock([
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.95), "contradicted": yes(0.02) }),
-        ),
+        ("\"holds\"", json!({ "holds": yes(0.95) })),
         ("locked field", decision("type", "002", "004")),
         ("echo Ada", decision("done", "001", "001")),
         ("pressed Enter", decision("wait", "001", "001")),
@@ -1496,7 +1596,7 @@ async fn act_drives_a_mac_app_through_its_accessibility_tree() {
         ("", decision("type", "005", "001")),
     ])
     .await;
-    let coupon = temp_path("coupon.e2e");
+    let coupon = temp_path("mac-coupon.e2e");
     std::fs::write(
         &coupon,
         format!(
