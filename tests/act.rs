@@ -1443,6 +1443,100 @@ fn a_mac_app_is_driven_past_a_helper_that_started_after_it() {
 }
 
 #[cfg(target_os = "macos")]
+const SLOW: &str = r#"import AppKit
+final class App: NSApplication {
+    var answered = false
+    override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
+        if attribute == .children && !answered {
+            answered = true
+            usleep(1_500_000)
+        }
+        return super.accessibilityAttributeValue(attribute)
+    }
+}
+final class Label: NSView {
+    let text: String
+    init(_ text: String) { self.text = text; super.init(frame: .zero) }
+    required init?(coder: NSCoder) { nil }
+    override var intrinsicContentSize: NSSize { NSSize(width: 120, height: 16) }
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? {
+        usleep(12_000)
+        return .staticText
+    }
+    override func accessibilityValue() -> Any? { text }
+}
+final class Delegate: NSObject, NSApplicationDelegate {
+    var window: NSWindow!
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        window = NSWindow(contentRect: NSRect(x: 200, y: 100, width: 200, height: 900), styleMask: [.titled], backing: .buffered, defer: false)
+        window.title = "Labels"
+        let stack = NSStackView(views: (1...40).map { Label("Label \($0)") })
+        stack.orientation = .vertical
+        stack.frame = NSRect(x: 20, y: 20, width: 160, height: 860)
+        window.contentView!.addSubview(stack)
+        window.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { NSApp.terminate(nil) }
+    }
+}
+let app = App.shared
+app.setActivationPolicy(.regular)
+let delegate = Delegate()
+app.delegate = delegate
+app.run()
+"#;
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_mac_app_slow_to_answer_is_still_read_whole() {
+    let (bundle, _quit) = mac_app("Slow", SLOW);
+    let model = mock([("", decision("done", "001", "001"))]).await;
+    let script = temp_path("slow.e2e");
+    std::fs::write(
+        &script,
+        format!("app {}\ndo read the labels\n", bundle.display()),
+    )
+    .unwrap();
+    let (output, report) = act(&script, Some(&model), false);
+    let error = report["error"].as_str().unwrap_or_default();
+    if error.contains("Privacy & Security") {
+        eprintln!("skipped: this process may not use the accessibility API");
+        return;
+    }
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    let asked = model.received_requests().await.unwrap();
+    let seen = String::from_utf8_lossy(&asked[0].body);
+    assert!(
+        seen.contains("Label 40") && !seen.contains("was not read"),
+        "{seen}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_mac_app_that_quits_is_an_error_at_once() {
+    let source = BUSY
+        .replace("\"Busy\"", "\"Gone\"")
+        .replace("sleep(60)", "NSApp.terminate(nil)");
+    let (bundle, _quit) = mac_app("Gone", &source);
+    let script = temp_path("gone.e2e");
+    std::fs::write(
+        &script,
+        format!("app {}\nsee \"never\"\n", bundle.display()),
+    )
+    .unwrap();
+    let (output, report) = act(&script, None, false);
+    let error = report["error"].as_str().unwrap_or_default();
+    if error.contains("Privacy & Security") {
+        eprintln!("skipped: this process may not use the accessibility API");
+        return;
+    }
+    assert_eq!(output.status.code(), Some(2), "{report}");
+    assert!(error.contains("did not answer"), "{report}");
+    assert!(report["seconds"].as_f64().unwrap() < 2.5, "{report}");
+}
+
+#[cfg(target_os = "macos")]
 const BUSY: &str = r#"import AppKit
 final class Delegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!

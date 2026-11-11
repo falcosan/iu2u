@@ -134,7 +134,7 @@ impl Mac {
     }
 
     pub(super) fn observe(&mut self) -> Result<Vec<Node>> {
-        let started = Instant::now();
+        let mut started = Instant::now();
         let mut nodes: Vec<Node> = Vec::new();
         let mut handles = Vec::new();
         let mut stack: Vec<(CFRetained<AXUIElement>, Option<usize>)> =
@@ -145,7 +145,15 @@ impl Mac {
                 cut_short(&mut nodes);
                 break;
             }
-            let Some(read) = self.read(&element) else {
+            if parent.is_none() {
+                unsafe { element.set_messaging_timeout(WALK_WITHIN.as_secs_f32()) };
+            }
+            let read = self.read(&element);
+            if parent.is_none() {
+                unsafe { element.set_messaging_timeout(MESSAGING_TIMEOUT) };
+                started = Instant::now();
+            }
+            let Some(read) = read else {
                 continue;
             };
             if read.empty || read.role == "AXMenuBar" {

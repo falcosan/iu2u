@@ -35,6 +35,7 @@ const COMMANDS: [&str; 6] = [
     "brave-browser",
 ];
 const REPLY_WITHIN: Duration = Duration::from_secs(30);
+const CLOSE_WITHIN: Duration = Duration::from_secs(5);
 const SCROLL_PIXELS: u32 = 600;
 const MAX_DIALOGS: usize = 10;
 const LONG_REQUEST: Duration = Duration::from_secs(2);
@@ -321,11 +322,13 @@ impl Browser {
             .send(None, "Browser.close", json!({}))
             .await
             .ok();
-        if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+        if tokio::time::timeout(CLOSE_WITHIN, self.child.wait())
             .await
             .is_err()
         {
-            self.child.kill().await.ok();
+            tokio::time::timeout(CLOSE_WITHIN, self.child.kill())
+                .await
+                .ok();
         }
         std::fs::remove_dir_all(&self.profile).ok();
     }
