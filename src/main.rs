@@ -44,6 +44,8 @@ enum Command {
             help = "Never ask the decision model: replay the lock files and fail where the screen changed"
         )]
         locked: bool,
+        #[arg(long, help = "Show the browser window instead of running it headless")]
+        headful: bool,
     },
 }
 
@@ -103,7 +105,11 @@ async fn run(command: Command) -> Result<ExitCode> {
             });
         }
         #[cfg(unix)]
-        Command::Act { scripts, locked } => return act(&scripts, locked).await,
+        Command::Act {
+            scripts,
+            locked,
+            headful,
+        } => return act(&scripts, locked, headful).await,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -133,7 +139,7 @@ async fn filter(statement: &str, at: f64) -> Result<bool> {
 }
 
 #[cfg(unix)]
-async fn act(scripts: &[PathBuf], locked: bool) -> Result<ExitCode> {
+async fn act(scripts: &[PathBuf], locked: bool, headful: bool) -> Result<ExitCode> {
     let paths: Vec<Option<&Path>> = if scripts.is_empty() {
         vec![None]
     } else {
@@ -153,7 +159,7 @@ async fn act(scripts: &[PathBuf], locked: bool) -> Result<ExitCode> {
                     .with_context(|| format!("cannot read {}", path.display()))?,
                 None => read_stdin()?,
             };
-            commands::act(Client::from_env(), &text, lock.as_deref(), locked).await
+            commands::act(Client::from_env(), &text, lock.as_deref(), locked, headful).await
         };
         let mut report = match outcome.await {
             Ok(outcome) => {

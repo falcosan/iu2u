@@ -140,6 +140,23 @@ fn act(script: &Path, model: Option<&MockServer>, locked: bool) -> (Output, Valu
     (output, report)
 }
 
+fn act_with_browser(name: &str, browser: &str, flag: Option<&str>) -> (Output, Value) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = temp_path(&format!("{name}-browser"));
+    std::fs::write(&path, browser).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = script(name, "<!doctype html><p>Hi</p>", "open PAGE\nsee \"Hi\"\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+        .arg("act")
+        .args(flag)
+        .arg(&script)
+        .env("IU2U_BROWSER", &path)
+        .output()
+        .unwrap();
+    let report = serde_json::from_slice(&output.stdout).unwrap();
+    (output, report)
+}
+
 fn vias(report: &Value) -> Vec<&str> {
     report["steps"]
         .as_array()
@@ -414,31 +431,28 @@ async fn a_request_that_never_ends_does_not_hold_up_the_page() {
 
 #[test]
 fn a_browser_that_fails_to_start_says_why() {
-    use std::os::unix::fs::PermissionsExt;
-    let browser = temp_path("broken-browser");
-    std::fs::write(
-        &browser,
-        "#!/bin/sh\necho 'error while loading shared libraries: libnss3.so' >&2\nexit 127\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let script = script(
+    let (output, report) = act_with_browser(
         "nobrowser",
-        "<!doctype html><p>Hi</p>",
-        "open PAGE\nsee \"Hi\"\n",
+        "#!/bin/sh\necho 'error while loading shared libraries: libnss3.so' >&2\nexit 127\n",
+        None,
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .arg("act")
-        .arg(&script)
-        .env("IU2U_BROWSER", &browser)
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(2), "{report}");
     assert!(
         report["error"].as_str().unwrap().contains("libnss3.so"),
         "{report}"
     );
+}
+
+#[test]
+fn the_browser_runs_headless_unless_headful_is_passed() {
+    for (flag, mode) in [(None, "mode=headless"), (Some("--headful"), "mode=window")] {
+        let (_, report) = act_with_browser(
+            "mode",
+            "#!/bin/sh\ncase \" $* \" in *' --headless '*) echo mode=headless >&2 ;; *) echo mode=window >&2 ;; esac\nexit 1\n",
+            flag,
+        );
+        assert!(report["error"].as_str().unwrap().contains(mode), "{report}");
+    }
 }
 
 #[test]
@@ -572,6 +586,23 @@ async fn act_types_into_a_rich_text_editor() {
             .contains("spinbutton \"Quantity\" = \"1\""),
         "{report}"
     );
+}
+
+#[tokio::test]
+async fn a_page_that_opens_a_new_tab_keeps_running_in_front() {
+    let model = mock([
+        ("Counting", decision("done", "001", "001")),
+        ("", decision("press", "001", "001")),
+    ])
+    .await;
+    let page = r#"<!doctype html><button onclick="const other = window.open(''); let ticks = 0; out.textContent = 'Counting'; const timer = setInterval(() => { if (++ticks === 150) { clearInterval(timer); out.textContent = 'Finished while ' + document.visibilityState + ' and the other tab is ' + other.document.visibilityState + ', blurred ' + blurs + ' times'; } }, 10);">Help</button><p id="out"></p><script>let blurs = 0; onblur = () => blurs++;</script>"#;
+    let script = script(
+        "newtab",
+        page,
+        "open PAGE\ndo open the help\nsee \"Finished while visible and the other tab is hidden, blurred 0 times\"\n",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
 }
 
 #[tokio::test]

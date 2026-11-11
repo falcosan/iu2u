@@ -98,7 +98,7 @@ pub(super) struct Browser {
 }
 
 impl Browser {
-    pub(super) async fn launch() -> Result<Self> {
+    pub(super) async fn launch(headful: bool) -> Result<Self> {
         let executable = find()?;
         let temp = std::env::temp_dir();
         sweep_profiles(&temp);
@@ -109,7 +109,7 @@ impl Browser {
         ));
         private_dir(&profile)
             .with_context(|| format!("cannot create the browser profile {}", profile.display()))?;
-        let started = Self::start(&executable, profile.clone()).await;
+        let started = Self::start(&executable, profile.clone(), headful).await;
         if started.is_err() {
             let said = std::fs::read_to_string(profile.join("stderr.log")).unwrap_or_default();
             std::fs::remove_dir_all(&profile).ok();
@@ -127,7 +127,7 @@ impl Browser {
         started
     }
 
-    async fn start(executable: &Path, profile: PathBuf) -> Result<Self> {
+    async fn start(executable: &Path, profile: PathBuf, headful: bool) -> Result<Self> {
         let (child_reads, we_write) = std::io::pipe()?;
         let (we_read, child_writes) = std::io::pipe()?;
         let (child_reads, child_writes) = (above_stdio(child_reads)?, above_stdio(child_writes)?);
@@ -136,8 +136,8 @@ impl Browser {
         command
             .arg("--remote-debugging-pipe")
             .arg(format!("--user-data-dir={}", profile.display()))
+            .args((!headful).then_some("--headless"))
             .args([
-                "--headless",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--window-size=1280,900",
@@ -187,6 +187,13 @@ impl Browser {
             .await?;
         let session = attached["sessionId"].as_str().context("no page session")?;
         connection.page.lock().unwrap().main_frame = target.into();
+        connection
+            .send(
+                None,
+                "Target.setDiscoverTargets",
+                json!({ "discover": true }),
+            )
+            .await?;
         let browser = Self {
             session: session.into(),
             connection,
@@ -196,6 +203,12 @@ impl Browser {
         for method in ["Page.enable", "Network.enable", "Accessibility.enable"] {
             browser.call(method, json!({})).await?;
         }
+        browser
+            .call(
+                "Emulation.setFocusEmulationEnabled",
+                json!({ "enabled": true }),
+            )
+            .await?;
         browser
             .call(
                 "Page.addScriptToEvaluateOnNewDocument",
@@ -514,6 +527,19 @@ impl Connection {
                             "Page.handleJavaScriptDialog",
                             json!({ "accept": accept }),
                         )
+                        .await
+                        .ok();
+                });
+            }
+            "Target.targetCreated"
+                if params["targetInfo"]["type"] == "page"
+                    && params["targetInfo"]["targetId"] != page.main_frame.as_str() =>
+            {
+                let connection = self.clone();
+                let target = page.main_frame.clone();
+                tokio::spawn(async move {
+                    connection
+                        .send(None, "Target.activateTarget", json!({ "targetId": target }))
                         .await
                         .ok();
                 });

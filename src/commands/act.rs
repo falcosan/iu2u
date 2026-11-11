@@ -58,6 +58,7 @@ enum Replayed {
 struct Run {
     client: Result<Client>,
     locked: bool,
+    headful: bool,
     model_calls: usize,
     surface: Option<Surface>,
     inputs: Vec<Input>,
@@ -74,6 +75,7 @@ pub async fn act(
     text: &str,
     lock: Option<&Path>,
     locked: bool,
+    headful: bool,
 ) -> Result<Outcome> {
     let script = script::parse(text)?;
     let old: Lock = match lock.map(|path| (path, std::fs::read_to_string(path))) {
@@ -90,6 +92,7 @@ pub async fn act(
     let mut run = Run {
         client,
         locked,
+        headful,
         model_calls: 0,
         surface: None,
         inputs: script.inputs,
@@ -197,7 +200,7 @@ impl Run {
             Step::Open(url) => {
                 if !matches!(self.surface, Some(Surface::Browser(_))) {
                     self.close().await;
-                    self.surface = Some(Surface::Browser(Browser::launch().await?));
+                    self.surface = Some(Surface::Browser(Browser::launch(self.headful).await?));
                 }
                 let Some(Surface::Browser(browser)) = &mut self.surface else {
                     unreachable!()
