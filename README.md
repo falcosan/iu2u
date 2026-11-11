@@ -50,7 +50,7 @@ You need **Rust 1.88+**, **Claude Code**, and a **decision-model server**. The s
 **1. Install the binary.**
 
 ```sh
-cargo install --locked --git https://github.com/falcosan/iu2u
+cargo install --locked iu2u
 ```
 
 Make sure `iu2u` is on the `PATH` Claude Code sees.

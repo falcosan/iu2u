@@ -7,7 +7,12 @@
   "plugins": [
     {
       "name": "iu2u",
-      "source": "./plugins/iu2u",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/falcosan/iu2u.git",
+        "path": "plugins/iu2u",
+        "ref": "v0.1.0"
+      },
       "description": "Powers for coding agents backed by any fast decision model, local or hosted"
     }
   ]
