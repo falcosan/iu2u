@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use common::{answer_always, answer_when, client, fail_always, yes};
 use futures_util::{StreamExt, stream};
-use iu2u::commands::{self, NextRequest};
+use iu2u::commands;
 use serde_json::json;
 use wiremock::MockServer;
 
@@ -108,37 +108,6 @@ async fn filter_stops_on_an_error_while_its_input_stays_open() {
     .expect("filter waited for its input to end");
     assert_eq!(exited.code(), Some(2));
     drop(input);
-}
-
-#[tokio::test]
-async fn next_picks_an_action_and_reports_progress() {
-    let model = MockServer::start().await;
-    answer_always(&model, json!({
-        "action": { "type": "choice", "choice": "login", "confidence": 0.7, "probabilities": { "login": 0.8, "help": 0.2 } },
-        "done": yes(0.1),
-        "stuck": yes(0.05)
-    }))
-    .await;
-    let request: NextRequest = serde_json::from_value(json!({
-        "goal": "sign in",
-        "screen": "Welcome. [login] [help]",
-        "actions": { "login": "Click Log in", "help": "Click Help" }
-    }))
-    .unwrap();
-    let result = commands::next(&client(&model), request).await.unwrap();
-    assert_eq!(
-        result,
-        json!({ "action": "login", "confidence": 0.7, "done": 0.1, "stuck": 0.05 })
-    );
-}
-
-#[tokio::test]
-async fn next_needs_a_real_choice() {
-    let model = MockServer::start().await;
-    let request: NextRequest =
-        serde_json::from_value(json!({ "goal": "g", "screen": "s", "actions": { "only": "One" } }))
-            .unwrap();
-    assert!(commands::next(&client(&model), request).await.is_err());
 }
 
 #[tokio::test]

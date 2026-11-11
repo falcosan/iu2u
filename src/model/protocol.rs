@@ -33,6 +33,8 @@ pub enum Answer {
     Pick {
         pick: String,
         confidence: Option<f64>,
+        #[serde(skip_serializing)]
+        probabilities: BTreeMap<String, f64>,
     },
     Scale {
         level: f64,
@@ -82,6 +84,7 @@ impl Answer {
                     confidence: confidence
                         .or_else(|| answer.get("probabilities")?.get(pick)?.as_f64()),
                     pick: pick.into(),
+                    probabilities: probabilities().unwrap_or_default(),
                 }
             }
             "score" => Self::Scale {
@@ -167,6 +170,7 @@ mod tests {
             Answer::Pick {
                 pick: "x".into(),
                 confidence: Some(0.7),
+                probabilities: BTreeMap::from([("x".into(), 0.7), ("y".into(), 0.3)]),
             }
         );
         assert_eq!(
@@ -177,6 +181,7 @@ mod tests {
             Answer::Pick {
                 pick: "x".into(),
                 confidence: Some(0.6),
+                probabilities: BTreeMap::new(),
             }
         );
     }

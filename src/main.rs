@@ -1,8 +1,12 @@
 use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures_util::{StreamExt, stream};
 use iu2u::{commands, hooks::Power, mcp::Server, model::Client};
@@ -28,8 +32,19 @@ enum Command {
         #[arg(long, default_value_t = 0.5, value_parser = probability)]
         at: f64,
     },
-    #[command(about = "Pick the next UI action from {goal, screen, actions} JSON on stdin")]
-    Next,
+    #[cfg(unix)]
+    #[command(
+        about = "Run scripts that drive the screen toward goals and check what it shows; each file is a script, or stdin is"
+    )]
+    Act {
+        scripts: Vec<PathBuf>,
+        #[arg(
+            long,
+            requires = "scripts",
+            help = "Never ask the decision model: replay the lock files and fail where the screen changed"
+        )]
+        locked: bool,
+    },
 }
 
 fn probability(text: &str) -> Result<f64, String> {
@@ -87,11 +102,8 @@ async fn run(command: Command) -> Result<ExitCode> {
                 }
             });
         }
-        Command::Next => {
-            let request =
-                serde_json::from_str(&read_stdin()?).context("expected {goal, screen, actions}")?;
-            println!("{}", commands::next(&Client::from_env()?, request).await?);
-        }
+        #[cfg(unix)]
+        Command::Act { scripts, locked } => return act(&scripts, locked).await,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -118,6 +130,48 @@ async fn filter(statement: &str, at: f64) -> Result<bool> {
         matched = true;
     }
     Ok(matched)
+}
+
+#[cfg(unix)]
+async fn act(scripts: &[PathBuf], locked: bool) -> Result<ExitCode> {
+    let paths: Vec<Option<&Path>> = if scripts.is_empty() {
+        vec![None]
+    } else {
+        scripts.iter().map(|path| Some(path.as_path())).collect()
+    };
+    let mut exit_code = 0;
+    for path in paths {
+        let lock = path.map(|path| {
+            let mut lock = path.as_os_str().to_owned();
+            lock.push(".lock");
+            PathBuf::from(lock)
+        });
+        let name = path.map_or("-".into(), |path| path.display().to_string());
+        let outcome = async {
+            let text = match path {
+                Some(path) => std::fs::read_to_string(path)
+                    .with_context(|| format!("cannot read {}", path.display()))?,
+                None => read_stdin()?,
+            };
+            commands::act(Client::from_env(), &text, lock.as_deref(), locked).await
+        };
+        let mut report = match outcome.await {
+            Ok(outcome) => {
+                exit_code = exit_code.max(outcome.code);
+                outcome.report
+            }
+            Err(error) => {
+                exit_code = 2;
+                serde_json::json!({ "status": "error", "error": format!("{error:#}") })
+            }
+        };
+        report["script"] = name.into();
+        match writeln!(std::io::stdout(), "{report}") {
+            Err(error) if error.kind() == ErrorKind::BrokenPipe => break,
+            written => written?,
+        }
+    }
+    Ok(ExitCode::from(exit_code))
 }
 
 fn read_stdin() -> Result<String> {

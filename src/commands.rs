@@ -1,5 +1,7 @@
+#[cfg(unix)]
+mod act;
 mod filter;
-mod next;
 
+#[cfg(unix)]
+pub use act::{Outcome, act};
 pub use filter::filter;
-pub use next::{NextRequest, next};

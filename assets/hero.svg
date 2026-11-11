@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="440" viewBox="0 0 880 440" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="340" viewBox="0 0 880 340" role="img" aria-labelledby="title desc">
   <title id="title">iu2u — decision-model powers for coding agents</title>
-  <desc id="desc">Guard blocks irreversible commands and asks before external actions. Proof requires a check. Filter selects matching log entries. Five hooks, four tools, two commands, zero auto-allows.</desc>
-  <path fill="#1A100A" d="M0 0h880v440H0z"/>
+  <desc id="desc">Guard blocks irreversible commands and asks before external actions. Proof requires a check. Filter selects matching log entries.</desc>
+  <path fill="#1A100A" d="M0 0h880v340H0z"/>
   <g fill="#FBF5BE" font-family="Arial,Helvetica,sans-serif">
     <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" letter-spacing="1.2">
       <text x="36" y="39">DECISION-MODEL POWERS</text>
@@ -42,26 +42,6 @@
       <text x="376" y="189">This command reaches beyond this computer.</text>
       <text x="376" y="256">Report a check that proves it.</text>
       <text x="376" y="323">ERROR payment refused: card expired</text>
-    </g>
-  </g>
-  <path fill="#FBF5BE" d="M0 350h880v90H0z"/>
-  <g fill="#1A100A" font-family="Arial,Helvetica,sans-serif">
-    <g font-size="32" font-weight="700">
-      <text x="36" y="394">5</text>
-      <text x="164" y="394">4</text>
-      <text x="280" y="394">2</text>
-      <text x="432" y="394">0</text>
-    </g>
-    <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11">
-      <text x="64" y="393">hooks</text>
-      <text x="192" y="393">tools</text>
-      <text x="308" y="393">commands</text>
-      <text x="460" y="393">auto-allows</text>
-      <text x="36" y="421" font-size="10">Claude Code plugin · Rust · Apache-2.0</text>
-    </g>
-    <g font-size="20" font-weight="700" text-anchor="end">
-      <text x="844" y="389">Probabilities.</text>
-      <text x="844" y="413">One pass.</text>
     </g>
   </g>
 </svg>

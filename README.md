@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/iu2u.svg" width="180" alt="iu2u: a man in a suit pointing at you">
+  <img src="assets/iu2u.svg" width="220" alt="iu2u: a man in a suit pointing at you">
 </p>
 
 <h1 align="center">iu2u</h1>
@@ -10,12 +10,11 @@
 
 <p align="center">
   <a href="https://github.com/falcosan/iu2u/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/falcosan/iu2u/ci.yml?branch=main&amp;style=flat-square&amp;label=ci&amp;labelColor=1A100A" alt="CI status"></a>
-  <img src="https://img.shields.io/badge/Claude_Code-plugin-FBF5BE?style=flat-square&amp;labelColor=1A100A" alt="Claude Code plugin">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-FBF5BE?style=flat-square&amp;labelColor=1A100A" alt="Apache-2.0 license"></a>
 </p>
 
 <p align="center">
-  <img src="assets/hero.svg" width="880" alt="iu2u examples: guard blocks an irreversible command and asks before a remote action; proof requests a reported check; filter selects failure logs. Five hooks, four tools, two commands, zero automatic approvals.">
+  <img src="assets/hero.svg" width="880" alt="iu2u examples: guard blocks an irreversible command and asks before a remote action; proof requests a reported check; filter selects failure logs.">
 </p>
 
 <p align="center">
@@ -131,24 +130,48 @@ iu2u filter "This line reports a failure" --at 0.8 < app.log
 
 Matching lines stream out in input order. Exit codes follow grep: **0** for a match, **1** for no matches, **2** for an error.
 
-### Pick the next move
+### Drive a browser or a Mac app
 
-Give `next` a goal, a text description of the screen, and at least two candidate actions:
+`act` runs a script, one sentence per line. It drives a real browser or a native Mac app toward each goal, then checks what the screen shows.
 
-```sh
-iu2u next <<'JSON'
-{
-  "goal": "log in",
-  "screen": "The login form is filled in. Log in and Help are visible.",
-  "actions": {
-    "login": "Click Log in",
-    "help": "Click Help"
-  }
-}
-JSON
+```text
+# tests/checkout.e2e
+open http://localhost:3000
+with email = qa@example.com
+with password = $SHOP_PASSWORD
+do sign in
+do add the cheapest red shirt to the cart
+expect the cart shows one red shirt
+see "Total"
 ```
 
-It returns JSON with `action`, `confidence`, `done`, and `stuck`. The last two are probabilities. Your test script executes the selected action.
+```sh
+iu2u act tests/*.e2e
+```
+
+| Line                    | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `open <url>`            | Opens the page in a headless Chrome, Chromium, Edge or Brave.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `app <name>`            | Opens a Mac app, such as `app Notes`, and drives it through its accessibility tree. It drives the app as it is, with your real documents.                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `with <name> = <value>` | A value the model may type; quote it to keep a leading `$`, such as `"$5"`. `$NAME` reads an environment variable and stays secret: wherever the screen shows the whole value, the model sees only its name, and a step stops rather than send it in pieces. Text the page restyles, such as in upper case, is not caught. Use long, unique secrets: a short or common one, such as `2024`, also hides that text elsewhere on the screen or stops the step. Text on the page can steer which field gets a value, so use test-only secrets and open only pages you trust. |
+| `do <goal>`             | Acts until the goal is reached: press, type, choose, Enter, scroll. Typing replaces the whole text of a field. A goal may take up to 15 actions; split longer ones. Text in quotes in the goal can be typed too.                                                                                                                                                                                                                                                                                                                                                         |
+| `expect <claim>`        | Asks the model whether the screen confirms the claim. It passes, fails or is **inconclusive**, which never passes.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `see "<text>"`          | Checks that the text is on the screen, without the model.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+
+Each decision costs one request, including the last one that confirms the goal, and `act` acts only when the model picks the same target with the options in reverse order. When a script passes, `act` writes `<script>.lock` next to it. Later runs replay it: actions whose controls still match, and claims about an unchanged screen, need no model at all. When a control is renamed, one request recognizes it or decides afresh. With `--locked`, `act` never asks the model and fails wherever the screen changed, so CI stays deterministic. A step whose screen shows text that changes on every run, such as a clock or an order number, cannot replay locked.
+
+Without files, `act` reads one script from stdin, so your agent can hand it a task:
+
+```sh
+iu2u act <<'EOF'
+app Notes
+do create a new note that says "Buy milk"
+EOF
+```
+
+Each script prints one JSON report: every step, how it was settled (`browser`, `app`, `model`, `replay`, `healed`, `cache` or `check`), the model calls and the final screen text. Exit codes: **0** when everything passed, **1** when a step failed, **2** when a script could not run or stopped on an error; the report still lists the steps and actions done before it.
+
+`act` needs macOS or Linux. For the browser it finds Chrome, Chromium, Edge or Brave; set `IU2U_BROWSER` to use another executable. It accepts `confirm()` dialogs and dismisses `alert()` and `prompt()`, showing each one on the screen; it stays on its first tab, does not see inside iframes and offers the model the first 254 controls and the first 6000 characters of a screen, and says so when it cuts one. Only controls with an accessible role can be used: a `<div>` or `<span>` with a click handler and no `role` is not offered. Mac apps open and are driven in the background, so `act` never takes over your keyboard or mouse. An app whose accessibility tree takes more than 2 seconds to read is cut short, the screen says so, and its runs may not replay with `--locked`. For Mac apps, allow the app that runs `iu2u`, such as your terminal or editor, in **System Settings › Privacy & Security › Accessibility**.
 
 ## How it works
 
@@ -203,6 +226,7 @@ Inside Claude Code, plugin options take precedence. For standalone commands and 
 | `trim`        | `IU2U_TRIM`          | `false`                          |
 | `compass`     | `IU2U_COMPASS`       | `false`                          |
 | `prune`       | `IU2U_PRUNE`         | `false`                          |
+| —             | `IU2U_BROWSER`       | The first browser found          |
 
 Use the server's base URL: iu2u appends `/v1/systemone`. The API key is sent as a bearer token. Hook switches accept `true` or `false`.
 
