@@ -1,6 +1,6 @@
 [package]
 name = "iu2u"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Decision-model powers for coding agents: any decision model, local or hosted, as MCP tools and hooks"

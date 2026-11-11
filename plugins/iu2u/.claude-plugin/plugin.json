@@ -1,7 +1,7 @@
 {
   "name": "iu2u",
   "displayName": "iu2u",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Powers for coding agents backed by any fast decision model, local or hosted: a shell-command guard that never auto-allows, proof before claiming done, output trimming, skill hints, compaction guidance, and tools to weigh, rank, seek and lint",
   "author": {
     "name": "Daniele Falchetti"
