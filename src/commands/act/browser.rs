@@ -212,6 +212,12 @@ impl Browser {
             .await?;
         browser
             .call(
+                "Emulation.setEmulatedMedia",
+                json!({ "features": [{ "name": "prefers-reduced-motion", "value": "reduce" }] }),
+            )
+            .await?;
+        browser
+            .call(
                 "Page.addScriptToEvaluateOnNewDocument",
                 json!({ "source": WATCH }),
             )

@@ -8,6 +8,7 @@ use serde_json::Value;
 
 const PASSED: Style = AnsiColor::Green.on_default();
 const FAILED: Style = AnsiColor::Red.on_default();
+const UNSURE: Style = AnsiColor::Yellow.on_default();
 const BADGE: Style = AnsiColor::White
     .on_default()
     .bg_color(Some(Color::Ansi(AnsiColor::Red)))
@@ -21,6 +22,7 @@ const RULE: &str = "⎯⎯⎯⎯⎯⎯⎯";
 #[derive(Default)]
 struct Tally {
     passed: usize,
+    unsure: usize,
     failed: usize,
 }
 
@@ -66,12 +68,12 @@ impl Reporter {
         if self.json {
             return;
         }
-        let passed = step["status"] == "passed";
+        let status = &step["status"];
         let mut text = String::new();
         writeln!(
             text,
             "  {} {}{DIM}{}{DIM:#}",
-            mark(passed),
+            mark(status),
             field(&step["step"]),
             duration(step)
         )
@@ -80,7 +82,11 @@ impl Reporter {
             writeln!(text, "    {DIM}› {}{DIM:#}", field(action)).ok();
         }
         if let Some(detail) = step["detail"].as_str() {
-            let style = if passed { DIM } else { FAILED };
+            let style = if status == "passed" {
+                DIM
+            } else {
+                look(status).1
+            };
             writeln!(text, "    {style}→ {}{style:#}", escaped(detail)).ok();
         }
         self.emit(&text);
@@ -95,9 +101,9 @@ impl Reporter {
         let passed = report["status"] == "passed";
         let steps = report["steps"].as_array().map_or(&[][..], Vec::as_slice);
         for step in steps {
-            count(&mut self.steps, step["status"] == "passed");
+            count(&mut self.steps, &step["status"]);
         }
-        count(&mut self.scripts, passed);
+        count(&mut self.scripts, &report["status"]);
         let calls = report["model_calls"].as_u64().unwrap_or_default();
         self.model_calls += calls;
         let failing = steps.iter().find(|step| step["status"] != "passed");
@@ -113,7 +119,7 @@ impl Reporter {
         writeln!(
             text,
             "{} {name}{DIM}{}{calls}{DIM:#}\n",
-            mark(passed),
+            mark(&report["status"]),
             duration(report)
         )
         .ok();
@@ -166,20 +172,25 @@ impl Reporter {
     }
 }
 
-fn count(tally: &mut Tally, passed: bool) {
-    if passed {
-        tally.passed += 1;
-    } else {
-        tally.failed += 1;
+fn count(tally: &mut Tally, status: &Value) {
+    match status.as_str() {
+        Some("passed") => tally.passed += 1,
+        Some("inconclusive") => tally.unsure += 1,
+        _ => tally.failed += 1,
     }
 }
 
-fn mark(passed: bool) -> String {
-    if passed {
-        format!("{PASSED}✓{PASSED:#}")
-    } else {
-        format!("{FAILED}✗{FAILED:#}")
+fn look(status: &Value) -> (&'static str, Style) {
+    match status.as_str() {
+        Some("passed") => ("✓", PASSED),
+        Some("inconclusive") => ("?", UNSURE),
+        _ => ("✗", FAILED),
     }
+}
+
+fn mark(status: &Value) -> String {
+    let (glyph, style) = look(status);
+    format!("{style}{glyph}{style:#}")
 }
 
 fn duration(report: &Value) -> String {
@@ -194,14 +205,18 @@ fn tally(tally: &Tally) -> String {
         let style = FAILED.bold();
         parts.push(format!("{style}{} failed{style:#}", tally.failed));
     }
-    if tally.passed > 0 || tally.failed == 0 {
+    if tally.unsure > 0 {
+        let style = UNSURE.bold();
+        parts.push(format!("{style}{} unsure{style:#}", tally.unsure));
+    }
+    if tally.passed > 0 || parts.is_empty() {
         let style = PASSED.bold();
         parts.push(format!("{style}{} passed{style:#}", tally.passed));
     }
     format!(
         "{} {DIM}({}){DIM:#}",
         parts.join(&format!(" {DIM}|{DIM:#} ")),
-        tally.passed + tally.failed
+        tally.passed + tally.unsure + tally.failed
     )
 }
 

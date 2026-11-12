@@ -31,6 +31,7 @@ const MAX_DECISIONS: usize = 30;
 const SEE_WITHIN: Duration = Duration::from_secs(5);
 const SEE_EVERY: Duration = Duration::from_millis(200);
 const REPORT_SCREEN_CHARS: usize = 3000;
+const FLOAT_SLACK: f64 = 1e-9;
 const CHANGED: &str = "the screen does not match the lock file; run without --locked to update it";
 const NOT_LOCKED: &str = "this step is not in the lock file; run without --locked to record it";
 
@@ -178,6 +179,10 @@ pub async fn act(
         },
         report,
     })
+}
+
+fn percent(probability: f64) -> u32 {
+    (probability * 100.0 + FLOAT_SLACK).floor() as u32
 }
 
 fn seconds(since: Instant) -> f64 {
@@ -552,7 +557,17 @@ impl Run {
         let state = decide::screen_state(&screen);
         let answers = self.ask(&state, &decide::claim(claim)).await?;
         let (verdict, holds) = decide::verdict(&answers)?;
-        let mut detail = format!("holds {holds:.2}");
+        let sure = percent(holds);
+        let mut detail = match verdict {
+            Verdict::Holds => format!("the model is {sure}% sure it holds"),
+            Verdict::Contradicted => {
+                format!("the model says it does not hold: {sure}% sure it holds")
+            }
+            Verdict::Inconclusive => format!(
+                "the model is unsure: {sure}% sure it holds, a pass needs {}%",
+                percent(decide::HOLDS_AT)
+            ),
+        };
         if decide::cut(&screen) {
             write!(detail, "; {}", decide::cut_note()).ok();
         }
@@ -604,5 +619,18 @@ impl Run {
         if let Some(surface) = self.surface.take() {
             surface.close().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percents_round_down_without_float_noise() {
+        assert_eq!(percent(0.29), 29);
+        assert_eq!(percent(0.58), 58);
+        assert_eq!(percent(0.74996), 74);
+        assert_eq!(percent(decide::HOLDS_AT), 75);
     }
 }

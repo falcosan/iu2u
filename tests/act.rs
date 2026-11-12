@@ -286,6 +286,10 @@ async fn a_script_on_stdin_reports_a_broken_claim_and_exits_one() {
     assert_eq!(report["script"], "-");
     assert_eq!(report["steps"].as_array().unwrap().len(), 2);
     assert_eq!(report["steps"][1]["status"], "failed");
+    assert_eq!(
+        report["steps"][1]["detail"],
+        "the model says it does not hold: 10% sure it holds"
+    );
 }
 
 fn long_claim(name: &str) -> std::path::PathBuf {
@@ -889,6 +893,17 @@ async fn a_reordered_list_is_not_replayed_by_position() {
 }
 
 #[test]
+fn pages_are_asked_to_reduce_motion() {
+    let script = script(
+        "motion",
+        "<!doctype html><p id=\"m\"></p><script>m.textContent = matchMedia('(prefers-reduced-motion: reduce)').matches ? 'Motion reduced' : 'Motion on';</script>",
+        "open PAGE\nsee \"Motion reduced\"\n",
+    );
+    let (output, report) = act(&script, None, false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+}
+
+#[test]
 fn several_scripts_exit_with_the_worst_result() {
     let page = "<!doctype html><p>Hello</p>";
     let failing = script("failing", page, "open PAGE\nsee \"Goodbye\"\n");
@@ -975,9 +990,32 @@ async fn the_results_say_how_much_the_model_saw_for_a_claim_that_holds() {
     assert_eq!(output.status.code(), Some(0), "{shown}");
     assert!(
         shown.contains("  ✓ expect the cart total is 5 dollars")
-            && shown.contains("    → holds 0.95; the model saw only the first 6000 characters"),
+            && shown.contains(
+                "    → the model is 95% sure it holds; the model saw only the first 6000 characters"
+            ),
         "{shown}"
     );
+}
+
+#[tokio::test]
+async fn the_results_mark_an_unsure_claim_and_say_what_a_pass_needs() {
+    let model = MockServer::start().await;
+    answer_always(&model, json!({ "holds": yes(0.74996) })).await;
+    let script = script(
+        "unsure",
+        "<!doctype html><p>Hello</p>",
+        "open PAGE\nexpect the page greets the visitor\n",
+    );
+    let (output, shown) = shown(&[&script], Some(&model), false);
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    for expected in [
+        "  ? expect the page greets the visitor ",
+        "    → the model is unsure: 74% sure it holds, a pass needs 75%\n",
+        "      Steps  1 unsure | 1 passed (2)\n",
+        "    Scripts  1 failed (1)\n",
+    ] {
+        assert!(shown.contains(expected), "{expected:?} not in:\n{shown}");
+    }
 }
 
 #[tokio::test]

@@ -10,11 +10,11 @@ use crate::clip;
 use crate::model::{Answer, Answers, Question, Questions};
 
 pub(super) const SCREEN_CHARS: usize = 6000;
+pub(super) const HOLDS_AT: f64 = 0.75;
 const OPERATION_AT: f64 = 0.5;
 const TARGET_AT: f64 = 0.3;
 const RECOGNIZED_AT: f64 = 0.6;
 const MARGIN: f64 = 0.1;
-const HOLDS_AT: f64 = 0.75;
 const NONE: &str = "none";
 const REVERSED: &str = "_reversed";
 
