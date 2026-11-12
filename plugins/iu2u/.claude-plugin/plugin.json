@@ -1,7 +1,7 @@
 {
   "name": "iu2u",
   "displayName": "iu2u",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Powers for coding agents backed by any fast decision model, local or hosted: a shell-command guard that never auto-allows, proof before claiming done, output trimming, skill hints, compaction guidance, and tools to weigh, rank, seek and lint",
   "author": {
     "name": "Daniele Falchetti"
@@ -69,9 +69,7 @@
   "mcpServers": {
     "iu2u": {
       "command": "iu2u",
-      "args": [
-        "mcp"
-      ],
+      "args": ["mcp"],
       "env": {
         "IU2U_BASE_URL": "${user_config.base_url}",
         "IU2U_MODEL": "${user_config.model}",
