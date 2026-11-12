@@ -169,7 +169,35 @@ do create a new note that says "Buy milk"
 EOF
 ```
 
-Each script prints one JSON report: every step, how it was settled (`browser`, `app`, `model`, `replay`, `healed`, `cache` or `check`), the model calls and the final screen text. Exit codes: **0** when everything passed, **1** when a step failed, **2** when a script could not run or stopped on an error; the report still lists the steps and actions done before it.
+`act` shows each script while it runs: every step with ✓ or ✗ and its time, the actions it took, and its note, such as how sure the model was, that it saw only part of the screen, or why the step failed. At the end it lists the failures, each with the lines of its script around the failing one, then the scripts, steps, model calls and time in total:
+
+```text
+▶ e2e/checkout.e2e
+  ✓ open https://shop.example.com 0.9s
+  ✓ do add the blue mug to the cart 2.1s
+    › pressed button "Add to cart" · in "Blue mug"
+  ✗ see "1 item" 5.0s
+    → "1 item" is not on the screen
+✗ e2e/checkout.e2e 8.0s · 3 model calls
+
+⎯⎯⎯⎯⎯⎯⎯ Failures 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  e2e/checkout.e2e:3 › see "1 item"
+"1 item" is not on the screen
+
+    1 | open https://shop.example.com
+    2 | do add the blue mug to the cart
+  > 3 | see "1 item"
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+    Scripts  1 failed (1)
+      Steps  1 failed | 2 passed (3)
+Model calls  3
+   Duration  8.0s
+```
+
+Colors appear only on a terminal; `NO_COLOR` turns them off and `CLICOLOR_FORCE` turns them on. With `--json`, each script prints one JSON report instead: every step with how it was settled (`browser`, `app`, `model`, `replay`, `healed`, `cache` or `check`) and its seconds, the model calls and the final screen text. Exit codes: **0** when everything passed, **1** when a step failed, **2** when a script could not run or stopped on an error; the output still lists the steps and actions done before it.
 
 `act` needs macOS or Linux. For the browser it finds Chrome, Chromium, Edge or Brave; set `IU2U_BROWSER` to use another executable. It accepts `confirm()` dialogs and dismisses `alert()` and `prompt()`, showing them on the screen, ten at most; it stays on its first tab, does not see inside iframes and offers the model the first 254 controls and the first 6000 characters of a screen, and says so when it cuts one. A request carries that screen text and one question with up to 254 options, which can pass 10,000 tokens: a model server with less room rejects it, and the step stops with the server's error. Only controls with an accessible role can be used: a `<div>` or `<span>` with a click handler and no `role` is not offered. Mac apps open and are driven in the background, so `act` never takes over your keyboard or mouse. An app whose accessibility tree has more than 3000 elements or takes more than 2 seconds to read is cut short, the screen says so, and its runs may not replay with `--locked`. For Mac apps, allow the app that runs `iu2u`, such as your terminal or editor, in **System Settings › Privacy & Security › Accessibility**.
 

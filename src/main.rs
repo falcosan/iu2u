@@ -46,6 +46,11 @@ enum Command {
         locked: bool,
         #[arg(long, help = "Show the browser window instead of running it headless")]
         headful: bool,
+        #[arg(
+            long,
+            help = "Print one JSON report per script instead of the readable results"
+        )]
+        json: bool,
     },
 }
 
@@ -106,8 +111,9 @@ async fn run(command: Command) -> Result<ExitCode> {
             scripts,
             locked,
             headful,
+            json,
         } => {
-            return Ok(act(&scripts, locked, headful)
+            return Ok(act(&scripts, locked, headful, json)
                 .await
                 .unwrap_or_else(|error| failed(&error)));
         }
@@ -145,12 +151,13 @@ async fn filter(statement: &str, at: f64) -> Result<bool> {
 }
 
 #[cfg(unix)]
-async fn act(scripts: &[PathBuf], locked: bool, headful: bool) -> Result<ExitCode> {
+async fn act(scripts: &[PathBuf], locked: bool, headful: bool, json: bool) -> Result<ExitCode> {
     let paths: Vec<Option<&Path>> = if scripts.is_empty() {
         vec![None]
     } else {
         scripts.iter().map(|path| Some(path.as_path())).collect()
     };
+    let mut reporter = commands::Reporter::new(json);
     let mut exit_code = 0;
     for path in paths {
         let lock = path.map(|path| {
@@ -159,30 +166,44 @@ async fn act(scripts: &[PathBuf], locked: bool, headful: bool) -> Result<ExitCod
             PathBuf::from(lock)
         });
         let name = path.map_or("-".into(), |path| path.display().to_string());
+        reporter.start(&name);
         let outcome = async {
             let text = match path {
                 Some(path) => std::fs::read_to_string(path)
                     .with_context(|| format!("cannot read {}", path.display()))?,
                 None => read_stdin()?,
             };
-            commands::act(Client::from_env(), &text, lock.as_deref(), locked, headful).await
+            let outcome = commands::act(
+                Client::from_env(),
+                &text,
+                lock.as_deref(),
+                locked,
+                headful,
+                |step| reporter.step(step),
+            )
+            .await?;
+            anyhow::Ok((text, outcome))
         };
-        let mut report = match outcome.await {
-            Ok(outcome) => {
+        let (text, mut report) = match outcome.await {
+            Ok((text, outcome)) => {
                 exit_code = exit_code.max(outcome.code);
-                outcome.report
+                (Some(text), outcome.report)
             }
             Err(error) => {
                 exit_code = 2;
-                serde_json::json!({ "status": "error", "error": format!("{error:#}") })
+                let report =
+                    serde_json::json!({ "status": "error", "error": format!("{error:#}") });
+                (None, report)
             }
         };
         report["script"] = name.into();
-        match writeln!(std::io::stdout(), "{report}") {
-            Err(error) if error.kind() == ErrorKind::BrokenPipe => break,
-            written => written?,
+        reporter.finish(&report, text.as_deref());
+        if reporter.broken() {
+            break;
         }
     }
+    reporter.summary();
+    reporter.close()?;
     Ok(ExitCode::from(exit_code))
 }
 
