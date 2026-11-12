@@ -3,6 +3,7 @@ mod decide;
 mod lock;
 #[cfg(target_os = "macos")]
 mod mac;
+mod reporter;
 mod screen;
 mod script;
 mod surface;
@@ -20,6 +21,7 @@ use crate::model::{Answers, Client, Questions};
 use browser::Browser;
 use decide::{Decision, Input, Verdict};
 use lock::{Lock, Move, Recorded, Replay};
+pub use reporter::Reporter;
 use screen::{MAX_ELEMENTS, Screen};
 use script::Step;
 use surface::{Action, Surface};
@@ -74,6 +76,7 @@ pub async fn act(
     lock: Option<&Path>,
     locked: bool,
     headful: bool,
+    mut on_step: impl FnMut(&Value),
 ) -> Result<Outcome> {
     let script = script::parse(text)?;
     let old: Lock = match lock.map(|path| (path, std::fs::read_to_string(path))) {
@@ -113,23 +116,26 @@ pub async fn act(
             .or_insert(1);
         let key = lock::key(&text, *occurrence);
         run.done.clear();
+        let began = Instant::now();
         let (settled, via, detail) = match run.step(&key, step).await {
             Ok(report) => (report.status, Some(report.via), report.detail),
             Err(failure) => {
-                let message = format!("line {line}: {text}: {failure:#}");
-                error = Some(message.clone());
-                ("error", None, Some(message))
+                error = Some(format!("line {line}: {text}: {failure:#}"));
+                ("error", None, Some(format!("{failure:#}")))
             }
         };
         let actions = std::mem::take(&mut run.done);
-        steps.push(json!({
+        let reported = json!({
             "line": line,
             "step": text,
             "status": settled,
             "via": via,
             "actions": actions,
             "detail": detail,
-        }));
+            "seconds": seconds(began),
+        });
+        on_step(&reported);
+        steps.push(reported);
         if settled != "passed" {
             status = if settled == "error" {
                 "error"
@@ -158,7 +164,7 @@ pub async fn act(
         "status": status,
         "steps": steps,
         "model_calls": run.model_calls,
-        "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+        "seconds": seconds(started),
         "screen": clip(&run.screen, REPORT_SCREEN_CHARS),
     });
     if let Some(error) = error {
@@ -172,6 +178,10 @@ pub async fn act(
         },
         report,
     })
+}
+
+fn seconds(since: Instant) -> f64 {
+    (since.elapsed().as_secs_f64() * 10.0).round() / 10.0
 }
 
 impl Report {

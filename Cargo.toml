@@ -1,6 +1,6 @@
 [package]
 name = "iu2u"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Decision-model powers for coding agents: any decision model, local or hosted, as MCP tools and hooks"
@@ -10,6 +10,8 @@ keywords = ["mcp", "claude-code", "codex", "decision-model", "agents"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
+anstream = "1"
+anstyle = "1"
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 reqwest = { version = "0.13", features = ["json"] }

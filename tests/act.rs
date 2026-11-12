@@ -10,7 +10,7 @@ use std::time::Duration;
 use common::{answer_always, reply, temp_path, yes};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method};
-use wiremock::{Mock, MockServer};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SHOP: &str = r#"<!doctype html><title>Shop</title>
 <h1>Sign in</h1>
@@ -112,21 +112,28 @@ fn edit_page(script: &Path, from: &str, to: &str) {
     .unwrap();
 }
 
-fn act(script: &Path, model: Option<&MockServer>, locked: bool) -> (Output, Value) {
+fn command(model: Option<&MockServer>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_iu2u"));
     command
         .arg("act")
-        .arg(script)
-        .args(locked.then_some("--locked"))
         .env_remove("IU2U_MODEL")
-        .env_remove("CLAUDE_PLUGIN_OPTION_MODEL")
-        .env("IU2U_TEST_SECRET", SECRET);
+        .env_remove("CLAUDE_PLUGIN_OPTION_MODEL");
     if let Some(model) = model {
         command
             .env("IU2U_BASE_URL", model.uri())
             .env("IU2U_MODEL", "model-x");
     }
-    let output = command.output().unwrap();
+    command
+}
+
+fn act(script: &Path, model: Option<&MockServer>, locked: bool) -> (Output, Value) {
+    let output = command(model)
+        .arg("--json")
+        .arg(script)
+        .args(locked.then_some("--locked"))
+        .env("IU2U_TEST_SECRET", SECRET)
+        .output()
+        .unwrap();
     let report = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
         panic!(
             "not a report: {}{}",
@@ -144,7 +151,7 @@ fn act_with_browser(name: &str, browser: &str, flag: Option<&str>) -> (Output, V
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     let script = script(name, "<!doctype html><p>Hi</p>", "open PAGE\nsee \"Hi\"\n");
     let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .arg("act")
+        .args(["act", "--json"])
         .args(flag)
         .arg(&script)
         .env("IU2U_BROWSER", &path)
@@ -178,6 +185,14 @@ async fn act_reaches_a_goal_records_it_and_replays_it_without_the_model() {
         ])
     );
     assert_eq!(report["model_calls"], 8);
+    assert!(
+        report["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["seconds"].is_f64()),
+        "{report}"
+    );
     let lock = std::fs::read_to_string(format!("{}.lock", script.display())).unwrap();
     assert!(lock.contains("\"move\": \"press\""));
 
@@ -253,10 +268,8 @@ async fn a_script_on_stdin_reports_a_broken_claim_and_exits_one() {
     answer_always(&model, json!({ "holds": yes(0.1) })).await;
     let page = temp_path("claim.html");
     std::fs::write(&page, SHOP.replace("BUTTON", "Sign in")).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .arg("act")
-        .env("IU2U_BASE_URL", model.uri())
-        .env("IU2U_MODEL", "model-x")
+    let mut child = command(Some(&model))
+        .arg("--json")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -275,20 +288,23 @@ async fn a_script_on_stdin_reports_a_broken_claim_and_exits_one() {
     assert_eq!(report["steps"][1]["status"], "failed");
 }
 
-#[tokio::test]
-async fn a_claim_about_a_long_screen_says_how_much_the_model_saw() {
-    let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.1) })).await;
+fn long_claim(name: &str) -> std::path::PathBuf {
     let links: String = (0..300)
         .map(|index| format!("<a href=\"#{index}\">Menu entry {index}</a>"))
         .collect();
     let page = format!("<!doctype html><nav>{links}</nav><p>Cart total 5 dollars</p>");
-    let script = script(
-        "long",
+    script(
+        name,
         &page,
         "open PAGE\nexpect the cart total is 5 dollars\n",
-    );
-    let (output, report) = act(&script, Some(&model), false);
+    )
+}
+
+#[tokio::test]
+async fn a_claim_about_a_long_screen_says_how_much_the_model_saw() {
+    let model = MockServer::start().await;
+    answer_always(&model, json!({ "holds": yes(0.1) })).await;
+    let (output, report) = act(&long_claim("long"), Some(&model), false);
     assert_eq!(output.status.code(), Some(1), "{report}");
     assert!(
         report["steps"][1]["detail"]
@@ -359,7 +375,7 @@ fn an_empty_secret_stops_the_script_before_it_runs() {
         "open PAGE\nwith password = $IU2U_EMPTY_SECRET\ndo sign in\n",
     );
     let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .arg("act")
+        .args(["act", "--json"])
         .arg(&script)
         .env("IU2U_EMPTY_SECRET", "")
         .output()
@@ -878,7 +894,7 @@ fn several_scripts_exit_with_the_worst_result() {
     let failing = script("failing", page, "open PAGE\nsee \"Goodbye\"\n");
     let passing = script("passing", page, "open PAGE\nsee \"Hello\"\n");
     let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .arg("act")
+        .args(["act", "--json"])
         .arg(&failing)
         .arg(&passing)
         .output()
@@ -902,6 +918,121 @@ fn several_scripts_exit_with_the_worst_result() {
         statuses,
         [(failing.as_str(), "failed"), (passing.as_str(), "passed")]
     );
+}
+
+fn shown(scripts: &[&Path], model: Option<&MockServer>, colored: bool) -> (Output, String) {
+    let mut command = command(model);
+    command
+        .args(scripts)
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR_FORCE");
+    if colored {
+        command.env("CLICOLOR_FORCE", "1");
+    }
+    let output = command.output().unwrap();
+    let shown = String::from_utf8_lossy(&output.stdout).into_owned();
+    (output, shown)
+}
+
+#[test]
+fn the_results_show_each_step_the_failing_line_of_its_script_and_the_totals() {
+    let page = "<!doctype html><p>Hello</p>";
+    let failing = script(
+        "readable-failing",
+        page,
+        "open PAGE\nsee \"Hello\"\nsee \"Goodbye\"\n\tsee \"Hello\"\n",
+    );
+    let passing = script("readable-passing", page, "open PAGE\nsee \"Hello\"\n");
+    let broken = script("readable-broken", page, "bogus step\n");
+    let (output, shown) = shown(&[&failing, &passing, &broken], None, false);
+    assert_eq!(output.status.code(), Some(2), "{shown}");
+    for expected in [
+        format!("▶ {}\n", failing.display()),
+        "  ✓ see \"Hello\" ".into(),
+        "  ✗ see \"Goodbye\" ".into(),
+        "    → \"Goodbye\" is not on the screen\n".into(),
+        format!(" FAIL  {}:3 › see \"Goodbye\"\n", failing.display()),
+        "  > 3 | see \"Goodbye\"\n    4 | \tsee \"Hello\"\n".into(),
+        format!("✓ {} ", passing.display()),
+        "  → line 1: unknown step \"bogus\"".into(),
+        format!(
+            " FAIL  {}\nline 1: unknown step \"bogus\"",
+            broken.display()
+        ),
+        "    Scripts  2 failed | 1 passed (3)\n".into(),
+        "      Steps  1 failed | 4 passed (5)\n".into(),
+    ] {
+        assert!(shown.contains(&expected), "{expected:?} not in:\n{shown}");
+    }
+    assert!(!shown.contains('\x1b'), "{shown}");
+}
+
+#[tokio::test]
+async fn the_results_say_how_much_the_model_saw_for_a_claim_that_holds() {
+    let model = MockServer::start().await;
+    answer_always(&model, json!({ "holds": yes(0.95) })).await;
+    let (output, shown) = shown(&[&long_claim("long-readable")], Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{shown}");
+    assert!(
+        shown.contains("  ✓ expect the cart total is 5 dollars")
+            && shown.contains("    → holds 0.95; the model saw only the first 6000 characters"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn the_results_escape_control_characters_from_the_model_server() {
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(422).set_body_string("bad \u{1b}]0;owned\u{7}"))
+        .mount(&model)
+        .await;
+    let script = script(
+        "escaped",
+        "<!doctype html><p>Hello</p>",
+        "open PAGE\nexpect the page says hello\n",
+    );
+    let (output, shown) = shown(&[&script], Some(&model), true);
+    assert_eq!(output.status.code(), Some(2), "{shown}");
+    assert!(
+        shown.contains("bad \\u{1b}]0;owned\\u{7}") && !shown.contains('\u{7}'),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn the_json_report_keeps_every_character_the_model_server_sent() {
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(422).set_body_string("bad \u{7f} body"))
+        .mount(&model)
+        .await;
+    let script = script(
+        "raw",
+        "<!doctype html><p>Hello</p>",
+        "open PAGE\nexpect the page says hello\n",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(2), "{report}");
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap()
+            .contains("bad \u{7f} body"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_results_are_colored_when_colors_are_forced() {
+    let script = script(
+        "colored",
+        "<!doctype html><p>Hello</p>",
+        "open PAGE\nsee \"Hello\"\n",
+    );
+    let (output, shown) = shown(&[&script], None, true);
+    assert_eq!(output.status.code(), Some(0), "{shown}");
+    assert!(shown.contains("\x1b[32m✓"), "{shown}");
 }
 
 #[tokio::test]
@@ -1043,6 +1174,13 @@ async fn an_error_mid_script_keeps_what_was_already_done() {
     );
     assert!(
         report["error"].as_str().unwrap().contains("line 3"),
+        "{report}"
+    );
+    assert!(
+        report["error"].as_str().unwrap().ends_with(&format!(
+            ": {}",
+            report["steps"][1]["detail"].as_str().unwrap()
+        )),
         "{report}"
     );
 }
