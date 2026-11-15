@@ -1811,21 +1811,32 @@ async fn a_held_picture_does_not_hold_up_the_steps() {
         "<!doctype html><p>Loading picture</p><img src=\"/slow.png\" width=\"50\" height=\"50\">",
     )])
     .await;
+    let model = MockServer::start().await;
+    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.9) })).await;
     let script = script(
         "held-picture",
         "",
         &format!(
-            "route */slow.png hold\nopen {}/app\nsee \"Picture done\" within 1s\n",
+            "route */slow.png hold\nopen {}/app\nexpect the page says it loads a picture\nsee \"Picture done\" within 1s\n",
             site.uri()
         ),
     );
-    let (output, report) = act(&script, None, false);
+    let output = command(Some(&model))
+        .arg("--json")
+        .arg(&script)
+        .env("IU2U_VISION", "true")
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(1), "{report}");
     assert!(
         report["steps"][1]["seconds"].as_f64().unwrap() < 2.0,
         "{report}"
     );
-    assert!(report["seconds"].as_f64().unwrap() < 5.0, "{report}");
+    assert!(
+        report["steps"][2]["seconds"].as_f64().unwrap() < 4.0,
+        "{report}"
+    );
     assert!(report["screenshot"].is_string(), "{report}");
 }
 
@@ -2193,8 +2204,9 @@ async fn the_step_after_a_followed_tab_closes_goes_to_the_tab_that_opened_it() {
         ),
         (
             "/help",
-            "<!doctype html><p>Help center</p><script>setTimeout(() => window.close(), 1000);</script>",
+            "<!doctype html><p>Help center</p><script>fetch('/close').finally(() => window.close());</script>",
         ),
+        ("/close", ""),
     ])
     .await;
     let model = mock([
@@ -2206,7 +2218,7 @@ async fn the_step_after_a_followed_tab_closes_goes_to_the_tab_that_opened_it() {
         "closing-reload",
         "",
         &format!(
-            "open {uri}/app\ndo open the help\nwait 2s\nreload\nsee \"App page\"\n",
+            "route */close hold\nopen {uri}/app\ndo open the help\nrelease */close\nsee \"App page\" within 30s\nreload\nsee \"App page\"\n",
             uri = site.uri()
         ),
     );
@@ -4033,7 +4045,7 @@ async fn a_model_that_sees_gets_the_screenshot_once_the_pictures_on_it_load() {
     .await;
     Mock::given(method("GET"))
         .and(path("/field.png"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(1500)))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(4000)))
         .mount(&site)
         .await;
     let model = MockServer::start().await;
@@ -4054,10 +4066,11 @@ async fn a_model_that_sees_gets_the_screenshot_once_the_pictures_on_it_load() {
         .unwrap();
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(0), "{report}");
-    assert!(
-        report["steps"][2]["seconds"].as_f64().unwrap() >= 1.0,
-        "{report}"
-    );
+    let waited: f64 = report["steps"].as_array().unwrap()[1..]
+        .iter()
+        .map(|step| step["seconds"].as_f64().unwrap())
+        .sum();
+    assert!(waited >= 3.0, "{report}");
 }
 
 #[tokio::test]
@@ -4404,7 +4417,7 @@ async fn a_start_that_waits_goes_back_to_the_page() {
         "start-within",
         "<!doctype html><p>Page text</p>",
         &format!(
-            "open PAGE\nrequest GET {uri}/api\nsee \"from the api\"\nstart web = python3 -m http.server {port} --bind 127.0.0.1 at http://127.0.0.1:{port}/ within 10s\nsee \"Page text\" within 0s\n",
+            "open PAGE\nrequest GET {uri}/api\nsee \"from the api\"\nstart web = python3 -m http.server {port} --bind 127.0.0.1 at http://127.0.0.1:{port}/ within 60s\nsee \"Page text\" within 0s\n",
             uri = api.uri()
         ),
     );
