@@ -14,6 +14,8 @@ const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const ERROR_BODY_CHARS: usize = 300;
+const SCREENSHOT: &str = "iu2u-screenshot";
+const IMAGES_HEADER: &str = "TypeSafe-Danger-Zone-Images";
 
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -65,12 +67,27 @@ impl Client {
     }
 
     pub async fn ask(&self, state: &str, questions: &Questions) -> Result<Answers> {
-        let body = json!({
+        self.ask_seeing(state, questions, None).await
+    }
+
+    pub async fn ask_seeing(
+        &self,
+        state: &str,
+        questions: &Questions,
+        screenshot: Option<&str>,
+    ) -> Result<Answers> {
+        let mut body = json!({
             "model": self.model,
             "state": state,
             "questions": questions_to_wire(questions)
         });
-        let mut request = self.http.post(&self.endpoint).json(&body);
+        let mut request = self.http.post(&self.endpoint);
+        if let Some(screenshot) = screenshot {
+            body["state"] = format!("{state}\n\nScreenshot of the part of the screen in view, while the text above also lists what lies out of view: {SCREENSHOT}").into();
+            body["assets"] = json!({ SCREENSHOT: { "type": "image", "format": "png", "data_base64": screenshot } });
+            request = request.header(IMAGES_HEADER, "true");
+        }
+        let mut request = request.json(&body);
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }

@@ -17,9 +17,12 @@ const LOAD_WITHIN: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Action {
     Press(Element),
+    Spot(f64, f64),
+    Hover(Element),
     Type(Element, Input),
     Choose(Element, String),
     Enter,
+    Escape,
     Scroll,
     Wait,
 }
@@ -40,11 +43,18 @@ impl Action {
     pub(super) fn describe(&self) -> String {
         match self {
             Self::Press(element) => format!("pressed {}", element.describe()),
+            Self::Spot(x, y) => format!(
+                "pressed the spot {:.0}% across and {:.0}% down the screen",
+                x * 100.0,
+                y * 100.0
+            ),
+            Self::Hover(element) => format!("pointed at {}", element.describe()),
             Self::Type(element, input) => {
                 format!("typed {} into {}", input.shown(), element.describe())
             }
             Self::Choose(element, option) => format!("chose {option:?} in {}", element.describe()),
             Self::Enter => "pressed Enter".into(),
+            Self::Escape => "pressed Escape".into(),
             Self::Scroll => "scrolled down".into(),
             Self::Wait => "waited".into(),
         }
@@ -60,6 +70,17 @@ impl Surface {
         }
     }
 
+    pub(super) async fn can_scroll(&self) -> Result<bool> {
+        match self {
+            Self::Browser(browser) => Ok(browser
+                .scroll_point()
+                .await?
+                .is_some_and(|(_, _, known)| known)),
+            #[cfg(target_os = "macos")]
+            Self::Mac(_) => Ok(false),
+        }
+    }
+
     pub(super) async fn act(&mut self, action: &Action) -> Result<()> {
         match self {
             Self::Browser(browser) => browser.act(action).await,
@@ -72,7 +93,7 @@ impl Surface {
         match self {
             Self::Browser(browser) => browser.close().await,
             #[cfg(target_os = "macos")]
-            Self::Mac(mac) => mac.close(),
+            Self::Mac(_) => {}
         }
     }
 }

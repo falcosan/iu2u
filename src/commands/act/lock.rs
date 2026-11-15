@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::decide::Input;
-use super::screen::{Element, Kind, Screen};
+use super::screen::{Element, Kind, Origin, Screen};
 use super::surface::Action;
 
 pub(super) type Lock = BTreeMap<String, Recorded>;
@@ -13,6 +13,12 @@ pub(super) struct Recorded {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) moves: Vec<Move>,
     pub(super) screen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) picked: Option<Origin>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) sight: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(super) exact: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -36,6 +42,15 @@ pub(super) enum Move {
         #[serde(flatten)]
         control: Control,
     },
+    Spot {
+        x: f64,
+        y: f64,
+        screen: String,
+    },
+    Hover {
+        #[serde(flatten)]
+        control: Control,
+    },
     Type {
         #[serde(flatten)]
         control: Control,
@@ -47,6 +62,10 @@ pub(super) enum Move {
         option: String,
     },
     Enter {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screen: Option<String>,
+    },
+    Escape {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         screen: Option<String>,
     },
@@ -63,6 +82,7 @@ pub(super) enum Move {
 pub(super) enum Replay {
     Exact(Action),
     Missing(Element),
+    Changed,
 }
 
 impl Recorded {
@@ -85,7 +105,7 @@ impl Control {
             section: element.section.clone(),
             position: twins.then_some(element.position),
             among: twins.then_some(element.among),
-            screen: twins.then(|| screen.fingerprint()),
+            screen: twins.then(|| screen.signature()),
         }
     }
 
@@ -105,6 +125,14 @@ impl Move {
             Action::Press(element) => Self::Press {
                 control: Control::of(element, screen),
             },
+            Action::Spot(x, y) => Self::Spot {
+                x: *x,
+                y: *y,
+                screen: screen.signature(),
+            },
+            Action::Hover(element) => Self::Hover {
+                control: Control::of(element, screen),
+            },
             Action::Type(element, input) => Self::Type {
                 control: Control::of(element, screen),
                 value: input.key.clone(),
@@ -114,10 +142,13 @@ impl Move {
                 option: option.clone(),
             },
             Action::Enter => Self::Enter {
-                screen: Some(screen.fingerprint()),
+                screen: Some(screen.signature()),
+            },
+            Action::Escape => Self::Escape {
+                screen: Some(screen.signature()),
             },
             Action::Scroll => Self::Scroll {
-                screen: Some(screen.fingerprint()),
+                screen: Some(screen.signature()),
             },
             Action::Wait => Self::Wait { ms: 0 },
         }
@@ -126,9 +157,14 @@ impl Move {
     pub(super) fn replay(&self, screen: &Screen, inputs: &[Input]) -> Replay {
         let (control, kind) = match self {
             Self::Enter { .. } => return Replay::Exact(Action::Enter),
+            Self::Escape { .. } => return Replay::Exact(Action::Escape),
             Self::Scroll { .. } => return Replay::Exact(Action::Scroll),
             Self::Wait { .. } => return Replay::Exact(Action::Wait),
-            Self::Press { control } => (control, Kind::Press),
+            Self::Spot { x, y, screen: on } if *on == screen.signature() => {
+                return Replay::Exact(Action::Spot(*x, *y));
+            }
+            Self::Spot { .. } => return Replay::Changed,
+            Self::Press { control } | Self::Hover { control } => (control, Kind::Press),
             Self::Type { control, .. } => (control, Kind::Type),
             Self::Choose { control, option } => (control, Kind::Choose(vec![option.clone()])),
         };
@@ -136,7 +172,7 @@ impl Move {
         if control
             .screen
             .as_ref()
-            .is_some_and(|recorded_screen| *recorded_screen != screen.fingerprint())
+            .is_some_and(|recorded_screen| *recorded_screen != screen.signature())
         {
             return Replay::Missing(recorded);
         }
@@ -154,6 +190,7 @@ impl Move {
     pub(super) fn with(&self, element: Element, inputs: &[Input]) -> Option<Action> {
         match self {
             Self::Press { .. } => Some(Action::Press(element)),
+            Self::Hover { .. } => Some(Action::Hover(element)),
             Self::Type { value, .. } => {
                 let input = inputs.iter().find(|input| &input.key == value)?;
                 Some(Action::Type(element, input.clone()))
@@ -164,7 +201,11 @@ impl Move {
                 }
                 _ => None,
             },
-            Self::Enter { .. } | Self::Scroll { .. } | Self::Wait { .. } => None,
+            Self::Enter { .. }
+            | Self::Escape { .. }
+            | Self::Scroll { .. }
+            | Self::Wait { .. }
+            | Self::Spot { .. } => None,
         }
     }
 }
@@ -205,6 +246,28 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&recorded).unwrap(),
             serde_json::json!({ "move": "type", "role": "textbox", "name": "Email", "section": "Login", "value": "email" })
+        );
+    }
+
+    #[test]
+    fn a_spot_replays_only_on_the_screen_it_was_pressed_on() {
+        let map = Screen {
+            text: "- image \"Map\"".into(),
+            ..Screen::default()
+        };
+        let recorded = Move::of(&Action::Spot(0.25, 0.5), &map);
+        assert!(matches!(
+            recorded.replay(&map, &[]),
+            Replay::Exact(Action::Spot(x, y)) if x == 0.25 && y == 0.5
+        ));
+        let other = Screen {
+            text: "- image \"Chart\"".into(),
+            ..Screen::default()
+        };
+        assert!(matches!(recorded.replay(&other, &[]), Replay::Changed));
+        assert_eq!(
+            serde_json::to_value(&recorded).unwrap(),
+            serde_json::json!({ "move": "spot", "x": 0.25, "y": 0.5, "screen": map.signature() })
         );
     }
 
@@ -270,6 +333,9 @@ mod tests {
                 &Screen::default(),
             )],
             screen: String::new(),
+            picked: None,
+            sight: false,
+            exact: String::new(),
         };
         assert_eq!(recorded.missing(&[email]), None);
         assert_eq!(recorded.missing(&[]), Some("email"));

@@ -1,4 +1,4 @@
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -11,7 +11,16 @@ use clap::{Parser, Subcommand};
 use futures_util::{StreamExt, stream};
 use iu2u::{commands, hooks::Power, mcp::Server, model::Client};
 use rmcp::{ServiceExt, transport::stdio};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+#[cfg(unix)]
+use tokio::signal::unix::{Signal, SignalKind, signal};
+
+#[cfg(unix)]
+const INTERRUPTED: u8 = 130;
+#[cfg(unix)]
+const TERMINATED: u8 = 143;
+#[cfg(unix)]
+const HUNG_UP: u8 = 129;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -51,6 +60,12 @@ enum Command {
             help = "Print one JSON report per script instead of the readable results"
         )]
         json: bool,
+        #[arg(
+            long,
+            value_name = "SCRIPT",
+            help = "Run this script once before the others; the services it starts and the values it sets last until the last script ends"
+        )]
+        before: Option<PathBuf>,
     },
 }
 
@@ -93,7 +108,7 @@ async fn run(command: Command) -> Result<ExitCode> {
                 .await?;
         }
         Command::Hook { power } => {
-            let text = read_stdin()?;
+            let text = read_stdin().await?;
             if power.enabled() {
                 let input = serde_json::from_str(&text).unwrap_or_default();
                 print!("{}", power.run(&input, Client::from_env()).await?);
@@ -112,8 +127,9 @@ async fn run(command: Command) -> Result<ExitCode> {
             locked,
             headful,
             json,
+            before,
         } => {
-            return Ok(act(&scripts, locked, headful, json)
+            return Ok(act(&scripts, before.as_deref(), locked, headful, json)
                 .await
                 .unwrap_or_else(|error| failed(&error)));
         }
@@ -151,64 +167,131 @@ async fn filter(statement: &str, at: f64) -> Result<bool> {
 }
 
 #[cfg(unix)]
-async fn act(scripts: &[PathBuf], locked: bool, headful: bool, json: bool) -> Result<ExitCode> {
+async fn act(
+    scripts: &[PathBuf],
+    before: Option<&Path>,
+    locked: bool,
+    headful: bool,
+    json: bool,
+) -> Result<ExitCode> {
     let paths: Vec<Option<&Path>> = if scripts.is_empty() {
         vec![None]
     } else {
         scripts.iter().map(|path| Some(path.as_path())).collect()
     };
     let mut reporter = commands::Reporter::new(json);
+    let mut suite = commands::Suite::new(locked, headful)?;
     let mut exit_code = 0;
-    for path in paths {
-        let lock = path.map(|path| {
-            let mut lock = path.as_os_str().to_owned();
-            lock.push(".lock");
-            PathBuf::from(lock)
-        });
-        let name = path.map_or("-".into(), |path| path.display().to_string());
-        reporter.start(&name);
-        let outcome = async {
-            let text = match path {
-                Some(path) => std::fs::read_to_string(path)
-                    .with_context(|| format!("cannot read {}", path.display()))?,
-                None => read_stdin()?,
+    let runs = before
+        .map(|before| (Some(before), true))
+        .into_iter()
+        .chain(paths.into_iter().map(|path| (path, false)));
+    let (mut interrupt, mut terminate, mut hangup) = (
+        caught(SignalKind::interrupt())?,
+        caught(SignalKind::terminate())?,
+        caught(SignalKind::hangup())?,
+    );
+    let (mut running, mut done) = (None, Vec::new());
+    let scripts = async {
+        for (path, first) in runs {
+            let lock = path.map(|path| {
+                let mut lock = path.as_os_str().to_owned();
+                lock.push(".lock");
+                PathBuf::from(lock)
+            });
+            let name = path.map_or("-".into(), |path| path.display().to_string());
+            reporter.start(&name);
+            running = Some(name.clone());
+            done.clear();
+            let outcome = async {
+                let text = match path {
+                    Some(path) => std::fs::read_to_string(path)
+                        .with_context(|| format!("cannot read {}", path.display()))?,
+                    None => read_stdin().await?,
+                };
+                let base = path
+                    .and_then(Path::parent)
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let outcome = commands::act(
+                    Client::from_env(),
+                    &text,
+                    base,
+                    lock.as_deref(),
+                    &mut suite,
+                    first,
+                    |step| {
+                        done.push(step.clone());
+                        reporter.step(step);
+                    },
+                )
+                .await?;
+                anyhow::Ok((text, outcome))
             };
-            let outcome = commands::act(
-                Client::from_env(),
-                &text,
-                lock.as_deref(),
-                locked,
-                headful,
-                |step| reporter.step(step),
-            )
-            .await?;
-            anyhow::Ok((text, outcome))
-        };
-        let (text, mut report) = match outcome.await {
-            Ok((text, outcome)) => {
-                exit_code = exit_code.max(outcome.code);
-                (Some(text), outcome.report)
-            }
-            Err(error) => {
+            let (text, mut report) = match outcome.await {
+                Ok((text, outcome)) => {
+                    exit_code = exit_code.max(outcome.code);
+                    (Some(text), outcome.report)
+                }
+                Err(error) => {
+                    exit_code = 2;
+                    let report =
+                        serde_json::json!({ "status": "error", "error": format!("{error:#}") });
+                    (None, report)
+                }
+            };
+            report["script"] = name.into();
+            reporter.finish(&report, text.as_deref());
+            running = None;
+            if first && exit_code != 0 {
                 exit_code = 2;
-                let report =
-                    serde_json::json!({ "status": "error", "error": format!("{error:#}") });
-                (None, report)
+                break;
             }
-        };
-        report["script"] = name.into();
-        reporter.finish(&report, text.as_deref());
-        if reporter.broken() {
-            break;
+            if reporter.broken() {
+                break;
+            }
         }
+    };
+    let stopped = tokio::select! {
+        () = scripts => None,
+        () = received(&mut interrupt) => Some(INTERRUPTED),
+        () = received(&mut terminate) => Some(TERMINATED),
+        () = received(&mut hangup) => Some(HUNG_UP),
+    };
+    if stopped.is_some()
+        && let Some(name) = running
+    {
+        let report = serde_json::json!({ "status": "error", "script": name, "error": "stopped by a signal", "steps": done });
+        reporter.finish(&report, None);
     }
+    suite.stop().await;
     reporter.summary();
     reporter.close()?;
-    Ok(ExitCode::from(exit_code))
+    Ok(ExitCode::from(stopped.unwrap_or(exit_code)))
 }
 
-fn read_stdin() -> Result<String> {
+#[cfg(unix)]
+fn caught(kind: SignalKind) -> Result<Option<Signal>> {
+    let mut old = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    let ignored = unsafe {
+        libc::sigaction(kind.as_raw_value(), std::ptr::null(), old.as_mut_ptr()) == 0
+            && old.assume_init().sa_sigaction == libc::SIG_IGN
+    };
+    Ok(if ignored { None } else { Some(signal(kind)?) })
+}
+
+#[cfg(unix)]
+async fn received(signal: &mut Option<Signal>) {
+    match signal {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn read_stdin() -> Result<String> {
     let mut text = String::new();
-    std::io::stdin().read_to_string(&mut text)?;
+    tokio::io::stdin().read_to_string(&mut text).await?;
     Ok(text)
 }

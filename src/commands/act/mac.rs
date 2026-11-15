@@ -31,7 +31,9 @@ const MAX_NODES: usize = 3000;
 const WALK_WITHIN: Duration = Duration::from_secs(2);
 const LAUNCH_WITHIN: Duration = Duration::from_secs(10);
 const MESSAGING_TIMEOUT: f32 = 0.25;
+const RESTORE_WITHIN: Duration = Duration::from_secs(2);
 const RETURN: u16 = 36;
+const ESCAPE: u16 = 53;
 const PAGE_DOWN: u16 = 121;
 const LETTER_A: u16 = 0;
 
@@ -76,7 +78,7 @@ impl Mac {
         let folder = executables_of(name)?;
         let manual = CFString::from_str("AXManualAccessibility");
         let started = Instant::now();
-        let (mut asked, mut running_here) = (Vec::<(i32, bool)>::new(), false);
+        let (mut asked, mut running_here) = (Asked(Vec::new()), false);
         let shown = loop {
             let shown = running()
                 .into_iter()
@@ -96,8 +98,8 @@ impl Mac {
                     if counted != AXError::Success {
                         return None;
                     }
-                    if asked.iter().all(|&(known, _)| known != pid) {
-                        asked.push((pid, switched_on(&app, &manual)));
+                    if asked.0.iter().all(|&(known, _)| known != pid) {
+                        asked.0.push((pid, switched_on(&app, &manual)));
                         unsafe { app.set_attribute_value(&manual, CFBoolean::new(true)) };
                     }
                     (windows > 0).then_some((pid, app))
@@ -107,28 +109,21 @@ impl Mac {
             }
             tokio::time::sleep(POLL).await;
         };
-        let driven = shown.as_ref().map(|(pid, _)| *pid);
-        for &(pid, was_manual) in &asked {
-            if !was_manual && driven != Some(pid) {
-                unsafe {
-                    AXUIElement::new_application(pid)
-                        .set_attribute_value(&manual, CFBoolean::new(false));
-                }
-            }
-        }
         let Some((pid, app)) = shown else {
             if running_here {
                 bail!("{name} showed no window it would describe");
             }
             bail!("{name} did not start");
         };
+        let was_manual = asked.0.contains(&(pid, true));
+        asked.0.retain(|&(known, _)| known != pid);
         Ok(Self {
             pid,
             app,
             attributes: CFArray::from_retained_objects(&ATTRIBUTES.map(CFString::from_str)),
             handles: Vec::new(),
             fingerprint: String::new(),
-            was_manual: asked.contains(&(pid, true)),
+            was_manual,
             limit: MAX_NODES,
         })
     }
@@ -237,8 +232,14 @@ impl Mac {
                 bail!("{} has no options to choose from", element.describe())
             }
             Action::Enter => self.key(RETURN, CGEventFlags::empty(), None),
+            Action::Escape => self.key(ESCAPE, CGEventFlags::empty(), None),
             Action::Scroll => self.key(PAGE_DOWN, CGEventFlags::empty(), None),
             Action::Wait => {}
+            Action::Spot(..) => bail!("a spot of a screenshot can only be pressed on a page"),
+            Action::Hover(element) => bail!(
+                "{} cannot be pointed at without pressing it in a Mac app",
+                element.describe()
+            ),
         }
         surface::settle(Some(before), started, async || {
             self.observe().ok();
@@ -250,17 +251,6 @@ impl Mac {
         })
         .await;
         Ok(())
-    }
-
-    pub(super) fn close(self) {
-        if !self.was_manual {
-            unsafe {
-                self.app.set_attribute_value(
-                    &CFString::from_str("AXManualAccessibility"),
-                    CFBoolean::new(false),
-                );
-            }
-        }
     }
 
     fn fresh(&self, element: &Element) -> Result<CFRetained<AXUIElement>> {
@@ -366,6 +356,36 @@ impl Mac {
     }
 }
 
+impl Drop for Mac {
+    fn drop(&mut self) {
+        if !self.was_manual {
+            switch_off(&self.app);
+        }
+    }
+}
+
+struct Asked(Vec<(i32, bool)>);
+
+impl Drop for Asked {
+    fn drop(&mut self) {
+        for &(pid, was_manual) in &self.0 {
+            if !was_manual {
+                switch_off(&*unsafe { AXUIElement::new_application(pid) });
+            }
+        }
+    }
+}
+
+fn switch_off(app: &AXUIElement) {
+    unsafe {
+        app.set_messaging_timeout(RESTORE_WITHIN.as_secs_f32());
+        app.set_attribute_value(
+            &CFString::from_str("AXManualAccessibility"),
+            CFBoolean::new(false),
+        );
+    }
+}
+
 impl Read {
     fn node(&self, handle: usize) -> Node {
         let (role, kind) = role(&self.role, &self.subrole);
@@ -412,7 +432,7 @@ impl Read {
             states,
             kind,
             handle,
-            children: Vec::new(),
+            ..Node::default()
         }
     }
 }

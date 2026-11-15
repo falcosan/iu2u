@@ -1,11 +1,23 @@
-use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 
 use crate::clip;
 
 pub(super) const MAX_ELEMENTS: usize = 254;
-const VALUE_CHARS: usize = 200;
+const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'!')
+    .remove(b'~')
+    .remove(b'*')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')');
+pub(super) const HEADER: &str = "response header";
+pub(super) const VALUE_CHARS: usize = 200;
 const SECTIONS: [&str; 14] = [
     "alertdialog",
     "banner",
@@ -35,9 +47,12 @@ pub(super) struct Node {
     pub(super) role: String,
     pub(super) name: String,
     pub(super) value: String,
+    pub(super) url: String,
+    pub(super) description: String,
     pub(super) states: Vec<&'static str>,
     pub(super) kind: Option<Kind>,
     pub(super) handle: usize,
+    pub(super) frame: usize,
     pub(super) children: Vec<usize>,
 }
 
@@ -52,6 +67,7 @@ pub(super) struct Element {
     pub(super) section: String,
     pub(super) kind: Kind,
     pub(super) handle: usize,
+    pub(super) frame: usize,
     pub(super) position: usize,
     pub(super) among: usize,
 }
@@ -60,8 +76,37 @@ pub(super) struct Element {
 pub(super) struct Screen {
     pub(super) text: String,
     pub(super) visible: String,
+    pub(super) pages: String,
+    pub(super) addresses: String,
     pub(super) elements: Vec<Element>,
     pub(super) omitted: usize,
+    pub(super) candidates: Vec<Candidate>,
+    pub(super) kept: Vec<String>,
+    pub(super) named: Vec<(String, String)>,
+    pub(super) shows_secret: bool,
+    pub(super) hovers: bool,
+    pub(super) spots: bool,
+    pub(super) tail: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Candidate {
+    pub(super) text: String,
+    pub(super) shown: String,
+    pub(super) origin: Origin,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub(super) enum Origin {
+    Screen {
+        role: String,
+        name: String,
+        field: String,
+    },
+    Json {
+        path: String,
+    },
 }
 
 impl Element {
@@ -76,6 +121,7 @@ impl Element {
             section: String::new(),
             kind,
             handle: 0,
+            frame: 0,
             position: 1,
             among: 1,
         }
@@ -103,20 +149,10 @@ impl Element {
 
 impl Screen {
     pub(super) fn new(nodes: &[Node], secrets: &[(&str, String)]) -> Self {
-        let mut forms: Vec<(String, &str)> = secrets
-            .iter()
-            .flat_map(|(secret, label)| {
-                [(secret.to_string(), label.as_str()), (words(secret), label)]
-            })
-            .filter(|(form, _)| !form.is_empty())
-            .collect();
-        forms.sort_by_key(|(form, _)| Reverse(form.len()));
-        let hide = |text: &str| {
-            forms.iter().fold(text.to_owned(), |text, (form, label)| {
-                text.replace(form, label)
-            })
-        };
+        let hider = Hider::new(secrets);
+        let hide = |text: &str| hider.hide(text);
         let mut screen = Self::default();
+        let mut offered = HashSet::new();
         let mut heading = String::new();
         let mut visited = vec![false; nodes.len()];
         let mut stack = vec![(0, 0, String::new(), (String::new(), String::new()))];
@@ -126,12 +162,51 @@ impl Screen {
             };
             visited[index] = true;
             let name = hide(&node.name);
-            let value = clip(&hide(&node.value), VALUE_CHARS);
+            let whole_value = hide(&node.value);
+            let value = clip(&whole_value, VALUE_CHARS);
             let repeats_parent = node.role == "text" && (name == parent.0 || name == parent.1);
-            let shown =
-                !node.role.is_empty() && !(name.is_empty() && value.is_empty()) && !repeats_parent;
+            let shown = !node.role.is_empty()
+                && !(name.is_empty()
+                    && value.is_empty()
+                    && node.url.is_empty()
+                    && node.kind.is_none()
+                    && !node.states.contains(&"busy"))
+                && !repeats_parent;
             if shown {
-                screen.line(node, &name, &value, depth);
+                let description = hide(&node.description);
+                let decoded = percent_decode_str(&node.url).decode_utf8_lossy();
+                let url = match hide(&decoded) {
+                    hidden if hidden != decoded => hidden,
+                    _ => hide(&node.url),
+                };
+                screen.shows_secret |= name != node.name
+                    || whole_value != node.value
+                    || description != node.description;
+                screen.line(node, [&name, &value, &description, &url], depth);
+                for (field, text, raw) in [
+                    ("name", &name, &node.name),
+                    ("value", &whole_value, &node.value),
+                    ("url", &url, &node.url),
+                    ("description", &description, &node.description),
+                ] {
+                    if !text.is_empty() && text == raw && offered.insert(text.clone()) {
+                        screen.candidates.push(Candidate {
+                            text: text.clone(),
+                            shown: if field == "name" {
+                                format!("{} {:?}", node.role, clip(&name, VALUE_CHARS))
+                            } else {
+                                let (named, quoted) =
+                                    (clip(&name, VALUE_CHARS), clip(text, VALUE_CHARS));
+                                format!("the {field} of {} {named:?}: {quoted:?}", node.role)
+                            },
+                            origin: Origin::Screen {
+                                role: node.role.clone(),
+                                name: name.clone(),
+                                field: field.into(),
+                            },
+                        });
+                    }
+                }
             }
             if node.role == "heading" {
                 heading.clone_from(&name);
@@ -162,6 +237,7 @@ impl Screen {
                     },
                     kind,
                     handle: node.handle,
+                    frame: node.frame,
                     position: 1,
                     among: 1,
                 });
@@ -213,16 +289,27 @@ impl Screen {
         }
     }
 
-    fn line(&mut self, node: &Node, name: &str, value: &str, depth: usize) {
-        writeln!(
-            self.text,
-            "{:indent$}- {}",
-            "",
-            summary(&node.role, name, value, &node.states),
-            indent = depth * 2
+    fn line(&mut self, node: &Node, [name, value, description, url]: [&str; 4], depth: usize) {
+        let mut line = summary(&node.role, name, value, &node.states);
+        if !description.is_empty() {
+            write!(line, " · description {description:?}").ok();
+        }
+        if !url.is_empty() {
+            write!(line, " · url {:?}", clip(url, VALUE_CHARS)).ok();
+        }
+        writeln!(self.text, "{:indent$}- {line}", "", indent = depth * 2).ok();
+        write!(
+            self.visible,
+            "{} ",
+            words(&format!("{name} {value} {description}"))
         )
         .ok();
-        write!(self.visible, "{} ", words(&format!("{name} {value}"))).ok();
+        if !url.is_empty() {
+            write!(self.addresses, "{url} ").ok();
+        }
+        if node.role == "page" {
+            write!(self.pages, "{url} ").ok();
+        }
     }
 
     fn push(&mut self, element: Element) {
@@ -234,18 +321,8 @@ impl Screen {
     }
 
     pub(super) fn shows(&self, text: &str) -> bool {
-        let (needle, shown) = (tight(text), tight(&self.visible));
-        let word = |character: Option<&char>| character.is_some_and(|c| c.is_alphanumeric());
-        needle.is_empty()
-            || shown
-                .windows(needle.len())
-                .enumerate()
-                .any(|(start, window)| {
-                    window == needle.as_slice()
-                        && !(word(needle.first())
-                            && word(start.checked_sub(1).and_then(|i| shown.get(i))))
-                        && !(word(needle.last()) && word(shown.get(start + needle.len())))
-                })
+        shows(&self.visible, text)
+            || (text.contains(['/', '?', '&', '=', '#']) && shows(&self.pages, text))
     }
 
     pub(super) fn reveals(&self, secret: &str) -> bool {
@@ -263,20 +340,185 @@ impl Screen {
                 _ => None,
             });
         !secret.is_empty()
-            && std::iter::once(self.visible.clone())
+            && [self.visible.clone(), self.addresses.clone()]
+                .into_iter()
                 .chain(options)
                 .any(|text| squeeze(&text).contains(&secret))
     }
 
     pub(super) fn fingerprint(&self) -> String {
-        let hash = self
-            .text
-            .bytes()
-            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-            });
-        format!("{hash:016x}")
+        hash(&self.identity())
     }
+
+    pub(super) fn signature(&self) -> String {
+        hash(&masked(&self.addressed(), &self.kept))
+    }
+
+    pub(super) fn exact(&self) -> String {
+        hash(&self.standing(self.text.clone()))
+    }
+
+    fn identity(&self) -> String {
+        let mut identity = String::with_capacity(self.text.len());
+        for line in self.text.split_inclusive('\n') {
+            let header = line
+                .trim_start()
+                .strip_prefix("- ")
+                .is_some_and(|line| line.starts_with(HEADER));
+            match line.split_once(':') {
+                Some((name, _)) if header => {
+                    identity.push_str(name);
+                    identity.push('\n');
+                }
+                _ => identity.push_str(line),
+            }
+        }
+        self.standing(identity)
+    }
+
+    fn standing(&self, text: String) -> String {
+        self.named
+            .iter()
+            .fold(text, |text, (value, name)| standing_for(&text, value, name))
+    }
+
+    fn addressed(&self) -> String {
+        let identity = self.identity();
+        let mut addressed = String::with_capacity(identity.len());
+        let mut rest = identity.as_str();
+        while let Some(at) = rest.find(" · url \"") {
+            let start = at + " · url \"".len();
+            addressed.push_str(&rest[..start]);
+            let mut escaped = false;
+            let end = rest[start..]
+                .find(|c: char| {
+                    let closes = c == '"' && !escaped;
+                    escaped = c == '\\' && !escaped;
+                    closes
+                })
+                .map_or(rest.len(), |end| start + end);
+            let address = &rest[start..end];
+            addressed.push_str(&address[..address.find(['?', '#']).unwrap_or(address.len())]);
+            rest = &rest[end..];
+        }
+        addressed.push_str(rest);
+        addressed
+    }
+}
+
+pub(super) struct Hider<'a> {
+    forms: Vec<(String, &'a str)>,
+}
+
+impl<'a> Hider<'a> {
+    pub(super) fn new(secrets: &'a [(&str, String)]) -> Self {
+        let mut forms: Vec<(String, &str)> = secrets
+            .iter()
+            .flat_map(|(secret, label)| {
+                let quoted = serde_json::to_string(secret).unwrap_or_default();
+                let escaped = quoted
+                    .get(1..quoted.len().saturating_sub(1))
+                    .unwrap_or_default()
+                    .to_owned();
+                [
+                    (secret.to_string(), label.as_str()),
+                    (words(secret), label),
+                    (escaped, label),
+                    (
+                        form_urlencoded::byte_serialize(secret.as_bytes()).collect(),
+                        label,
+                    ),
+                    (
+                        utf8_percent_encode(secret, URI_COMPONENT).to_string(),
+                        label,
+                    ),
+                ]
+            })
+            .filter(|(form, _)| !form.is_empty())
+            .collect();
+        forms.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        forms.dedup_by(|(a, _), (b, _)| a == b);
+        Self { forms }
+    }
+
+    pub(super) fn hide(&self, text: &str) -> String {
+        self.forms
+            .iter()
+            .fold(text.to_owned(), |text, (form, label)| {
+                text.replace(form, label)
+            })
+    }
+}
+
+fn standing_for(text: &str, value: &str, name: &str) -> String {
+    if value.is_empty() {
+        return text.to_owned();
+    }
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let (first, last) = (value.chars().next(), value.chars().next_back());
+    let mut stood = String::with_capacity(text.len());
+    let mut done = 0;
+    for (at, _) in text.match_indices(value) {
+        let end = at + value.len();
+        if !(word(first) && word(text[..at].chars().next_back()))
+            && !(word(last) && word(text[end..].chars().next()))
+        {
+            stood.push_str(&text[done..at]);
+            stood.push_str(name);
+            done = end;
+        }
+    }
+    stood.push_str(&text[done..]);
+    stood
+}
+
+pub(super) fn masked(text: &str, kept: &[String]) -> String {
+    let mut masked = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(|c: char| c.is_ascii_digit()) {
+        masked.push_str(&rest[..at]);
+        let length = rest[at..]
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len() - at);
+        let number = &rest[at..at + length];
+        masked.push_str(if kept.iter().any(|kept| kept == number) {
+            number
+        } else {
+            "#"
+        });
+        rest = &rest[at + length..];
+    }
+    masked.push_str(rest);
+    masked
+}
+
+pub(super) fn shows(visible: &str, text: &str) -> bool {
+    let (needle, shown) = (tight(text), tight(visible));
+    let word = |character: Option<&char>| character.is_some_and(|c| c.is_alphanumeric());
+    needle.is_empty()
+        || shown
+            .windows(needle.len())
+            .enumerate()
+            .any(|(start, window)| {
+                window == needle.as_slice()
+                    && !(word(needle.first())
+                        && word(start.checked_sub(1).and_then(|i| shown.get(i))))
+                    && !(word(needle.last()) && word(shown.get(start + needle.len())))
+            })
+}
+
+pub(super) fn numbers(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_digit())
+        .filter(|number| !number.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn hash(text: &str) -> String {
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{hash:016x}")
 }
 
 fn summary(role: &str, name: &str, value: &str, states: &[&str]) -> String {
@@ -488,6 +730,50 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_in_an_address_the_browser_encodes_only_in_part_is_hidden() {
+        let label = "(secret \"pw\")".to_string();
+        let mut link = node("link", "Share", Some(Kind::Press), &[]);
+        link.url = "https://hub.test/share?pw=p@ss%20word".into();
+        let screen = Screen::new(
+            &[node("page", "", None, &[1]), link],
+            &[("p@ss word", label.clone())],
+        );
+        assert!(
+            !screen.text.contains("p@ss") && screen.text.contains("pw=(secret"),
+            "{}",
+            screen.text
+        );
+        assert!(
+            screen
+                .candidates
+                .iter()
+                .all(|candidate| !candidate.text.contains("p@ss"))
+        );
+    }
+
+    #[test]
+    fn a_long_text_is_offered_whole_but_shown_short() {
+        let long = "x".repeat(5 * VALUE_CHARS);
+        let screen = Screen::new(
+            &[
+                node("page", "", None, &[1]),
+                node("paragraph", &long, None, &[]),
+            ],
+            &[],
+        );
+        let offered = screen
+            .candidates
+            .iter()
+            .find(|candidate| candidate.text == long)
+            .unwrap();
+        assert!(
+            offered.shown.len() < 2 * VALUE_CHARS,
+            "{}",
+            offered.shown.len()
+        );
+    }
+
+    #[test]
     fn a_secret_inside_a_longer_one_does_not_uncover_it() {
         let field = Node {
             value: "admin2024secret".into(),
@@ -502,6 +788,68 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_in_an_address_or_a_description_is_hidden() {
+        let link = Node {
+            url: "https://hub/reset?token=tok-31337".into(),
+            description: "Sent with tok-31337".into(),
+            ..node("link", "Reset", Some(Kind::Press), &[])
+        };
+        let secrets = [("tok-31337", "(secret \"token\")".to_string())];
+        let screen = Screen::new(&[node("", "", None, &[1]), link], &secrets);
+        assert!(!screen.text.contains("tok-31337"), "{}", screen.text);
+        for url in [
+            "https://hub/verify?email=qa%2Be2e%40example.com",
+            "https://hub/verify?name=Q+A+%28e2e%29",
+            "https://hub/verify?name=Q%20A%20(e2e)",
+        ] {
+            let link = Node {
+                url: url.into(),
+                ..node("link", "Resend", Some(Kind::Press), &[])
+            };
+            let secrets = [
+                ("qa+e2e@example.com", "(secret \"email\")".to_string()),
+                ("Q A (e2e)", "(secret \"name\")".to_string()),
+            ];
+            let screen = Screen::new(&[node("", "", None, &[1]), link], &secrets);
+            assert!(!screen.text.contains("e2e"), "{}", screen.text);
+        }
+        assert!(!screen.reveals("tok-31337"), "{}", screen.visible);
+        assert!(
+            screen
+                .candidates
+                .iter()
+                .all(|candidate| !candidate.text.contains("tok-31337")),
+            "{:?}",
+            screen.candidates
+        );
+    }
+
+    #[test]
+    fn a_secret_is_searched_once_for_each_distinct_form() {
+        let secrets = [
+            ("abc123XYZ", "(secret \"token\")".to_string()),
+            ("a b", "(secret \"pair\")".to_string()),
+        ];
+        assert_eq!(Hider::new(&secrets).forms.len(), 4);
+    }
+
+    #[test]
+    fn a_secret_escaped_in_json_is_hidden() {
+        let line = node(
+            "text",
+            "password: \"Sup3r\\\"Secret-Value-42\\\"\"",
+            None,
+            &[],
+        );
+        let secrets = [(
+            "Sup3r\"Secret-Value-42\"",
+            "(secret \"password\")".to_string(),
+        )];
+        let screen = Screen::new(&[node("", "", None, &[1]), line], &secrets);
+        assert!(!screen.text.contains("Secret-Value-42"), "{}", screen.text);
+    }
+
+    #[test]
     fn a_secret_inside_a_drop_down_option_is_caught() {
         let cards = node(
             "combobox",
@@ -511,6 +859,83 @@ mod tests {
         );
         let screen = Screen::new(&[node("", "", None, &[1]), cards], &[]);
         assert!(screen.reveals("4242 4242 4242 4242"));
+    }
+
+    #[test]
+    fn a_control_without_a_name_still_shows_on_the_screen() {
+        let screen = Screen::new(
+            &[
+                node("page", "Hub", None, &[1, 2]),
+                node("button", "", Some(Kind::Press), &[]),
+                node("generic", "", None, &[]),
+            ],
+            &[],
+        );
+        assert_eq!(screen.text, "- page \"Hub\"\n  - button \"\"\n");
+        assert_eq!(screen.elements.len(), 1);
+    }
+
+    #[test]
+    fn a_signature_ignores_the_numbers_the_step_does_not_mention() {
+        let shown = |text: &str, kept: &[&str]| Screen {
+            text: text.into(),
+            kept: kept.iter().map(|kept| (*kept).to_owned()).collect(),
+            ..Screen::default()
+        };
+        assert_eq!(
+            shown("- text \"Updated 22 days ago at 10:41\"", &[]).signature(),
+            shown("- text \"Updated 23 days ago at 09:05\"", &[]).signature()
+        );
+        assert_ne!(
+            shown("- text \"3 prototypes\"", &["3"]).signature(),
+            shown("- text \"4 prototypes\"", &["3"]).signature()
+        );
+        assert_ne!(
+            shown("- text \"Updated\"", &[]).signature(),
+            shown("- text \"Uploaded\"", &[]).signature()
+        );
+        assert_eq!(
+            shown(
+                "- page \"Hub\" · url \"http://hub/#code=ab3f&state=eyJ\"\n- text \"Hi\"",
+                &[]
+            )
+            .signature(),
+            shown(
+                "- page \"Hub\" · url \"http://hub/?q=x\"\n- text \"Hi\"",
+                &[]
+            )
+            .signature()
+        );
+        assert_ne!(
+            shown("- page \"Hub\" · url \"http://hub/a\"", &[]).signature(),
+            shown("- page \"Hub\" · url \"http://hub/b\"", &[]).signature()
+        );
+        assert_eq!(
+            shown(
+                r#"- link "Share" · url "http://hub/share?pw=(secret \"pw\")&state=eyJ""#,
+                &[]
+            )
+            .signature(),
+            shown(
+                r#"- link "Share" · url "http://hub/share?pw=(secret \"pw\")&state=xQz""#,
+                &[]
+            )
+            .signature()
+        );
+        assert_eq!(
+            numbers("expect the cart shows 3 items for 12.50"),
+            ["3", "12", "50"]
+        );
+    }
+
+    #[test]
+    fn a_value_stands_for_its_name_only_where_it_stands_alone() {
+        assert_eq!(
+            standing_for("Prototype 4711 made, 47110 left, #4711", "4711", "$id"),
+            "Prototype $id made, 47110 left, #$id"
+        );
+        assert_eq!(standing_for("go x/p/42/", "/p/42", "$p"), "go x$p/");
+        assert_eq!(standing_for("same", "", "$p"), "same");
     }
 
     #[test]

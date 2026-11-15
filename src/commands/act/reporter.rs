@@ -236,6 +236,9 @@ fn failure(name: &str, report: &Value, failing: Option<&Value>, script: Option<&
     if let Some(detail) = step["detail"].as_str() {
         writeln!(text, "{FAILED}{}{FAILED:#}", escaped(detail)).ok();
     }
+    if let Some(screenshot) = report["screenshot"].as_str() {
+        writeln!(text, "{DIM}Screenshot: {}{DIM:#}", escaped(screenshot)).ok();
+    }
     if let Some(script) = script {
         writeln!(text).ok();
         text.push_str(&frame(script, line));

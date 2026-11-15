@@ -63,6 +63,13 @@ fn filter_exits_like_grep() {
     };
     assert_eq!(exit_code("1000"), Some(1));
     assert_eq!(exit_code("soon"), Some(2));
+    let with_vision = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+        .args(["filter", "This line reports a problem"])
+        .env("IU2U_MODEL", "model-x")
+        .env("IU2U_VISION", "yes")
+        .output()
+        .unwrap();
+    assert_eq!(with_vision.status.code(), Some(1));
 }
 
 #[test]

@@ -1,22 +1,29 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::mem::discriminant;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use super::screen::{Element, Kind, MAX_ELEMENTS, Screen};
+use super::script::Files;
 use super::surface::Action;
 use crate::clip;
 use crate::model::{Answer, Answers, Question, Questions};
 
 pub(super) const SCREEN_CHARS: usize = 6000;
 pub(super) const HOLDS_AT: f64 = 0.75;
+const SIGHT_AT: f64 = 0.5;
 const OPERATION_AT: f64 = 0.5;
 const TARGET_AT: f64 = 0.3;
 const RECOGNIZED_AT: f64 = 0.6;
 const MARGIN: f64 = 0.1;
 const NONE: &str = "none";
+const NONE_FITS: &str = "none of the options fits";
 const REVERSED: &str = "_reversed";
+const COARSE: (usize, usize) = (8, 6);
+const FINE: (usize, usize) = (8, 8);
+const CLOSER: f64 = 1.5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Input {
@@ -31,6 +38,22 @@ pub(super) enum Decision {
     Done,
     Stuck,
     Unsure(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Area {
+    pub(super) left: f64,
+    pub(super) top: f64,
+    pub(super) width: f64,
+    pub(super) height: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Grid {
+    pub(super) area: Area,
+    pub(super) columns: usize,
+    pub(super) rows: usize,
+    pub(super) reversed: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -66,7 +89,7 @@ impl Input {
 impl<'a> Step<'a> {
     pub(super) fn new(goal: &'a str, screen: &'a Screen, inputs: &'a [Input]) -> Self {
         let elements = &screen.elements;
-        let press = elements
+        let press: Vec<&Element> = elements
             .iter()
             .filter(|element| !matches!(element.kind, Kind::Choose(_)))
             .collect();
@@ -80,17 +103,32 @@ impl<'a> Step<'a> {
             .into_iter()
             .any(|element| element.states.contains(&"focused"));
         let operations = [
-            ("press", "Press, click or toggle one control", press),
+            (
+                "press",
+                "Press, click or toggle one control; a menu or list that is still closed opens this way",
+                press.clone(),
+            ),
+            (
+                "hover",
+                "Point at one control without pressing it, to show its tooltip or menu",
+                if screen.hovers { press } else { Vec::new() },
+            ),
             ("type", "Replace the whole text of a field with one of the given values", type_),
-            ("choose", "Choose an option in a drop-down list", choose),
+            (
+                "choose",
+                "Choose an option in a drop-down list that already offers its options",
+                choose,
+            ),
         ]
         .into_iter()
         .map(|(name, description, targets)| Operation { name, description, targets })
         .filter(|operation| !operation.targets.is_empty())
         .chain(
             [
+                (screen.spots, "spot", "Press a spot of the screenshot that no control in the list stands for, such as a place on a map, a point on a chart or a part of a picture"),
                 (focused_field, "enter", "Press Enter in the focused field, for example to submit it"),
-                (true, "scroll", "Scroll down to reveal more of the screen"),
+                (true, "escape", "Press Escape, for example to close an open menu, list or dialog"),
+                (true, "scroll", "Scroll down to reveal more of the screen; a press or a point at a control already on the screen reaches it without scrolling"),
                 (true, "wait", "Wait, because the screen is still loading or changing"),
                 (true, "done", "The goal is already reached on this screen"),
                 (true, "stuck", "The goal cannot be reached from here: an error, a dead end or missing information"),
@@ -118,8 +156,29 @@ impl<'a> Step<'a> {
         }
     }
 
-    pub(super) fn state(&self, history: &[String]) -> String {
+    pub(super) fn state(&self, history: &[String], files: &[Files]) -> String {
         let mut state = format!("Goal: {}\n", self.goal);
+        if !files.is_empty() {
+            state.push_str("Files the goal names, for a file chooser or picker:\n");
+            for files in files {
+                let given: Vec<String> = files
+                    .paths
+                    .iter()
+                    .map(|path| {
+                        let path = Path::new(path);
+                        let name = path
+                            .file_name()
+                            .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy());
+                        if path.is_dir() {
+                            format!("the folder {name}")
+                        } else {
+                            format!("the file {name}")
+                        }
+                    })
+                    .collect();
+                writeln!(state, "- {}: {}", files.key, given.join(", ")).ok();
+            }
+        }
         if !history.is_empty() {
             state.push_str("Done so far for this goal:\n");
             for done in history {
@@ -140,67 +199,125 @@ impl<'a> Step<'a> {
 
     pub(super) async fn decide(
         &self,
-        mut ask: impl AsyncFnMut(Questions) -> Result<Answers>,
+        acted: bool,
+        mut ask: impl AsyncFnMut(Questions, Option<Grid>) -> Result<Answers>,
     ) -> Result<Decision> {
         let goal = self.goal;
-        let answers = ask(Questions::from([(
-            "operation".into(),
-            Question::Pick {
-                text: format!("Which operation brings the screen closest to this goal: {goal}"),
-                options: self
-                    .operations
-                    .iter()
-                    .map(|operation| (operation.name.into(), operation.description.into()))
-                    .collect(),
-            },
-        )]))
-        .await?;
-        let chosen = match ranked(answers.get("operation")) {
-            Some((pick, top, margin)) if top >= OPERATION_AT && margin >= MARGIN => pick,
-            ranking => {
+        let mut operations: Vec<&Operation> = self.operations.iter().collect();
+        let (operation, index) = loop {
+            let answers = ask(
+                Questions::from([(
+                    "operation".into(),
+                    Question::Pick {
+                        text: format!(
+                            "Which operation brings the screen closest to this goal: {goal}"
+                        ),
+                        options: operations
+                            .iter()
+                            .map(|operation| (operation.name.into(), operation.description.into()))
+                            .collect(),
+                    },
+                )]),
+                None,
+            )
+            .await?;
+            let chosen = match ranked(answers.get("operation")) {
+                Some((pick, top, margin))
+                    if top >= OPERATION_AT
+                        && margin >= MARGIN
+                        && (pick != "stuck" || top >= HOLDS_AT) =>
+                {
+                    pick
+                }
+                ranking => {
+                    return Ok(Decision::Unsure(format!(
+                        "which operation to use ({})",
+                        shown(ranking)
+                    )));
+                }
+            };
+            let Some(operation) = operations
+                .iter()
+                .copied()
+                .find(|operation| operation.name == chosen)
+            else {
+                let names: Vec<&str> = operations.iter().map(|operation| operation.name).collect();
                 return Ok(Decision::Unsure(format!(
-                    "which operation to use ({})",
-                    shown(ranking)
+                    "which operation to use: {chosen:?} is not one of {names:?}"
                 )));
+            };
+            let name = operation.name;
+            match name {
+                "done" if acted => return Ok(Decision::Done),
+                "done" => {
+                    let reached = ask(
+                        Questions::from([(
+                            "holds".into(),
+                            Question::yesno(&format!(
+                                "Is this goal already reached on this screen, with nothing left to do: {goal}"
+                            )),
+                        )]),
+                        None,
+                    )
+                    .await?;
+                    match verdict(&reached)? {
+                        (Verdict::Holds, _) => return Ok(Decision::Done),
+                        (Verdict::Inconclusive, holds) => {
+                            return Ok(Decision::Unsure(format!(
+                                "whether the goal is reached (at {holds:.2})"
+                            )));
+                        }
+                        (Verdict::Contradicted, _) => {
+                            operations.retain(|other| other.name != name);
+                            continue;
+                        }
+                    }
+                }
+                "spot" => {
+                    match spot(goal, async |questions, grid| {
+                        ask(questions, Some(grid)).await
+                    })
+                    .await?
+                    {
+                        Ok((x, y)) => return Ok(Decision::Act(Box::new(Action::Spot(x, y)))),
+                        Err(reason) if reason == NONE_FITS => {
+                            operations.retain(|other| other.name != name);
+                            continue;
+                        }
+                        Err(reason) => {
+                            return Ok(Decision::Unsure(format!("where to press: {reason}")));
+                        }
+                    }
+                }
+                "stuck" => return Ok(Decision::Stuck),
+                "enter" => return Ok(Decision::Act(Box::new(Action::Enter))),
+                "escape" => return Ok(Decision::Act(Box::new(Action::Escape))),
+                "scroll" => return Ok(Decision::Act(Box::new(Action::Scroll))),
+                "wait" => return Ok(Decision::Act(Box::new(Action::Wait))),
+                _ => {}
+            }
+            let descriptions: Vec<String> = operation
+                .targets
+                .iter()
+                .map(|element| element.describe())
+                .collect();
+            let text =
+                format!("Which of these is the one to {name} to get closest to this goal: {goal}");
+            let mut plain = async |questions| ask(questions, None).await;
+            match agree(&mut plain, name, &text, &descriptions, TARGET_AT).await? {
+                Ok(index) => break (operation, index),
+                Err(reason) if reason == NONE_FITS => {
+                    operations.retain(|other| other.name != name);
+                }
+                Err(reason) => return Ok(Decision::Unsure(format!("what to {name}: {reason}"))),
             }
         };
-        let Some(operation) = self
-            .operations
-            .iter()
-            .find(|operation| operation.name == chosen)
-        else {
-            let names: Vec<&str> = self
-                .operations
-                .iter()
-                .map(|operation| operation.name)
-                .collect();
-            return Ok(Decision::Unsure(format!(
-                "which operation to use: {chosen:?} is not one of {names:?}"
-            )));
-        };
         let name = operation.name;
-        match name {
-            "done" => return Ok(Decision::Done),
-            "stuck" => return Ok(Decision::Stuck),
-            "enter" => return Ok(Decision::Act(Box::new(Action::Enter))),
-            "scroll" => return Ok(Decision::Act(Box::new(Action::Scroll))),
-            "wait" => return Ok(Decision::Act(Box::new(Action::Wait))),
-            _ => {}
-        }
-        let descriptions: Vec<String> = operation
-            .targets
-            .iter()
-            .map(|element| element.describe())
-            .collect();
-        let text =
-            format!("Which of these is the one to {name} to get closest to this goal: {goal}");
-        let index = match agree(&mut ask, name, &text, &descriptions, TARGET_AT).await? {
-            Ok(index) => index,
-            Err(reason) => return Ok(Decision::Unsure(format!("what to {name}: {reason}"))),
-        };
         let element = operation.targets[index];
-        if name == "press" {
-            return Ok(Decision::Act(Box::new(Action::Press(element.clone()))));
+        match name {
+            "press" => return Ok(Decision::Act(Box::new(Action::Press(element.clone())))),
+            "hover" => return Ok(Decision::Act(Box::new(Action::Hover(element.clone())))),
+            _ => {}
         }
         let values = self.values(name, element);
         let mut text = format!(
@@ -217,7 +334,8 @@ impl<'a> Step<'a> {
         }
         let id = format!("{name}_{}", forward(index));
         let offered = &values[..values.len().min(MAX_ELEMENTS)];
-        let value = match agree(&mut ask, &id, &text, offered, TARGET_AT).await? {
+        let mut plain = async |questions| ask(questions, None).await;
+        let value = match agree(&mut plain, &id, &text, offered, TARGET_AT).await? {
             Ok(value) => value,
             Err(reason) => {
                 return Ok(Decision::Unsure(format!(
@@ -234,11 +352,18 @@ impl<'a> Step<'a> {
 }
 
 pub(super) fn screen_state(screen: &Screen) -> String {
+    if screen.tail && cut(screen) {
+        let skip = screen.text.chars().count() - SCREEN_CHARS;
+        return format!(
+            "Screen, of which only the last {SCREEN_CHARS} characters are shown here:\n{}",
+            screen.text.chars().skip(skip).collect::<String>()
+        );
+    }
     let mut state = format!("Screen:\n{}", clip(&screen.text, SCREEN_CHARS));
     if cut(screen) {
         write!(
             state,
-            "\n(The screen goes on: only its first {SCREEN_CHARS} characters are shown.)"
+            "\n(The screen goes on: only its first {SCREEN_CHARS} characters are shown here. Scrolling does not show the rest here, but its controls can still be used by name.)"
         )
         .ok();
     }
@@ -249,8 +374,9 @@ pub(super) fn cut(screen: &Screen) -> bool {
     screen.text.chars().nth(SCREEN_CHARS).is_some()
 }
 
-pub(super) fn cut_note() -> String {
-    format!("the model saw only the first {SCREEN_CHARS} characters of the screen")
+pub(super) fn cut_note(tail: bool) -> String {
+    let part = if tail { "last" } else { "first" };
+    format!("the model saw only the {part} {SCREEN_CHARS} characters of the screen")
 }
 
 pub(super) async fn recognize(
@@ -276,11 +402,35 @@ pub(super) async fn recognize(
     Ok(index.ok().map(|index| candidates[index].clone()))
 }
 
+pub(super) async fn pick(
+    what: &str,
+    candidates: &[String],
+    mut ask: impl AsyncFnMut(Questions) -> Result<Answers>,
+) -> Result<Result<usize, String>> {
+    let text = format!("Which of these is {what}");
+    agree(&mut ask, "extract", &text, candidates, TARGET_AT).await
+}
+
 pub(super) fn claim(statement: &str) -> Questions {
-    Questions::from([(
-        "holds".into(),
-        Question::yesno(&format!("The screen shows that this is true: {statement}")),
-    )])
+    Questions::from([
+        (
+            "holds".into(),
+            Question::yesno(&format!("The screen shows that this is true: {statement}")),
+        ),
+        (
+            "sight".into(),
+            Question::yesno(&format!(
+                "Does this claim depend on the look of the screen, such as a colour, a position, a size or a picture, rather than only on its text? Claim: {statement}"
+            )),
+        ),
+    ])
+}
+
+pub(super) fn needs_sight(answers: &Answers) -> bool {
+    answers
+        .get("sight")
+        .and_then(Answer::yes)
+        .is_some_and(|sight| sight >= SIGHT_AT)
 }
 
 pub(super) fn verdict(answers: &Answers) -> Result<(Verdict, f64)> {
@@ -310,30 +460,41 @@ async fn agree(
     }
     let count = descriptions.len();
     let orders = count.min(2);
-    let mut picks = Vec::new();
-    for (id, question) in both_orders(id, text, descriptions).take(orders) {
-        let reply = ask(Questions::from([(id.clone(), question)])).await?;
-        match ranked(reply.get(&id)) {
-            Some((pick, top, margin)) if top >= at && margin >= MARGIN => {
-                if pick == NONE && picks.is_empty() {
-                    return Ok(Err("none of the options fits".into()));
-                }
-                picks.push(pick);
-            }
-            ranking => return Ok(Err(format!("unsure ({})", shown(ranking)))),
-        }
-    }
-    let index = |label: &str| {
+    let index = |order: usize, label: &str| {
         label
             .parse::<usize>()
             .ok()
             .and_then(|n| n.checked_sub(1))
             .filter(|&n| n < count)
+            .map(|n| if order == 0 { n } else { count - 1 - n })
     };
+    let named = |order: usize, label: &str| {
+        index(order, label).map_or_else(|| label.to_owned(), |n| descriptions[n].clone())
+    };
+    let mut picks = Vec::new();
+    for (order, (id, question)) in both_orders(id, text, descriptions).take(orders).enumerate() {
+        let reply = ask(Questions::from([(id.clone(), question)])).await?;
+        match ranked(reply.get(&id)) {
+            Some((pick, top, margin)) if top >= at && margin >= MARGIN => {
+                if pick == NONE && picks.is_empty() {
+                    return Ok(Err(NONE_FITS.into()));
+                }
+                picks.push(pick);
+            }
+            ranking => {
+                let ranking = ranking.map(|(pick, top, margin)| (named(order, &pick), top, margin));
+                return Ok(Err(format!("unsure ({})", shown(ranking))));
+            }
+        }
+    }
     let (first, last) = (&picks[0], &picks[orders - 1]);
-    Ok(match (index(first), index(last).map(|n| count - 1 - n)) {
+    Ok(match (index(0, first), index(orders - 1, last)) {
         (Some(a), Some(b)) if a == b => Ok(a),
-        _ => Err(format!("the two orderings disagree ({first} and {last})")),
+        _ => Err(format!(
+            "the two orderings disagree ({} and {})",
+            named(0, first),
+            named(orders - 1, last)
+        )),
     })
 }
 
@@ -394,8 +555,87 @@ fn shown(ranking: Option<(String, f64, f64)>) -> String {
     })
 }
 
-fn forward(index: usize) -> String {
+pub(super) fn forward(index: usize) -> String {
     format!("{:03}", index + 1)
+}
+
+pub(super) async fn spot(
+    goal: &str,
+    mut ask: impl AsyncFnMut(Questions, Grid) -> Result<Answers>,
+) -> Result<Result<(f64, f64), String>> {
+    let mut area = Area {
+        left: 0.0,
+        top: 0.0,
+        width: 1.0,
+        height: 1.0,
+    };
+    for (id, (columns, rows), shows) in [
+        ("spot", COARSE, "the screen in view"),
+        (
+            "spot_closer",
+            FINE,
+            "an enlarged part of the screen around the cell chosen before",
+        ),
+    ] {
+        let descriptions: Vec<String> = (1..=rows)
+            .flat_map(|row| {
+                (1..=columns)
+                    .map(move |column| format!("the cell in row {row} and column {column}"))
+            })
+            .collect();
+        let text = format!(
+            "The screenshot shows {shows}, under a grid of cells numbered at their top left corner. Which cell holds the spot to press to get closest to this goal: {goal}"
+        );
+        let mut asked = async |questions: Questions| {
+            let reversed = questions.keys().any(|id| id.ends_with(REVERSED));
+            ask(
+                questions,
+                Grid {
+                    area,
+                    columns,
+                    rows,
+                    reversed,
+                },
+            )
+            .await
+        };
+        let cell = match agree(&mut asked, id, &text, &descriptions, TARGET_AT).await? {
+            Ok(cell) => cell,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let (width, height) = (area.width / columns as f64, area.height / rows as f64);
+        let (left, top) = (
+            area.left + (cell % columns) as f64 * width,
+            area.top + (cell / columns) as f64 * height,
+        );
+        area = if id == "spot" {
+            let grow = |start: f64, size: f64| {
+                let grown = size * CLOSER;
+                (
+                    (start - (grown - size) / 2.0).clamp(0.0, 1.0 - grown),
+                    grown,
+                )
+            };
+            let ((left, width), (top, height)) = (grow(left, width), grow(top, height));
+            Area {
+                left,
+                top,
+                width,
+                height,
+            }
+        } else {
+            Area {
+                left,
+                top,
+                width,
+                height,
+            }
+        };
+    }
+    Ok(Ok((
+        area.left + area.width / 2.0,
+        area.top + area.height / 2.0,
+    )))
 }
 
 #[cfg(test)]
@@ -427,7 +667,7 @@ mod tests {
     async fn decide(step: &Step<'_>, answers: &Answers) -> (Decision, Vec<Questions>) {
         let mut asked = Vec::new();
         let decision = step
-            .decide(async |questions| {
+            .decide(false, async |questions, _| {
                 asked.push(questions);
                 Ok(answers.clone())
             })
@@ -445,6 +685,34 @@ mod tests {
         .await
         .unwrap();
         (element, asked)
+    }
+
+    #[test]
+    fn the_state_says_which_files_and_folders_the_goal_names() {
+        let folder = std::env::temp_dir().join(format!("iu2u-state-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let screen = screen();
+        let files = [
+            Files {
+                key: "panel".into(),
+                paths: vec![folder.join("panel.zip").display().to_string()],
+                zip: false,
+            },
+            Files {
+                key: "project".into(),
+                paths: vec![folder.display().to_string()],
+                zip: false,
+            },
+        ];
+        let state = Step::new("attach the panel", &screen, &[]).state(&[], &files);
+        std::fs::remove_dir_all(&folder).ok();
+        let folder = folder.file_name().unwrap().to_string_lossy();
+        assert!(
+            state.starts_with(&format!(
+                "Goal: attach the panel\nFiles the goal names, for a file chooser or picker:\n- panel: the file panel.zip\n- project: the folder {folder}\n"
+            )),
+            "{state}"
+        );
     }
 
     #[tokio::test]
@@ -472,6 +740,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_spot_is_found_on_a_grid_and_then_on_a_closer_one() {
+        let seeing = Screen {
+            spots: true,
+            ..screen()
+        };
+        assert!(
+            !Step::new("pay", &screen(), &[])
+                .operations
+                .iter()
+                .any(|operation| operation.name == "spot")
+        );
+        let step = Step::new("press Madrid on the map", &seeing, &[]);
+        let mut grids = Vec::new();
+        let decision = step
+            .decide(false, async |questions: Questions, grid| {
+                grids.extend(grid);
+                let id = questions.keys().next().cloned().unwrap_or_default();
+                let label = match id.as_str() {
+                    "operation" => "spot",
+                    "spot" => "019",
+                    "spot_reversed" => "030",
+                    "spot_closer" => "001",
+                    _ => "064",
+                };
+                Ok(Answers::from([(id, pick(label, &[(label, 0.9)]))]))
+            })
+            .await
+            .unwrap();
+        let Decision::Act(action) = decision else {
+            panic!("{decision:?}");
+        };
+        let Action::Spot(x, y) = *action else {
+            panic!("{action:?}");
+        };
+        assert!(
+            (x - 0.230_468_75).abs() < 1e-9 && (y - 0.307_291_666).abs() < 1e-6,
+            "{x} {y}"
+        );
+        assert_eq!(
+            grids
+                .iter()
+                .map(|grid| (grid.columns, grid.rows, grid.reversed))
+                .collect::<Vec<_>>(),
+            [(8, 6, false), (8, 6, true), (8, 8, false), (8, 8, true)]
+        );
+        assert_eq!(grids[0].area.width, 1.0);
+        assert!(
+            (grids[2].area.left - 0.218_75).abs() < 1e-9
+                && (grids[2].area.width - 0.187_5).abs() < 1e-9
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spot_no_cell_fits_is_asked_about_again_without_spots() {
+        let seeing = Screen {
+            spots: true,
+            ..screen()
+        };
+        let step = Step::new("press the pin below the map", &seeing, &[]);
+        let mut asked = Vec::new();
+        let decision = step
+            .decide(false, async |questions: Questions, _| {
+                let (id, question) = questions.into_iter().next().unwrap();
+                let label = match &question {
+                    Question::Pick { options, .. } if id == "operation" => {
+                        if options.contains_key("spot") {
+                            "spot"
+                        } else {
+                            "scroll"
+                        }
+                    }
+                    _ => "none",
+                };
+                asked.push(id.clone());
+                Ok(Answers::from([(id, pick(label, &[(label, 0.9)]))]))
+            })
+            .await
+            .unwrap();
+        assert_eq!(decision, Decision::Act(Box::new(Action::Scroll)));
+        assert_eq!(asked, ["operation", "spot", "operation"]);
+    }
+
+    #[tokio::test]
     async fn orderings_that_disagree_or_a_close_call_leave_the_step_unsure() {
         let screen = screen();
         let step = Step::new("pay", &screen, &[]);
@@ -486,27 +837,119 @@ mod tests {
             pick("press", &[("press", 0.5), ("type", 0.45)]),
         )]);
         assert!(
-            matches!(decide(&step, &disagree).await.0, Decision::Unsure(reason) if reason.contains("disagree"))
+            matches!(decide(&step, &disagree).await.0, Decision::Unsure(reason) if reason.contains(r#"disagree (button "Pay" and button "Help")"#))
         );
         assert!(matches!(decide(&step, &close).await.0, Decision::Unsure(_)));
+    }
+
+    #[tokio::test]
+    async fn a_goal_is_out_of_reach_only_when_the_model_is_as_sure_as_a_claim_needs() {
+        let screen = screen();
+        let step = Step::new("pay", &screen, &[]);
+        let stuck = |sure: f64| {
+            Answers::from([(
+                "operation".into(),
+                pick("stuck", &[("stuck", sure), ("done", 1.0 - sure)]),
+            )])
+        };
+        assert!(
+            matches!(decide(&step, &stuck(0.6)).await.0, Decision::Unsure(reason) if reason.contains("stuck at 0.60"))
+        );
+        assert_eq!(decide(&step, &stuck(HOLDS_AT)).await.0, Decision::Stuck);
+    }
+
+    #[tokio::test]
+    async fn a_goal_done_without_acting_is_done_only_when_the_screen_shows_it_reached() {
+        let screen = screen();
+        let step = Step::new("pay", &screen, &[]);
+        let reached = async |acted: bool, holds: f64| {
+            let mut asked = Vec::new();
+            let decision = step
+                .decide(acted, async |questions: Questions, _| {
+                    let (id, question) = questions.into_iter().next().unwrap();
+                    let answer = match &question {
+                        Question::Pick { options, .. } if options.contains_key("done") => {
+                            pick("done", &[("done", 0.9)])
+                        }
+                        Question::Pick { .. } => pick("stuck", &[("stuck", 0.9)]),
+                        _ => Answer::Yesno { yes: holds },
+                    };
+                    asked.push(id.clone());
+                    Ok(Answers::from([(id, answer)]))
+                })
+                .await
+                .unwrap();
+            (decision, asked)
+        };
+        assert_eq!(
+            reached(true, 0.1).await,
+            (Decision::Done, vec!["operation".into()])
+        );
+        assert_eq!(
+            reached(false, HOLDS_AT).await,
+            (Decision::Done, vec!["operation".into(), "holds".into()])
+        );
+        assert!(
+            matches!(reached(false, 0.5).await.0, Decision::Unsure(reason) if reason == "whether the goal is reached (at 0.50)")
+        );
+        assert_eq!(
+            reached(false, 0.1).await,
+            (
+                Decision::Stuck,
+                vec!["operation".into(), "holds".into(), "operation".into()]
+            )
+        );
     }
 
     #[tokio::test]
     async fn a_target_the_first_order_does_not_settle_is_not_asked_about_again() {
         let screen = screen();
         let step = Step::new("pay", &screen, &[]);
-        for (first, reason) in [
-            (pick("none", &[("none", 0.9)]), "none of the options fits"),
-            (pick("002", &[("002", 0.2)]), "unsure"),
-        ] {
-            let answers = Answers::from([
-                ("operation".into(), pick("press", &[("press", 0.9)])),
-                ("press".into(), first),
-            ]);
-            let (decision, asked) = decide(&step, &answers).await;
-            assert!(matches!(decision, Decision::Unsure(said) if said.contains(reason)));
-            assert_eq!(asked.len(), 2);
-        }
+        let answers = Answers::from([
+            ("operation".into(), pick("press", &[("press", 0.9)])),
+            ("press".into(), pick("002", &[("002", 0.2)])),
+        ]);
+        let (decision, asked) = decide(&step, &answers).await;
+        assert!(
+            matches!(decision, Decision::Unsure(said) if said.contains(r#"unsure (button "Pay" at 0.20"#))
+        );
+        assert_eq!(asked.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_operation_none_of_whose_targets_fits_is_asked_about_again_without_it() {
+        let screen = Screen {
+            elements: vec![
+                Element::new("combobox", "Rows", Kind::Choose(vec!["20".into()])),
+                Element::new("combobox", "Project", Kind::Press),
+            ],
+            ..Screen::default()
+        };
+        let step = Step::new("choose Data Warehouse in the project filter", &screen, &[]);
+        let mut asked = Vec::new();
+        let decision = step
+            .decide(false, async |questions: Questions, _| {
+                let answer = match questions.iter().next() {
+                    Some((id, Question::Pick { options, .. })) if id == "operation" => {
+                        if options.contains_key("choose") {
+                            pick("choose", &[("choose", 0.9)])
+                        } else {
+                            pick("press", &[("press", 0.9)])
+                        }
+                    }
+                    Some((id, _)) if id == "choose" => pick("none", &[("none", 0.9)]),
+                    _ => pick("001", &[("001", 0.9)]),
+                };
+                asked.push(questions.keys().next().cloned().unwrap_or_default());
+                Ok(Answers::from([(asked.last().unwrap().clone(), answer)]))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            Decision::Act(Box::new(Action::Press(screen.elements[1].clone())))
+        );
+        assert_eq!(asked, ["operation", "choose", "operation", "press"]);
     }
 
     #[tokio::test]
