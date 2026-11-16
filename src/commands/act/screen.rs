@@ -18,6 +18,7 @@ const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b')');
 pub(super) const HEADER: &str = "response header";
 pub(super) const VALUE_CHARS: usize = 200;
+const FOCUSED: &str = " · focused";
 const SECTIONS: [&str; 14] = [
     "alertdialog",
     "banner",
@@ -350,6 +351,10 @@ impl Screen {
         hash(&self.identity())
     }
 
+    pub(super) fn unfocused(&self) -> String {
+        hash(&without_focus(&self.identity()))
+    }
+
     pub(super) fn signature(&self) -> String {
         hash(&masked(&self.addressed(), &self.kept))
     }
@@ -448,6 +453,28 @@ impl<'a> Hider<'a> {
                 text.replace(form, label)
             })
     }
+}
+
+pub(super) fn without_focus(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let (mut quoted, mut escaped) = (false, false);
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if !quoted && rest.starts_with(FOCUSED) {
+            rest = &rest[FOCUSED.len()..];
+            continue;
+        }
+        if escaped {
+            escaped = false;
+        } else if quoted && c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        }
+        kept.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    kept
 }
 
 fn standing_for(text: &str, value: &str, name: &str) -> String {
@@ -946,5 +973,13 @@ mod tests {
         };
         assert_eq!(screen("a").fingerprint(), "af63dc4c8601ec8c");
         assert_ne!(screen("a").fingerprint(), screen("b").fingerprint());
+        assert_eq!(
+            screen("- button \"Save\" · focused").unfocused(),
+            screen("- button \"Save\"").unfocused()
+        );
+        assert_eq!(
+            without_focus(r#"- button "Save · focused \" · focused" · focused · in "Form""#),
+            r#"- button "Save · focused \" · focused" · in "Form""#
+        );
     }
 }

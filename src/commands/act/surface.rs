@@ -66,7 +66,7 @@ impl Surface {
         match self {
             Self::Browser(browser) => browser.observe().await,
             #[cfg(target_os = "macos")]
-            Self::Mac(mac) => mac.observe(),
+            Self::Mac(mac) => mac.observe().await,
         }
     }
 

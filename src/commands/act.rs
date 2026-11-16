@@ -11,7 +11,7 @@ mod shell;
 mod surface;
 mod zip;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -113,6 +113,7 @@ struct Report {
 struct Progress {
     moves: Vec<Move>,
     via: &'static str,
+    pressed: Option<(String, (String, String))>,
 }
 
 enum Replayed {
@@ -150,6 +151,7 @@ struct Run<'a> {
     shows_secret: bool,
     shot: Option<String>,
     done: Vec<String>,
+    files_refused: bool,
 }
 
 pub async fn act(
@@ -248,6 +250,7 @@ pub async fn act(
         shows_secret: false,
         shot: None,
         done: Vec::new(),
+        files_refused: false,
     };
     let mut steps = Vec::new();
     let mut occurrences = std::collections::HashMap::new();
@@ -262,6 +265,8 @@ pub async fn act(
             .or_insert(1);
         let key = lock::key(&checked, *occurrence);
         run.done.clear();
+        run.chosen.clear();
+        run.files_refused = false;
         run.numbers = screen::numbers(&checked);
         run.named = script::references(&checked);
         let began = Instant::now();
@@ -740,6 +745,7 @@ impl Run<'_> {
     }
 
     async fn observe(&mut self) -> Result<Screen> {
+        self.hand_files().await.ok();
         let shell = self.shell();
         let nodes = match &self.response {
             Some(lines) => text_nodes(lines, !shell),
@@ -806,9 +812,15 @@ impl Run<'_> {
         }
     }
 
-    async fn act(&mut self, action: &Action) -> Result<()> {
-        self.press(action).await?;
-        self.give_files().await
+    async fn hand_files(&mut self) -> Result<()> {
+        let given = self.give_files().await;
+        if let Err(error) = &given {
+            self.done.push(format!(
+                "a file chooser or picker could not take the files ({error:#})"
+            ));
+            self.files_refused = true;
+        }
+        given
     }
 
     async fn press(&mut self, action: &Action) -> Result<()> {
@@ -963,9 +975,15 @@ impl Run<'_> {
     }
 
     async fn replay(&mut self, key: &str, goal: &str, inputs: &[Input]) -> Result<Replayed> {
-        let afresh = |moves, via| Ok(Replayed::Afresh(Progress { moves, via }));
+        let afresh = |moves, via, pressed| {
+            Ok(Replayed::Afresh(Progress {
+                moves,
+                via,
+                pressed,
+            }))
+        };
         let Some(recorded) = self.old.get(key).cloned() else {
-            return afresh(Vec::new(), "model");
+            return afresh(Vec::new(), "model", None);
         };
         if let Some(value) = recorded.missing(inputs) {
             if self.suite.locked {
@@ -976,9 +994,10 @@ impl Run<'_> {
                     ),
                 )));
             }
-            return afresh(Vec::new(), "model");
+            return afresh(Vec::new(), "model", None);
         }
         let (mut moves, mut via, mut skipped, mut skipped_ms) = (Vec::new(), "replay", 0, 0);
+        let mut last = None;
         for recorded_move in &recorded.moves {
             if let Move::Wait { ms } = recorded_move {
                 skipped += 1;
@@ -1012,7 +1031,7 @@ impl Run<'_> {
                 Replay::Missing(_) | Replay::Changed if self.suite.locked => {
                     return Ok(Replayed::Settled(Report::failed("replay", CHANGED.into())));
                 }
-                Replay::Changed => return afresh(moves, via),
+                Replay::Changed => return afresh(moves, via, last),
                 Replay::Missing(control) => {
                     let state =
                         decide::Step::new(goal, &screen, inputs).state(&self.done, &self.chosen);
@@ -1025,7 +1044,7 @@ impl Run<'_> {
                             via = "healed";
                             action
                         }
-                        None => return afresh(moves, via),
+                        None => return afresh(moves, via, last),
                     }
                 }
             };
@@ -1049,21 +1068,32 @@ impl Run<'_> {
                     tokio::time::sleep(SEE_EVERY).await;
                 }
             }
-            if done.is_ok() {
-                done = self.give_files().await;
+            let pressed = done.is_ok();
+            if pressed
+                && let Err(error) = self.hand_files().await
+                && !recorded.files_refused
+            {
+                done = Err(error);
             }
             (skipped, skipped_ms) = (0, 0);
-            if let Err(error) = done {
+            if let Err(error) = &done {
                 if self.suite.locked {
                     return Ok(Replayed::Settled(Report::failed(
                         "replay",
                         format!("{error:#}"),
                     )));
                 }
-                self.refused(&action, &error);
-                return afresh(moves, via);
+                if !pressed {
+                    self.refused(&action, error);
+                    return afresh(moves, via, last);
+                }
             }
             moves.push(Move::of(&action, &screen));
+            let unfocused = screen.unfocused();
+            last = Some((unfocused.clone(), tried(&screen, unfocused, &action)));
+            if done.is_err() {
+                return afresh(moves, via, last);
+            }
         }
         let within = SEE_WITHIN + Duration::from_millis(skipped_ms);
         if let (screen, true) = self
@@ -1075,7 +1105,7 @@ impl Run<'_> {
             self.record(key, moves, &screen);
             return Ok(Replayed::Settled(Report::passed(via, None)));
         }
-        afresh(moves, via)
+        afresh(moves, via, last)
     }
 
     async fn plan(
@@ -1085,14 +1115,31 @@ impl Run<'_> {
         inputs: &[Input],
         progress: Progress,
     ) -> Result<Report> {
-        let Progress { mut moves, mut via } = progress;
+        let Progress {
+            mut moves,
+            mut via,
+            pressed,
+        } = progress;
         if via == "replay" {
             via = "model";
         }
-        let mut seen = HashSet::new();
+        let (mut shown, mut seen) = (String::new(), HashSet::new());
+        if let Some((on, tried)) = pressed {
+            shown = on;
+            seen.insert(tried);
+        }
+        let mut waited = HashSet::new();
+        let mut retried = HashSet::new();
+        let mut blocked = HashMap::new();
         let mut unsure_before = false;
         for _ in 0..MAX_DECISIONS {
             let screen = self.observe().await?;
+            let unfocused = screen.unfocused();
+            if shown != unfocused {
+                seen.clear();
+                waited.clear();
+                shown.clone_from(&unfocused);
+            }
             let step = decide::Step::new(goal, &screen, inputs);
             let state = step.state(&self.done, &self.chosen);
             let acted = moves
@@ -1105,6 +1152,7 @@ impl Run<'_> {
                     None => self.ask(&state, &questions).await,
                 })
                 .await?;
+            self.hand_files().await.ok();
             match decision {
                 Decision::Done => {
                     self.record(key, moves, &screen);
@@ -1131,7 +1179,7 @@ impl Run<'_> {
                     unsure_before = false;
                     via = "model";
                     if *action == Action::Wait {
-                        seen.clear();
+                        blocked.clear();
                         let ms = self.wait().await?;
                         moves.push(Move::Wait { ms });
                         continue;
@@ -1142,20 +1190,44 @@ impl Run<'_> {
                             format!("the goal took more than {MAX_ACTIONS} actions"),
                         ));
                     }
-                    if !seen.insert((screen.fingerprint(), action.describe()))
+                    let tried = tried(&screen, unfocused, &action);
+                    let refusal = (screen.signature(), tried.1.clone());
+                    if (seen.contains(&tried) || blocked.contains_key(&refusal))
                         && !(*action == Action::Scroll && self.surface()?.can_scroll().await?)
                     {
-                        return Ok(Report::failed(
-                            via,
-                            format!(
-                                "it would repeat this on an unchanged screen: {}",
-                                action.describe()
-                            ),
-                        ));
+                        if let Some(reason) = blocked.get(&refusal) {
+                            return Ok(Report::failed(
+                                via,
+                                format!(
+                                    "it could not do this, even after trying again: {} ({reason})",
+                                    action.describe()
+                                ),
+                            ));
+                        }
+                        if !waited.insert(tried) {
+                            return Ok(Report::failed(
+                                via,
+                                format!(
+                                    "it would repeat this on an unchanged screen: {}",
+                                    action.describe()
+                                ),
+                            ));
+                        }
+                        let ms = self.wait().await?;
+                        moves.push(Move::Wait { ms });
+                        continue;
                     }
-                    match self.act(&action).await {
-                        Ok(()) => moves.push(Move::of(&action, &screen)),
-                        Err(error) => self.refused(&action, &error),
+                    match self.press(&action).await {
+                        Ok(()) => {
+                            seen.insert(tried);
+                            moves.push(Move::of(&action, &screen));
+                        }
+                        Err(error) => {
+                            self.refused(&action, &error);
+                            if !retried.insert(refusal.clone()) {
+                                blocked.insert(refusal, format!("{error:#}"));
+                            }
+                        }
                     }
                 }
             }
@@ -1334,6 +1406,7 @@ impl Run<'_> {
                 picked: None,
                 sight: false,
                 exact: String::new(),
+                files_refused: self.files_refused,
             },
         );
     }
@@ -1596,6 +1669,18 @@ impl Run<'_> {
         self.suite.services.push(service);
         Ok(Report::passed("shell", None))
     }
+}
+
+fn tried(screen: &Screen, unfocused: String, action: &Action) -> (String, String) {
+    let keyed = matches!(*action, Action::Enter | Action::Escape);
+    (
+        if keyed {
+            screen.fingerprint()
+        } else {
+            unfocused
+        },
+        screen::without_focus(&action.describe()),
+    )
 }
 
 fn given(named: Vec<&Files>, dir: &Path) -> Result<Vec<Files>> {

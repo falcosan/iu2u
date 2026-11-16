@@ -19,6 +19,8 @@ pub(super) struct Recorded {
     pub(super) sight: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(super) exact: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) files_refused: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -336,6 +338,7 @@ mod tests {
             picked: None,
             sight: false,
             exact: String::new(),
+            files_refused: false,
         };
         assert_eq!(recorded.missing(&[email]), None);
         assert_eq!(recorded.missing(&[]), Some("email"));

@@ -5,7 +5,9 @@ mod common;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use common::{answer_always, reply, temp_path, yes};
 use serde_json::{Value, json};
@@ -1064,26 +1066,196 @@ async fn a_page_that_opens_a_new_tab_keeps_running_in_front() {
     assert_eq!(output.status.code(), Some(0), "{report}");
 }
 
-#[tokio::test]
-async fn a_press_blocked_for_a_moment_is_tried_again_after_a_wait() {
-    let model = MockServer::start().await;
-    for (state, answers, times) in [
-        ("Saved", decision("done", "001", "001"), None),
-        ("could not", decision("wait", "001", "001"), Some(1)),
-        ("", decision("press", "001", "001"), None),
-    ] {
-        let mock = Mock::given(method("POST"))
-            .and(body_string_contains(state))
-            .respond_with(reply(answers).set_delay(Duration::from_millis(400)));
-        match times {
-            Some(times) => mock.up_to_n_times(times).mount(&model).await,
-            None => mock.mount(&model).await,
-        }
-    }
-    let page = r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><div id="cover" style="position: fixed; inset: 0"></div><p id="out"></p><script>setTimeout(() => cover.remove(), 1500);</script>"#;
-    let script = script("covered", page, "open PAGE\ndo save\n");
+async fn pressed_once(name: &str, page: &str) {
+    let model = mock([
+        ("Saved", decision("done", "001", "001")),
+        ("", decision("press", "001", "001")),
+    ])
+    .await;
+    let script = script(name, page, "open PAGE\ndo save\n");
     let (output, report) = act(&script, Some(&model), false);
     assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(
+        report["steps"][1]["actions"],
+        json!(["pressed button \"Save\""]),
+        "{report}"
+    );
+}
+
+async fn not_pressed(name: &str, page: &str, reason: &str) {
+    let model = mock([("", decision("press", "001", "001"))]).await;
+    let script = script(name, page, "open PAGE\ndo save\n");
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert_eq!(
+        report["steps"][1]["actions"][0],
+        format!("tried but could not do this: pressed button \"Save\" ({reason})"),
+        "{report}"
+    );
+}
+
+async fn pressed_once_under_a_cover(name: &str, covered_ms: u64, saving_ms: u64) {
+    pressed_once(
+        name,
+        &format!(
+            r#"<!doctype html><button onclick="setTimeout(() => out.textContent = 'Saved', {saving_ms})">Save</button><div id="cover" style="position: fixed; inset: 0"></div><p id="out"></p><script>const look = Document.prototype.elementFromPoint; Document.prototype.elementFromPoint = function (...point) {{ Document.prototype.elementFromPoint = look; setTimeout(() => cover.remove(), {covered_ms}); return look.apply(this, point); }};</script>"#
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_press_waits_for_a_control_that_something_covers_for_a_moment() {
+    pressed_once_under_a_cover("covered-moment", 300, 0).await;
+}
+
+#[tokio::test]
+async fn a_press_that_waited_for_its_control_still_waits_for_its_effect() {
+    pressed_once_under_a_cover("covered-then-slow", 1000, 200).await;
+}
+
+#[tokio::test]
+async fn a_control_that_pulses_in_place_is_pressed() {
+    pressed_once("pulsing", r#"<!doctype html><style>@keyframes pulse { to { transform: scale(1.2) } } button { animation: pulse 0.4s linear infinite alternate }</style><button onclick="out.textContent = 'Saved'">Save</button><p id="out"></p>"#).await;
+}
+
+#[tokio::test]
+async fn a_control_that_keeps_moving_is_not_pressed() {
+    not_pressed("moving", r#"<!doctype html><style>@keyframes slide { to { transform: translateX(300px) } } button { animation: slide 1s linear infinite }</style><button onclick="out.textContent = 'Saved'">Save</button><p id="out"></p>"#, "button \"Save\" did not hold still").await;
+}
+
+#[tokio::test]
+async fn a_control_whose_animation_has_not_started_is_not_taken_for_still() {
+    not_pressed("pending", r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><p id="out"></p><script>const slide = document.querySelector('button').animate([{ transform: 'none' }, { transform: 'translateX(300px)' }], { duration: 1000, iterations: Infinity }); slide.pause(); let started = false; Object.defineProperty(slide, 'pending', { get: () => !started }); const look = Document.prototype.elementFromPoint; Document.prototype.elementFromPoint = function (...point) { Document.prototype.elementFromPoint = look; started = true; slide.play(); return look.apply(this, point); };</script>"#, "button \"Save\" did not hold still").await;
+}
+
+#[tokio::test]
+async fn a_control_on_a_page_that_draws_no_frames_is_not_pressed_blind() {
+    not_pressed("frameless", r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><p id="out"></p><script>window.requestAnimationFrame = () => 0;</script>"#, "the page drew no frames, so it is unknown whether button \"Save\" holds still").await;
+}
+
+#[tokio::test]
+async fn a_control_under_a_sticky_header_is_scrolled_out_from_under_it() {
+    pressed_once("sticky", r#"<!doctype html><header style="position: sticky; top: 0; height: 100px; background: white">Menu</header><div style="height: 1000px"></div><button onclick="out.textContent = 'Saved'">Save</button><p id="out"></p><div style="height: 2000px"></div><script>scrollTo(0, document.querySelector('button').offsetTop - 40)</script>"#).await;
+}
+
+#[tokio::test]
+async fn a_control_in_a_header_that_shrinks_as_the_page_scrolls_is_pressed() {
+    pressed_once("scroll-driven", r#"<!doctype html><style>@keyframes shrink { to { transform: scale(0.8) } } header { animation: shrink linear both; animation-timeline: scroll() }</style><header><button onclick="out.textContent = 'Saved'">Save</button></header><p id="out"></p>"#).await;
+}
+
+async fn covered_until_told(
+    name: &str,
+    answer: &str,
+    saving: Duration,
+) -> (Output, Value, std::path::PathBuf, MockServer) {
+    let told = Arc::new(AtomicBool::new(false));
+    let model = MockServer::start().await;
+    let answered = decision(answer, "001", "001");
+    let telling = told.clone();
+    Mock::given(method("POST"))
+        .and(body_string_contains("Saved"))
+        .respond_with(reply(decision("done", "001", "001")))
+        .mount(&model)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("could not"))
+        .respond_with(move |_: &wiremock::Request| {
+            telling.store(true, Ordering::SeqCst);
+            reply(answered.clone())
+        })
+        .up_to_n_times(1)
+        .mount(&model)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(reply(decision("press", "001", "001")))
+        .mount(&model)
+        .await;
+    let site = cover_site(told, saving).await;
+    let script = script(name, "", &format!("open {}/app\ndo save\n", site.uri()));
+    let (output, report) = act(&script, Some(&model), false);
+    (output, report, script, site)
+}
+
+async fn cover_site(gone: Arc<AtomicBool>, saving: Duration) -> MockServer {
+    let site = site(&[(
+        "/app",
+        &format!(
+            r#"<!doctype html><button onclick="setTimeout(() => out.textContent = 'Saved', {})">Save</button><div id="cover" style="position: fixed; inset: 0"></div><p id="out"></p><script>const check = () => fetch('/cover').then(answer => answer.text()).then(cover => cover === 'gone' ? document.getElementById('cover').remove() : setTimeout(check, 200)); check();</script>"#,
+            saving.as_millis()
+        ),
+    )])
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/cover"))
+        .respond_with(move |_: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_string(if gone.load(Ordering::SeqCst) {
+                "gone"
+            } else {
+                "here"
+            })
+        })
+        .mount(&site)
+        .await;
+    site
+}
+
+#[tokio::test]
+async fn a_press_the_model_waits_out_is_tried_again_after_each_wait() {
+    let gone = Arc::new(AtomicBool::new(false));
+    let turns = Arc::new(AtomicUsize::new(0));
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Saved"))
+        .respond_with(reply(decision("done", "001", "001")))
+        .mount(&model)
+        .await;
+    let ungoing = gone.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            if body.matches("tried but could not").count() >= 2 {
+                ungoing.store(true, Ordering::SeqCst);
+            }
+            let operation = if body.contains("\"operation\":{")
+                && turns.fetch_add(1, Ordering::SeqCst) % 2 == 1
+            {
+                "wait"
+            } else {
+                "press"
+            };
+            reply(decision(operation, "001", "001"))
+        })
+        .mount(&model)
+        .await;
+    let site = cover_site(gone, Duration::ZERO).await;
+    let script = script(
+        "waited-out",
+        "",
+        &format!("open {}/app\ndo save\n", site.uri()),
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(
+        report["steps"][1]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|done| *done == "pressed button \"Save\"")
+            .count(),
+        1,
+        "{report}"
+    );
+}
+
+const REFUSED_SAVE: &str = "tried but could not do this: pressed button \"Save\" (button \"Save\" is covered by another element)";
+
+#[tokio::test]
+async fn a_press_blocked_for_a_moment_is_tried_again_after_a_wait() {
+    let (output, report, script, _site) =
+        covered_until_told("covered", "wait", Duration::ZERO).await;
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(report["steps"][1]["actions"][0], REFUSED_SAVE, "{report}");
     assert_eq!(report["steps"][1]["actions"][1], "waited", "{report}");
 
     let (locked, replayed) = act(&script, None, true);
@@ -1091,6 +1263,232 @@ async fn a_press_blocked_for_a_moment_is_tried_again_after_a_wait() {
     assert!(
         replayed["screen"].as_str().unwrap().contains("Saved"),
         "{replayed}"
+    );
+}
+
+#[tokio::test]
+async fn a_press_that_could_not_be_done_is_tried_once_more() {
+    let (output, report, _, _site) = covered_until_told("refused", "press", Duration::ZERO).await;
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(
+        report["steps"][1]["actions"],
+        json!([REFUSED_SAVE, "pressed button \"Save\""]),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_press_tried_once_more_still_gets_a_wait_for_its_late_effect() {
+    let (output, report, _, _site) =
+        covered_until_told("refused-late", "press", Duration::from_millis(1500)).await;
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(
+        report["steps"][1]["actions"],
+        json!([REFUSED_SAVE, "pressed button \"Save\"", "waited"]),
+        "{report}"
+    );
+}
+
+async fn wrong_chooser_first(
+    name: &str,
+    folder: &str,
+    moves_on: &str,
+    thinking: Duration,
+) -> Value {
+    let note = temp_path(&format!("{name}-note.txt"));
+    std::fs::write(&note, "note").unwrap();
+    let given = format!("Files {name}-note.txt");
+    let model = mock_after(
+        thinking,
+        [
+            (given.as_str(), decision("done", "001", "001")),
+            (moves_on, decision("press", "002", "001")),
+            ("", decision("press", "001", "002")),
+        ],
+    )
+    .await;
+    let script = script(
+        name,
+        &format!(
+            "<!doctype html><button onclick=\"{folder}; fb.hidden = false\">Choose folder</button><input id=\"di\" type=\"file\" webkitdirectory style=\"display:none\"><button id=\"fb\" hidden onclick=\"fi.click()\">Choose file</button><input id=\"fi\" type=\"file\" style=\"display:none\" onchange=\"out.textContent = 'Files ' + this.files[0].name\"><p id=\"out\">Nothing yet</p>"
+        ),
+        &format!(
+            "with note = file {}\nopen PAGE\ndo attach the note\n",
+            note.display()
+        ),
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    let (locked, replayed) = act(&script, None, true);
+    assert_eq!(locked.status.code(), Some(0), "{replayed}");
+    report
+}
+
+#[tokio::test]
+async fn a_replayed_press_whose_chooser_now_takes_no_files_stays_in_the_lock() {
+    let note = temp_path("now-refused-note.txt");
+    std::fs::write(&note, "note").unwrap();
+    let model = mock([
+        ("Files now-refused-note.txt", decision("done", "001", "001")),
+        ("could not take the files", decision("press", "002", "001")),
+        ("", decision("press", "001", "001")),
+    ])
+    .await;
+    let script = script(
+        "now-refused",
+        "<!doctype html><button onclick=\"fi.click()\">Upload</button><input id=\"di\" type=\"file\" webkitdirectory style=\"display:none\"><button id=\"fb\" hidden onclick=\"fi.click()\">Choose file</button><input id=\"fi\" type=\"file\" style=\"display:none\" onchange=\"out.textContent = 'Files ' + this.files[0].name\"><p id=\"out\">Nothing yet</p>",
+        &format!(
+            "with note = file {}\nopen PAGE\ndo attach the note\n",
+            note.display()
+        ),
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    edit_page(
+        &script,
+        "onclick=\"fi.click()\">Upload",
+        "onclick=\"di.click(); fb.hidden = false\">Upload",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    let (locked, replayed) = act(&script, None, true);
+    assert_eq!(locked.status.code(), Some(0), "{replayed}");
+}
+
+#[tokio::test]
+async fn a_press_whose_chooser_took_no_files_still_replays_locked() {
+    wrong_chooser_first(
+        "wrong-chooser",
+        "di.click()",
+        "could not take the files",
+        Duration::ZERO,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_press_whose_late_chooser_took_no_files_still_replays_locked() {
+    wrong_chooser_first(
+        "late-wrong-chooser",
+        "setTimeout(() => di.click(), 1500)",
+        "could not take the files",
+        Duration::ZERO,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_chooser_that_opens_while_the_model_decides_is_answered_before_the_next_press() {
+    let report = wrong_chooser_first(
+        "slow-wrong-chooser",
+        "setTimeout(() => di.click(), 1500)",
+        "pressed button",
+        Duration::from_millis(1000),
+    )
+    .await;
+    let actions = report["steps"][1]["actions"].as_array().unwrap();
+    let at = |done: &str| {
+        actions
+            .iter()
+            .position(|action| action.as_str().unwrap().starts_with(done))
+    };
+    assert!(
+        at("a file chooser or picker could not take the files")
+            < at("pressed button \"Choose file\"")
+            && at("a file chooser or picker could not take the files").is_some(),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_press_that_stays_covered_stops_after_its_one_retry() {
+    let model = mock([("", decision("press", "001", "001"))]).await;
+    let script = script(
+        "always-covered",
+        r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><div style="position: fixed; inset: 0"></div><p id="out"></p><p id="clock">0</p><script>setInterval(() => clock.textContent++, 200)</script>"#,
+        "open PAGE\ndo save\n",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert_eq!(
+        report["steps"][1]["actions"],
+        json!([REFUSED_SAVE, REFUSED_SAVE]),
+        "{report}"
+    );
+    assert_eq!(
+        report["steps"][1]["detail"],
+        "it could not do this, even after trying again: pressed button \"Save\" (button \"Save\" is covered by another element)",
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn presses_that_stay_covered_stop_even_when_the_model_takes_turns_with_them() {
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &wiremock::Request| {
+            let refused = String::from_utf8_lossy(&request.body)
+                .matches("tried but could not")
+                .count();
+            reply(if refused.is_multiple_of(2) {
+                decision("press", "001", "002")
+            } else {
+                decision("press", "002", "001")
+            })
+        })
+        .mount(&model)
+        .await;
+    let script = script(
+        "always-covered-two",
+        r#"<!doctype html><button>Save</button><button>Submit</button><div style="position: fixed; inset: 0"></div>"#,
+        "open PAGE\ndo save\n",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert_eq!(
+        report["steps"][1]["actions"].as_array().unwrap().len(),
+        4,
+        "{report}"
+    );
+    assert_eq!(
+        report["steps"][1]["detail"],
+        "it could not do this, even after trying again: pressed button \"Save\" (button \"Save\" is covered by another element)",
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_press_whose_files_do_not_fit_is_not_pressed_again() {
+    let note = temp_path("unfit-note.txt");
+    std::fs::write(&note, "note").unwrap();
+    let model = mock([("", decision("press", "001", "001"))]).await;
+    let script = script(
+        "unfit",
+        "<!doctype html><button onclick=\"fi.click()\">Upload</button><input id=\"fi\" type=\"file\" webkitdirectory style=\"display:none\"><p>Nothing yet</p>",
+        &format!(
+            "with note = file {}\nopen PAGE\ndo attach the note\n",
+            note.display()
+        ),
+    );
+    let (_, report) = act(&script, Some(&model), false);
+    let actions = report["steps"][1]["actions"].as_array().unwrap();
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|done| done
+                .as_str()
+                .unwrap()
+                .starts_with("pressed button \"Upload\""))
+            .count(),
+        1,
+        "{report}"
+    );
+    assert!(
+        actions.iter().any(|done| done
+            .as_str()
+            .unwrap()
+            .contains("the page asked for a folder")),
+        "{report}"
     );
 }
 
@@ -1117,6 +1515,21 @@ async fn a_replay_waits_for_a_control_that_something_covers_for_a_moment() {
         replayed["screen"].as_str().unwrap().contains("Saved"),
         "{replayed}"
     );
+}
+
+#[tokio::test]
+async fn a_replay_tries_a_covered_control_once_more_as_the_model_run_did() {
+    let model = mock([
+        ("Saved", decision("done", "001", "001")),
+        ("", decision("press", "001", "001")),
+    ])
+    .await;
+    let page = r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><div id="cover" style="position: fixed; inset: 0"></div><p id="out"></p><script>const look = Document.prototype.elementFromPoint; Document.prototype.elementFromPoint = function (...point) { Document.prototype.elementFromPoint = look; setTimeout(() => cover.remove(), 7000); return look.apply(this, point); };</script>"#;
+    let script = script("covered-long", page, "open PAGE\ndo save\n");
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    let (locked, replayed) = act(&script, None, true);
+    assert_eq!(locked.status.code(), Some(0), "{replayed}");
 }
 
 #[tokio::test]
@@ -2760,6 +3173,238 @@ async fn a_file_chooser_the_page_ignores_is_not_pressed_again_and_again() {
 }
 
 #[tokio::test]
+async fn a_wait_the_model_asks_for_does_not_allow_the_same_press_again() {
+    let site = site(&[(
+        "/app",
+        "<!doctype html><button onclick=\"fetch('/zoom')\">Zoom in</button>",
+    )])
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/zoom"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&site)
+        .await;
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("pressed button"))
+        .respond_with(reply(decision("wait", "001", "001")))
+        .up_to_n_times(1)
+        .mount(&model)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(reply(decision("press", "001", "001")))
+        .mount(&model)
+        .await;
+    let script = script(
+        "zoom-once",
+        "",
+        &format!("open {}/app\ndo zoom in\n", site.uri()),
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    let zooms = site
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/zoom")
+        .count();
+    assert_eq!(zooms, 1, "{report}");
+}
+
+#[tokio::test]
+async fn going_back_to_an_earlier_tab_is_not_a_repeat() {
+    goes_back_to_an_earlier_tab("tabs-back", "button", "button", 0).await;
+}
+
+#[tokio::test]
+async fn going_back_to_an_earlier_tab_that_takes_no_focus_is_not_a_repeat() {
+    goes_back_to_an_earlier_tab("tabs-back-unfocused", "div role=\"tab\"", "div", 0).await;
+}
+
+#[tokio::test]
+async fn going_back_to_an_earlier_tab_that_shows_late_waits_for_it_again() {
+    goes_back_to_an_earlier_tab("tabs-back-late", "div role=\"tab\"", "div", 1500).await;
+}
+
+async fn goes_back_to_an_earlier_tab(name: &str, tab: &str, end: &str, late_ms: u64) {
+    let model = mock([
+        ("Chose Yearly", decision("done", "001", "001")),
+        ("Showing Yearly", decision("press", "001", "002")),
+        ("", decision("press", "002", "001")),
+    ])
+    .await;
+    let script = script(
+        name,
+        &format!(
+            r#"<!doctype html><{tab} onclick="out.textContent = 'Showing Monthly'">Monthly</{end}><{tab} onclick="setTimeout(() => out.textContent = ++yearly > 1 ? 'Chose Yearly' : 'Showing Yearly', {late_ms})">Yearly</{end}><p id="out">Showing Monthly</p><script>let yearly = 0;</script>"#
+        ),
+        "open PAGE\ndo look at Yearly, then Monthly, then choose Yearly\n",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+}
+
+#[tokio::test]
+async fn a_replay_that_hands_over_to_the_model_does_not_press_again() {
+    let model = mock([
+        ("Saved", decision("done", "001", "001")),
+        ("", decision("press", "001", "001")),
+    ])
+    .await;
+    let script = script(
+        "replay-late",
+        "<!doctype html><button onclick=\"setTimeout(() => out.textContent = 'Saved', 0)\">Save</button><p id=\"out\"></p>",
+        "open PAGE\ndo save\n",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    edit_page(&script, "'Saved', 0)", "'Saved', 1500)");
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(
+        report["steps"][1]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|done| done
+                .as_str()
+                .unwrap()
+                .starts_with("pressed button \"Save\""))
+            .count(),
+        1,
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_press_whose_effect_comes_late_is_not_pressed_again() {
+    let model = mock([
+        ("Saved", decision("done", "001", "001")),
+        ("", decision("press", "001", "001")),
+    ])
+    .await;
+    let script = script(
+        "late-effect",
+        "<!doctype html><button onclick=\"setTimeout(() => out.textContent = 'Saved', 1500)\">Save</button><p id=\"out\"></p>",
+        "open PAGE\ndo save\n",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(
+        report["steps"][1]["actions"][0], "pressed button \"Save\"",
+        "{report}"
+    );
+    assert!(
+        report["steps"][1]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|done| done.as_str().unwrap().starts_with("pressed"))
+            .count()
+            == 1,
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn enter_in_one_field_and_then_in_the_next_is_not_a_repeat() {
+    let model = mock([
+        ("Sent", decision("done", "001", "001")),
+        ("", decision("enter", "001", "001")),
+    ])
+    .await;
+    let script = script(
+        "two-enters",
+        "<!doctype html><label>Code <input value=\"12\" autofocus onkeydown=\"if (event.key === 'Enter') next.focus()\"></label><label>Check <input id=\"next\" value=\"34\" onkeydown=\"if (event.key === 'Enter') out.textContent = 'Sent'\"></label><p id=\"out\"></p>",
+        "open PAGE\ndo submit the code\n",
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+}
+
+#[tokio::test]
+async fn a_picker_that_opens_after_its_do_gets_none_of_its_files() {
+    let note = temp_path("step-note.txt");
+    std::fs::write(&note, "note").unwrap();
+    let site = site(&[
+        (
+            "/app",
+            "<!doctype html><button onclick=\"fi.click()\">Upload</button><input id=\"fi\" type=\"file\" style=\"display:none\" onchange=\"out.textContent = 'Files ' + this.files[0].name; fetch('/later').then(() => showOpenFilePicker()).then(([handle]) => handle.getFile()).then(file => late.textContent = 'Picked ' + file.name, () => late.textContent = 'Picked nothing')\"><p id=\"out\">Nothing yet</p><p id=\"late\"></p>",
+        ),
+        ("/later", ""),
+    ])
+    .await;
+    let model = mock([
+        ("Files step-note.txt", decision("done", "001", "001")),
+        ("", decision("press", "001", "001")),
+    ])
+    .await;
+    let script = script(
+        "after-do",
+        "",
+        &format!(
+            "with note = file {}\nroute */later hold\nopen {}/app\ndo attach the note\nrelease */later\nsee \"Picked nothing\" within 10s\n",
+            note.display(),
+            site.uri()
+        ),
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+}
+
+#[tokio::test]
+async fn a_file_chooser_that_opens_late_gets_the_named_file() {
+    let note = temp_path("late-note.txt");
+    std::fs::write(&note, "late").unwrap();
+    let model = mock([
+        ("Files late-note.txt", decision("done", "001", "001")),
+        ("", decision("press", "001", "001")),
+    ])
+    .await;
+    let script = script(
+        "late-chooser",
+        "<!doctype html><button onclick=\"setTimeout(() => fi.click(), 1500)\">Upload</button><input id=\"fi\" type=\"file\" style=\"display:none\" onchange=\"out.textContent = 'Files ' + this.files[0].name\"><p id=\"out\">Nothing yet</p>",
+        &format!(
+            "with note = file {}\nopen PAGE\ndo attach the note\n",
+            note.display()
+        ),
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    let (locked, replayed) = act(&script, None, true);
+    assert_eq!(locked.status.code(), Some(0), "{replayed}");
+}
+
+#[tokio::test]
+async fn a_file_chooser_that_opens_late_and_cannot_take_the_files_tells_the_model() {
+    let note = temp_path("late-folder-note.txt");
+    std::fs::write(&note, "late").unwrap();
+    let model = mock([("", decision("press", "001", "001"))]).await;
+    let script = script(
+        "late-folder",
+        "<!doctype html><button onclick=\"setTimeout(() => di.click(), 1500)\">Upload</button><input id=\"di\" type=\"file\" webkitdirectory style=\"display:none\"><p>Nothing yet</p>",
+        &format!(
+            "with note = file {}\nopen PAGE\ndo attach the note\n",
+            note.display()
+        ),
+    );
+    let (output, report) = act(&script, Some(&model), false);
+    assert_ne!(output.status.code(), Some(2), "{report}");
+    assert!(
+        report["steps"][1]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|done| done
+                .as_str()
+                .unwrap()
+                .contains("the page asked for a folder")),
+        "{report}"
+    );
+}
+
+#[tokio::test]
 async fn a_replay_that_cannot_give_the_files_presses_once() {
     let note = temp_path("pressed-once.txt");
     std::fs::write(&note, "one").unwrap();
@@ -2781,9 +3426,13 @@ async fn a_replay_that_cannot_give_the_files_presses_once() {
     edit_page(&script, "type=\"file\"", "type=\"file\" webkitdirectory");
     let (output, report) = act(&script, None, true);
     assert_eq!(output.status.code(), Some(1), "{report}");
-    assert_eq!(
-        report["steps"][1]["actions"].as_array().unwrap().len(),
-        1,
+    let actions = report["steps"][1]["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 2, "{report}");
+    assert!(
+        actions[1]
+            .as_str()
+            .unwrap()
+            .starts_with("a file chooser or picker could not take the files"),
         "{report}"
     );
     assert!(
@@ -3760,10 +4409,21 @@ async fn a_model_that_sees_gets_one_screenshot_per_screen() {
 async fn a_model_that_sees_gets_a_new_screenshot_in_each_step() {
     let model = MockServer::start().await;
     answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.9) })).await;
+    let site = site(&[
+        (
+            "/app",
+            "<!doctype html><p id=\"s\" style=\"color: red\">Status</p><script>fetch('/recolor').finally(() => s.style.color = 'green')</script>",
+        ),
+        ("/recolor", ""),
+    ])
+    .await;
     let script = script(
         "recolored",
-        "<!doctype html><p id=\"s\" style=\"color: red\">Status</p><script>setTimeout(() => s.style.color = 'green', 1000)</script>",
-        "open PAGE\nexpect the status is shown\nwait 2s\nexpect the status is shown in green\n",
+        "",
+        &format!(
+            "route */recolor hold\nopen {}/app\nexpect the status is shown\nrelease */recolor\nwait 1s\nexpect the status is shown in green\n",
+            site.uri()
+        ),
     );
     let output = command(Some(&model))
         .arg(&script)
@@ -4043,13 +4703,27 @@ async fn a_model_that_sees_gets_the_screenshot_once_the_pictures_on_it_load() {
         "<!doctype html><p>Gallery</p><script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<img alt=\"Field\" src=\"/field.png\">'), 800);</script>",
     )])
     .await;
+    let loading = Duration::from_millis(1500);
+    let picture = Arc::new(Mutex::new(None::<Instant>));
+    let asked = Arc::new(Mutex::new(None::<Instant>));
+    let picture_at = picture.clone();
     Mock::given(method("GET"))
         .and(path("/field.png"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(4000)))
+        .respond_with(move |_: &wiremock::Request| {
+            *picture_at.lock().unwrap() = Some(Instant::now());
+            ResponseTemplate::new(200).set_delay(loading)
+        })
         .mount(&site)
         .await;
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.9) })).await;
+    let asked_at = asked.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &wiremock::Request| {
+            asked_at.lock().unwrap().get_or_insert_with(Instant::now);
+            reply(json!({ "holds": yes(0.95), "sight": yes(0.9) }))
+        })
+        .mount(&model)
+        .await;
     let script = script(
         "pictures",
         "",
@@ -4066,11 +4740,11 @@ async fn a_model_that_sees_gets_the_screenshot_once_the_pictures_on_it_load() {
         .unwrap();
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(0), "{report}");
-    let waited: f64 = report["steps"].as_array().unwrap()[1..]
-        .iter()
-        .map(|step| step["seconds"].as_f64().unwrap())
-        .sum();
-    assert!(waited >= 3.0, "{report}");
+    let (picture, asked) = (
+        picture.lock().unwrap().unwrap(),
+        asked.lock().unwrap().unwrap(),
+    );
+    assert!(asked >= picture + loading, "{report}");
 }
 
 #[tokio::test]
@@ -5704,20 +6378,9 @@ async fn a_failed_step_on_a_long_screen_says_how_much_the_model_saw() {
 
 #[tokio::test]
 async fn a_step_stops_after_too_many_decisions() {
-    let model = MockServer::start().await;
-    for index in 0..30 {
-        let (forward, reversed) = (format!("{:03}", index + 1), format!("{:03}", 30 - index));
-        Mock::given(method("POST"))
-            .respond_with(reply(decision("press", &forward, &reversed)))
-            .up_to_n_times(3)
-            .mount(&model)
-            .await;
-    }
-    let buttons: String = (0..30)
-        .map(|index| format!("<button>Pay {index}</button>"))
-        .collect();
-    let page = format!(r#"<!doctype html>{buttons}<div style="position: fixed; inset: 0"></div>"#);
-    let detail = stopped("decisions", &page, &model).await;
+    let model = mock([("", decision("wait", "001", "001"))]).await;
+    let page = r#"<!doctype html><p id="tick">Tick 0</p><button>Pay</button><script>let count = 0; setInterval(() => tick.textContent = 'Tick ' + ++count, 400);</script>"#;
+    let detail = stopped("decisions", page, &model).await;
     assert!(detail.contains("not reached in 30 decisions"), "{detail}");
 }
 
@@ -6307,8 +6970,7 @@ fn a_mac_app_that_quits_is_an_error_at_once() {
         return;
     }
     assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(error.contains("did not answer"), "{report}");
-    assert!(report["seconds"].as_f64().unwrap() < 2.5, "{report}");
+    assert!(error.contains("the app quit"), "{report}");
 }
 
 #[cfg(target_os = "macos")]

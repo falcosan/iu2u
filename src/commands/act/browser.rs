@@ -47,6 +47,13 @@ const STDERR_CHARS: usize = 500;
 pub(super) const SUITE_PREFIX: &str = "iu2u-act-";
 const BUSY_REQUESTS: [&str; 5] = ["Document", "Stylesheet", "Script", "XHR", "Fetch"];
 const WATCH: &str = "window.__iu2u ?? (new MutationObserver(() => window.__iu2u++).observe(document, { subtree: true, childList: true, attributes: true, characterData: true }), window.__iu2u = 0)";
+const STABLE: &str = "function(within, still) { return new Promise(done => { const chain = new Set(); for (let node = this; node; node = node.parentNode ?? node.host) chain.add(node); let last = null; const frame = () => { const box = this.getBoundingClientRect(); const at = [box.x + box.width / 2, box.y + box.height / 2]; if (last !== null) { done(Math.hypot(at[0] - last[0], at[1] - last[1]) < still && !document.getAnimations().some(animation => animation.pending && animation.timeline?.currentTime != null && chain.has(animation.effect?.target))); return; } last = at; requestAnimationFrame(frame); }; requestAnimationFrame(frame); setTimeout(() => done(null), within); }); }";
+const FRAMES_WITHIN: Duration = Duration::from_millis(500);
+const STILL_PIXELS: f64 = 1.0;
+const ACTIONABLE_WITHIN: Duration = Duration::from_secs(5);
+const ALIGN: &str =
+    "function(at) { this.scrollIntoView({ block: at, inline: at, behavior: 'instant' }); }";
+const ALIGNMENTS: [Option<&str>; 4] = [None, Some("end"), Some("center"), Some("start")];
 const HIT: &str = "function(x, y) { const hit = this.getRootNode().elementFromPoint(x, y); return !!hit && (hit === this || this.contains(hit) || hit.closest('label')?.control === this); }";
 const FOCUS_AND_SELECT: &str = "function() { this.focus(); if (this.select) { this.select(); } else { getSelection().selectAllChildren(this); } const active = this.getRootNode().activeElement; return active === this || this.contains(active); }";
 const PICKERS: &str = "(() => { const picks = window.__iu2uPicks = {}; let last = 0; const ask = (kind, options) => new Promise((resolve, reject) => { const id = ++last; picks[id] = { resolve, reject }; __iu2uPick(JSON.stringify({ id, kind, multiple: !!(options && options.multiple) })); }); window.showOpenFilePicker = options => ask('file', options); window.showDirectoryPicker = options => ask('directory', options); })()";
@@ -220,7 +227,11 @@ impl Browser {
             .arg("--remote-debugging-pipe")
             .arg(format!("--user-data-dir={}", profile.display()))
             .args((!headful).then_some("--headless"))
-            .args(["--no-first-run", "--no-default-browser-check"])
+            .args([
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-backgrounding-occluded-windows",
+            ])
             .arg(format!("--window-size={},{}", VIEWPORT.0, VIEWPORT.1))
             .args(
                 (cfg!(target_os = "linux")
@@ -1068,16 +1079,20 @@ impl Browser {
             .unwrap()
             .dialogs
             .retain(|(_, shown)| !shown);
-        let before = self.revision().await;
-        let started = Instant::now();
+        let (mut before, mut started) = (self.revision().await, Instant::now());
         match action {
-            Action::Press(element) => self.press(element).await?,
+            Action::Press(element) => {
+                let (x, y) = self.point(element).await?;
+                (before, started) = (self.revision().await, Instant::now());
+                self.click(x, y).await?;
+            }
             Action::Spot(x, y) => {
                 let [width, height, ..] = self.view().await?;
                 self.click(x * width, y * height).await?;
             }
             Action::Hover(element) => {
                 let (x, y) = self.point(element).await?;
+                (before, started) = (self.revision().await, Instant::now());
                 self.call(
                     "Input.dispatchMouseEvent",
                     json!({ "type": "mouseMoved", "x": x, "y": y }),
@@ -1256,7 +1271,7 @@ impl Browser {
             .call_in(
                 element.frame,
                 "Runtime.callFunctionOn",
-                json!({ "objectId": object, "functionDeclaration": function, "arguments": arguments, "returnByValue": true }),
+                json!({ "objectId": object, "functionDeclaration": function, "arguments": arguments, "returnByValue": true, "awaitPromise": true }),
             )
             .await?;
         if let Some(exception) = result.get("exceptionDetails") {
@@ -1268,11 +1283,6 @@ impl Browser {
             );
         }
         Ok(result["result"]["value"].clone())
-    }
-
-    async fn press(&self, element: &Element) -> Result<()> {
-        let (x, y) = self.point(element).await?;
-        self.click(x, y).await
     }
 
     async fn click(&self, x: f64, y: f64) -> Result<()> {
@@ -1291,46 +1301,80 @@ impl Browser {
     }
 
     async fn point(&self, element: &Element) -> Result<(f64, f64)> {
-        self.fresh(element).await?;
-        self.call_in(
-            element.frame,
-            "DOM.scrollIntoViewIfNeeded",
-            json!({ "backendNodeId": element.handle }),
-        )
-        .await?;
-        let (origin, document) = self.place(element.frame).await?;
-        let quads = self
-            .call_in(
-                element.frame,
-                "DOM.getContentQuads",
-                json!({ "backendNodeId": element.handle }),
-            )
-            .await?;
-        let quad: Vec<f64> = quads["quads"][0]
-            .as_array()
-            .with_context(|| format!("{} is not visible", element.describe()))?
-            .iter()
-            .filter_map(Value::as_f64)
-            .collect();
-        let [left, top, _, _, right, bottom, ..] = quad[..] else {
-            bail!("{} is not visible", element.describe());
-        };
-        let (x, y) = (
-            (left + right) / 2.0 + origin.0,
-            (top + bottom) / 2.0 + origin.1,
-        );
-        if self
-            .on(
-                element,
-                HIT,
-                json!([{ "value": x - document.0 }, { "value": y - document.1 }]),
-            )
-            .await?
-            != json!(true)
-        {
-            bail!("{} is covered by another element", element.describe());
+        let (started, mut tries) = (Instant::now(), 0);
+        loop {
+            self.fresh(element).await?;
+            match ALIGNMENTS[tries % ALIGNMENTS.len()] {
+                None => {
+                    self.call_in(
+                        element.frame,
+                        "DOM.scrollIntoViewIfNeeded",
+                        json!({ "backendNodeId": element.handle }),
+                    )
+                    .await?;
+                }
+                Some(at) => {
+                    self.on(element, ALIGN, json!([{ "value": at }])).await?;
+                }
+            }
+            let measured = self
+                .on(
+                    element,
+                    STABLE,
+                    json!([
+                        { "value": FRAMES_WITHIN.as_secs_f64() * 1000.0 },
+                        { "value": STILL_PIXELS }
+                    ]),
+                )
+                .await?;
+            let still = measured == json!(true);
+            let (origin, document) = self.place(element.frame).await?;
+            let quads = self
+                .call_in(
+                    element.frame,
+                    "DOM.getContentQuads",
+                    json!({ "backendNodeId": element.handle }),
+                )
+                .await?;
+            let quad: Vec<f64> = quads["quads"][0]
+                .as_array()
+                .with_context(|| format!("{} is not visible", element.describe()))?
+                .iter()
+                .filter_map(Value::as_f64)
+                .collect();
+            let [left, top, _, _, right, bottom, ..] = quad[..] else {
+                bail!("{} is not visible", element.describe());
+            };
+            let (x, y) = (
+                (left + right) / 2.0 + origin.0,
+                (top + bottom) / 2.0 + origin.1,
+            );
+            let hit = self
+                .on(
+                    element,
+                    HIT,
+                    json!([{ "value": x - document.0 }, { "value": y - document.1 }]),
+                )
+                .await?
+                == json!(true);
+            if still && hit {
+                return Ok((x, y));
+            }
+            if started.elapsed() >= ACTIONABLE_WITHIN {
+                if measured.is_null() {
+                    bail!(
+                        "the page drew no frames, so it is unknown whether {} holds still",
+                        element.describe()
+                    );
+                }
+                if !still {
+                    bail!("{} did not hold still", element.describe());
+                }
+                bail!("{} is covered by another element", element.describe());
+            }
+            tries += 1;
+            tokio::time::sleep(surface::POLL).await;
         }
-        Ok((x, y))
     }
 
     async fn key(&self, key: &str, code: u32, text: &str) -> Result<()> {

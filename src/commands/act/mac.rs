@@ -32,6 +32,7 @@ const WALK_WITHIN: Duration = Duration::from_secs(2);
 const LAUNCH_WITHIN: Duration = Duration::from_secs(10);
 const MESSAGING_TIMEOUT: f32 = 0.25;
 const RESTORE_WITHIN: Duration = Duration::from_secs(2);
+const QUIT_WITHIN: Duration = Duration::from_secs(1);
 const RETURN: u16 = 36;
 const ESCAPE: u16 = 53;
 const PAGE_DOWN: u16 = 121;
@@ -128,7 +129,12 @@ impl Mac {
         })
     }
 
-    pub(super) fn observe(&mut self) -> Result<Vec<Node>> {
+    fn alive(&self) -> bool {
+        unsafe { libc::kill(self.pid, 0) == 0 }
+    }
+
+    pub(super) async fn observe(&mut self) -> Result<Vec<Node>> {
+        anyhow::ensure!(self.alive(), "the app quit");
         let mut started = Instant::now();
         let mut nodes: Vec<Node> = Vec::new();
         let mut handles = Vec::new();
@@ -167,7 +173,14 @@ impl Mac {
                     .map(|child| (child, Some(index))),
             );
         }
-        anyhow::ensure!(!nodes.is_empty(), "the app did not answer");
+        if nodes.is_empty() {
+            let quitting = Instant::now();
+            while quitting.elapsed() < QUIT_WITHIN {
+                anyhow::ensure!(self.alive(), "the app quit");
+                tokio::time::sleep(POLL).await;
+            }
+            anyhow::bail!("the app did not answer");
+        }
         self.handles = handles;
         self.fingerprint = Screen::new(&nodes, &[]).fingerprint();
         Ok(nodes)
@@ -242,7 +255,7 @@ impl Mac {
             ),
         }
         surface::settle(Some(before), started, async || {
-            self.observe().ok();
+            self.observe().await.ok();
             Probe {
                 revision: Some(self.fingerprint.clone()),
                 busy: false,
