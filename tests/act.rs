@@ -2336,28 +2336,6 @@ async fn a_followed_tab_that_closes_goes_back_to_the_tab_that_opened_it() {
         ),
         (
             "/help",
-            "<!doctype html><p>Help center</p><script>setTimeout(() => window.close(), 2000);</script>",
-        ),
-    ])
-    .await;
-    let model = pressing("Help center").await;
-    let script = site_script(
-        "closing",
-        &site,
-        "open SITE/app\ndo open the help\nsee \"Help center\"\ninject document.addEventListener('DOMContentLoaded', () => document.body.append('Injected'))\nwait 3s\nsee \"App page\"\nsee no \"Injected\"\nreload\nsee \"Injected\"\n",
-    );
-    passes(&script, &model);
-}
-
-#[tokio::test]
-async fn the_step_after_a_followed_tab_closes_goes_to_the_tab_that_opened_it() {
-    let site = site(&[
-        (
-            "/app",
-            "<!doctype html><p>App page</p><a href=\"/help\" target=\"_blank\">Help</a>",
-        ),
-        (
-            "/help",
             "<!doctype html><p>Help center</p><script>fetch('/close').finally(() => window.close());</script>",
         ),
         ("/close", ""),
@@ -2365,9 +2343,9 @@ async fn the_step_after_a_followed_tab_closes_goes_to_the_tab_that_opened_it() {
     .await;
     let model = pressing("Help center").await;
     let script = site_script(
-        "closing-reload",
+        "closing",
         &site,
-        "route */close hold\nopen SITE/app\ndo open the help\nrelease */close\nsee \"App page\" within 30s\nreload\nsee \"App page\"\n",
+        "route */close hold\nopen SITE/app\ndo open the help\nsee \"Help center\"\ninject document.addEventListener('DOMContentLoaded', () => document.body.append('Injected'))\nrelease */close\nsee \"App page\" within 30s\nsee no \"Injected\"\nreload\nsee \"Injected\"\n",
     );
     passes(&script, &model);
 }
@@ -4647,9 +4625,8 @@ fn stubborn_services_are_stopped_together() {
         "",
         "start first = sh -c 'trap \"\" TERM; exec sleep 77'; echo done\nstart second = sh -c 'trap \"\" TERM; exec sleep 78'; echo done\nwait 1s\n",
     );
-    let started = std::time::Instant::now();
     let report = runs(&script);
-    assert!(started.elapsed() < Duration::from_secs(9), "{report}");
+    assert!(report["seconds"].as_f64().unwrap() < 9.0, "{report}");
 }
 
 #[test]

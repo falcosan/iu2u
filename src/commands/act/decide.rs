@@ -455,47 +455,103 @@ async fn agree(
     descriptions: &[String],
     at: f64,
 ) -> Result<Result<usize, String>> {
+    Ok(zone(ask, id, text, descriptions, at, |a, b| a == b)
+        .await?
+        .map(|cells| cells[0]))
+}
+
+fn position(order: usize, label: &str, count: usize) -> Option<usize> {
+    label
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .filter(|&n| n < count)
+        .map(|n| if order == 0 { n } else { count - 1 - n })
+}
+
+async fn zone(
+    ask: &mut impl AsyncFnMut(Questions) -> Result<Answers>,
+    id: &str,
+    text: &str,
+    descriptions: &[String],
+    at: f64,
+    near: impl Fn(usize, usize) -> bool,
+) -> Result<Result<Vec<usize>, String>> {
     if descriptions.is_empty() {
         return Ok(Err("there is nothing to pick from".into()));
     }
     let count = descriptions.len();
     let orders = count.min(2);
-    let index = |order: usize, label: &str| {
-        label
-            .parse::<usize>()
-            .ok()
-            .and_then(|n| n.checked_sub(1))
-            .filter(|&n| n < count)
-            .map(|n| if order == 0 { n } else { count - 1 - n })
-    };
-    let named = |order: usize, label: &str| {
-        index(order, label).map_or_else(|| label.to_owned(), |n| descriptions[n].clone())
-    };
-    let mut picks = Vec::new();
+    let (mut cells, mut named) = (Vec::new(), Vec::new());
     for (order, (id, question)) in both_orders(id, text, descriptions).take(orders).enumerate() {
         let reply = ask(Questions::from([(id.clone(), question)])).await?;
-        match ranked(reply.get(&id)) {
-            Some((pick, top, margin)) if top >= at && margin >= MARGIN => {
-                if pick == NONE && picks.is_empty() {
-                    return Ok(Err(NONE_FITS.into()));
-                }
-                picks.push(pick);
-            }
-            ranking => {
-                let ranking = ranking.map(|(pick, top, margin)| (named(order, &pick), top, margin));
-                return Ok(Err(format!("unsure ({})", shown(ranking))));
-            }
+        let Some(chances) = chances_in(reply.get(&id)) else {
+            return Ok(Err(format!("unsure ({})", shown(None))));
+        };
+        let cell = |slot: usize| position(order, chances[slot].0, count);
+        let strong: Vec<(usize, usize)> = (0..chances.len())
+            .filter(|&slot| chances[slot].1 >= MARGIN)
+            .filter_map(|slot| Some((slot, cell(slot)?)))
+            .collect();
+        let mut zones: Vec<Vec<usize>> = (0..chances.len()).map(|slot| vec![slot]).collect();
+        for (first, &(a, x)) in strong.iter().enumerate() {
+            zones.extend(
+                strong[first + 1..]
+                    .iter()
+                    .filter(|&&(_, y)| near(x, y))
+                    .map(|&(b, _)| vec![a, b]),
+            );
         }
+        let mass = |zone: &[usize]| zone.iter().map(|&slot| chances[slot].1).sum::<f64>();
+        let lead = |zone: &[usize]| {
+            mass(zone)
+                - zones
+                    .iter()
+                    .filter(|other| other.iter().all(|slot| !zone.contains(slot)))
+                    .map(|other| mass(other))
+                    .fold(0.0, f64::max)
+        };
+        let Some(chosen) = zones.iter().find(|zone| {
+            zone.iter().all(|&slot| cell(slot).is_some())
+                && mass(zone) >= at
+                && lead(zone) >= MARGIN
+        }) else {
+            let ((label, top), ahead) = (chances[0], lead(&[0]));
+            let sure = top >= at && ahead >= MARGIN;
+            if order == 0 && label == NONE && sure {
+                return Ok(Err(NONE_FITS.into()));
+            }
+            let label =
+                cell(0).map_or_else(|| label.to_owned(), |index| descriptions[index].clone());
+            if order > 0 && sure {
+                return Ok(Err(format!(
+                    "the two orderings disagree ({} and {label})",
+                    named[0]
+                )));
+            }
+            return Ok(Err(format!(
+                "unsure ({})",
+                shown(Some((label, top, ahead)))
+            )));
+        };
+        let chosen: Vec<usize> = chosen.iter().filter_map(|&slot| cell(slot)).collect();
+        named.push(
+            chosen
+                .iter()
+                .map(|&index| descriptions[index].as_str())
+                .collect::<Vec<_>>()
+                .join(" or "),
+        );
+        cells.extend(chosen);
     }
-    let (first, last) = (&picks[0], &picks[orders - 1]);
-    Ok(match (index(0, first), index(orders - 1, last)) {
-        (Some(a), Some(b)) if a == b => Ok(a),
-        _ => Err(format!(
+    if cells.iter().any(|&a| cells.iter().any(|&b| !near(a, b))) {
+        return Ok(Err(format!(
             "the two orderings disagree ({} and {})",
-            named(0, first),
-            named(orders - 1, last)
-        )),
-    })
+            named[0],
+            named[orders - 1]
+        )));
+    }
+    Ok(Ok(cells))
 }
 
 fn both_orders(
@@ -531,22 +587,28 @@ fn both_orders(
     })
 }
 
-fn ranked(answer: Option<&Answer>) -> Option<(String, f64, f64)> {
-    let Some(Answer::Pick {
-        pick,
-        confidence,
-        probabilities,
-    }) = answer
-    else {
-        return None;
+fn chances_in(answer: Option<&Answer>) -> Option<Vec<(&str, f64)>> {
+    let mut chances: Vec<(&str, f64)> = match answer? {
+        Answer::Pick { probabilities, .. } if !probabilities.is_empty() => probabilities
+            .iter()
+            .map(|(label, probability)| (label.as_str(), *probability))
+            .collect(),
+        Answer::Pick {
+            pick,
+            confidence: Some(confidence),
+            ..
+        } => vec![(pick.as_str(), *confidence)],
+        _ => return None,
     };
-    let top = probabilities.get(pick).copied().or(*confidence)?;
-    let second = probabilities
-        .iter()
-        .filter(|(label, _)| *label != pick)
-        .map(|(_, probability)| *probability)
-        .fold(0.0, f64::max);
-    Some((pick.clone(), top, top - second))
+    chances.sort_by(|a, b| b.1.total_cmp(&a.1));
+    Some(chances)
+}
+
+fn ranked(answer: Option<&Answer>) -> Option<(String, f64, f64)> {
+    let chances = chances_in(answer)?;
+    let (pick, top) = chances[0];
+    let next = chances.get(1).map_or(0.0, |(_, chance)| *chance);
+    Some((pick.to_owned(), top, top - next))
 }
 
 fn shown(ranking: Option<(String, f64, f64)>) -> String {
@@ -599,14 +661,29 @@ pub(super) async fn spot(
             )
             .await
         };
-        let cell = match agree(&mut asked, id, &text, &descriptions, TARGET_AT).await? {
-            Ok(cell) => cell,
+        let near = |a: usize, b: usize| {
+            (a % columns).abs_diff(b % columns) <= 1 && (a / columns).abs_diff(b / columns) <= 1
+        };
+        let cells = match zone(&mut asked, id, &text, &descriptions, TARGET_AT, near).await? {
+            Ok(cells) => cells,
             Err(reason) => return Ok(Err(reason)),
         };
+        let span = |of: fn(usize, usize) -> usize| {
+            let values = cells.iter().map(|&cell| of(cell, columns));
+            (values.clone().min().unwrap_or(0), values.max().unwrap_or(0))
+        };
+        let ((first, last), (top_row, bottom_row)) = (
+            span(|cell, columns| cell % columns),
+            span(|cell, columns| cell / columns),
+        );
         let (width, height) = (area.width / columns as f64, area.height / rows as f64);
         let (left, top) = (
-            area.left + (cell % columns) as f64 * width,
-            area.top + (cell / columns) as f64 * height,
+            area.left + first as f64 * width,
+            area.top + top_row as f64 * height,
+        );
+        let (width, height) = (
+            (last - first + 1) as f64 * width,
+            (bottom_row - top_row + 1) as f64 * height,
         );
         area = if id == "spot" {
             let grow = |start: f64, size: f64| {
@@ -739,41 +816,52 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_spot_is_found_on_a_grid_and_then_on_a_closer_one() {
+    async fn spotted(answers: &[(&str, Answer)]) -> (Decision, Vec<Grid>) {
         let seeing = Screen {
             spots: true,
             ..screen()
         };
-        assert!(
-            !Step::new("pay", &screen(), &[])
-                .operations
-                .iter()
-                .any(|operation| operation.name == "spot")
-        );
         let step = Step::new("press Madrid on the map", &seeing, &[]);
         let mut grids = Vec::new();
         let decision = step
             .decide(false, async |questions: Questions, grid| {
                 grids.extend(grid);
                 let id = questions.keys().next().cloned().unwrap_or_default();
-                let label = match id.as_str() {
-                    "operation" => "spot",
-                    "spot" => "019",
-                    "spot_reversed" => "030",
-                    "spot_closer" => "001",
-                    _ => "064",
-                };
-                Ok(Answers::from([(id, pick(label, &[(label, 0.9)]))]))
+                let answer = answers.iter().find(|(asked, _)| *asked == id).unwrap();
+                Ok(Answers::from([(id, answer.1.clone())]))
             })
             .await
             .unwrap();
+        (decision, grids)
+    }
+
+    fn spotted_at(decision: Decision) -> (f64, f64) {
         let Decision::Act(action) = decision else {
             panic!("{decision:?}");
         };
         let Action::Spot(x, y) = *action else {
             panic!("{action:?}");
         };
+        (x, y)
+    }
+
+    #[tokio::test]
+    async fn a_spot_is_found_on_a_grid_and_then_on_a_closer_one() {
+        assert!(
+            !Step::new("pay", &screen(), &[])
+                .operations
+                .iter()
+                .any(|operation| operation.name == "spot")
+        );
+        let (decision, grids) = spotted(&[
+            ("operation", pick("spot", &[("spot", 0.9)])),
+            ("spot", pick("019", &[("019", 0.9)])),
+            ("spot_reversed", pick("030", &[("030", 0.9)])),
+            ("spot_closer", pick("001", &[("001", 0.9)])),
+            ("spot_closer_reversed", pick("064", &[("064", 0.9)])),
+        ])
+        .await;
+        let (x, y) = spotted_at(decision);
         assert!(
             (x - 0.230_468_75).abs() < 1e-9 && (y - 0.307_291_666).abs() < 1e-6,
             "{x} {y}"
@@ -790,6 +878,92 @@ mod tests {
             (grids[2].area.left - 0.218_75).abs() < 1e-9
                 && (grids[2].area.width - 0.187_5).abs() < 1e-9
         );
+    }
+
+    #[tokio::test]
+    async fn a_spot_on_the_line_between_cells_is_pressed_on_both() {
+        let (decision, grids) = spotted(&[
+            ("operation", pick("spot", &[("spot", 0.9)])),
+            (
+                "spot",
+                pick(
+                    "001",
+                    &[("001", 0.27), ("019", 0.26), ("020", 0.25), ("none", 0.22)],
+                ),
+            ),
+            ("spot_reversed", pick("030", &[("030", 0.9)])),
+            ("spot_closer", pick("001", &[("001", 0.9)])),
+            (
+                "spot_closer_reversed",
+                pick("063", &[("063", 0.5), ("064", 0.5)]),
+            ),
+        ])
+        .await;
+        assert!(
+            (grids[2].area.left - 0.187_5).abs() < 1e-9
+                && (grids[2].area.width - 0.375).abs() < 1e-9,
+            "{:?}",
+            grids[2].area
+        );
+        let (x, y) = spotted_at(decision);
+        assert!(
+            (x - 0.234_375).abs() < 1e-9 && (y - 0.307_291_666).abs() < 1e-6,
+            "{x} {y}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spot_the_model_is_not_sure_of_is_not_pressed() {
+        let operation = ("operation", pick("spot", &[("spot", 0.9)]));
+        for (answers, reason) in [
+            (
+                vec![
+                    ("spot", pick("019", &[("019", 0.9)])),
+                    ("spot_reversed", pick("001", &[("001", 0.9)])),
+                ],
+                "the two orderings disagree (the cell in row 3 and column 3 and the cell in row 6 and column 8)",
+            ),
+            (
+                vec![
+                    ("spot", pick("019", &[("019", 0.9)])),
+                    ("spot_reversed", pick("none", &[("none", 0.9)])),
+                ],
+                "the two orderings disagree (the cell in row 3 and column 3 and none)",
+            ),
+            (
+                vec![(
+                    "spot",
+                    pick(
+                        "none",
+                        &[("none", 0.4), ("019", 0.25), ("020", 0.2), ("001", 0.15)],
+                    ),
+                )],
+                "unsure (none at 0.40, ahead by -0.05)",
+            ),
+            (
+                vec![(
+                    "spot",
+                    pick("019", &[("019", 0.44), ("none", 0.35), ("020", 0.02)]),
+                )],
+                "unsure (the cell in row 3 and column 3 at 0.44, ahead by 0.09)",
+            ),
+            (
+                vec![(
+                    "spot",
+                    pick(
+                        "019",
+                        &[("019", 0.26), ("020", 0.26), ("001", 0.24), ("002", 0.24)],
+                    ),
+                )],
+                "unsure (the cell in row 3 and column 3 at 0.26, ahead by -0.22)",
+            ),
+        ] {
+            let (decision, _) = spotted(&[[operation.clone()].as_slice(), &answers].concat()).await;
+            assert!(
+                matches!(&decision, Decision::Unsure(found) if *found == format!("where to press: {reason}")),
+                "{decision:?}"
+            );
+        }
     }
 
     #[tokio::test]
