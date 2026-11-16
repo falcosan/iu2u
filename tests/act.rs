@@ -40,6 +40,10 @@ fn choice(pick: &str) -> Value {
     json!({ "type": "choice", "choice": pick, "confidence": 0.9, "probabilities": { pick: 0.9, "none": 0.1 } })
 }
 
+fn does(operation: &str) -> Value {
+    decision(operation, "001", "001")
+}
+
 fn decision(operation: &str, pick: &str, pick_reversed: &str) -> Value {
     json!({
         "operation": choice(operation),
@@ -73,6 +77,38 @@ async fn mock(replies: impl IntoIterator<Item = (&str, Value)>) -> MockServer {
     mock_after(Duration::ZERO, replies).await
 }
 
+fn verdict(probability: f64) -> Value {
+    json!({ "holds": yes(probability), "sight": yes(0.0) })
+}
+
+async fn pressing(done_on: &str) -> MockServer {
+    mock([(done_on, does("done")), ("", does("press"))]).await
+}
+
+async fn spot_model(done_on: &str) -> MockServer {
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(done_on))
+        .and(body_string_contains("\"operation\":{"))
+        .respond_with(reply(json!({ "operation": choice("done") })))
+        .mount(&model)
+        .await;
+    for (question, label) in [
+        ("operation", "spot"),
+        ("spot", "019"),
+        ("spot_reversed", "030"),
+        ("spot_closer", "001"),
+        ("spot_closer_reversed", "064"),
+    ] {
+        Mock::given(method("POST"))
+            .and(body_string_contains(format!("\"{question}\":{{")))
+            .respond_with(reply(json!({ question: choice(label) })))
+            .mount(&model)
+            .await;
+    }
+    model
+}
+
 async fn mock_after(
     delay: Duration,
     replies: impl IntoIterator<Item = (&str, Value)>,
@@ -90,13 +126,10 @@ async fn mock_after(
 
 async fn model() -> MockServer {
     mock([
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
-        ("Welcome", decision("done", "001", "001")),
+        ("\"holds\"", verdict(0.95)),
+        ("Welcome", does("done")),
         ("typed", decision("press", "002", "001")),
-        ("", decision("type", "001", "001")),
+        ("", does("type")),
     ])
     .await
 }
@@ -111,6 +144,10 @@ fn script(name: &str, page: &str, steps: &str) -> std::path::PathBuf {
     )
     .unwrap();
     script
+}
+
+fn site_script(name: &str, site: &MockServer, steps: &str) -> std::path::PathBuf {
+    script(name, "", &steps.replace("SITE", &site.uri()))
 }
 
 fn shop(name: &str) -> std::path::PathBuf {
@@ -141,11 +178,25 @@ fn command(model: Option<&MockServer>) -> Command {
 }
 
 fn act(script: &Path, model: Option<&MockServer>, locked: bool) -> (Output, Value) {
+    act_with(script, model, locked, &[])
+}
+
+fn sees(script: &Path, model: &MockServer) -> (Output, Value) {
+    act_with(script, Some(model), false, &[("IU2U_VISION", "true")])
+}
+
+fn act_with(
+    script: &Path,
+    model: Option<&MockServer>,
+    locked: bool,
+    env: &[(&str, &str)],
+) -> (Output, Value) {
     let output = command(model)
         .arg("--json")
         .arg(script)
         .args(locked.then_some("--locked"))
         .env("IU2U_TEST_SECRET", SECRET)
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     let report = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
@@ -156,6 +207,43 @@ fn act(script: &Path, model: Option<&MockServer>, locked: bool) -> (Output, Valu
         )
     });
     (output, report)
+}
+
+#[track_caller]
+fn passes(script: &Path, model: &MockServer) -> Value {
+    succeeded(act(script, Some(model), false))
+}
+
+#[track_caller]
+fn runs(script: &Path) -> Value {
+    succeeded(act(script, None, false))
+}
+
+#[track_caller]
+fn replays(script: &Path) -> Value {
+    succeeded(act(script, None, true))
+}
+
+#[track_caller]
+fn succeeded(run: (Output, Value)) -> Value {
+    exits(0, run)
+}
+
+#[track_caller]
+fn exits(code: i32, (output, report): (Output, Value)) -> Value {
+    assert_eq!(output.status.code(), Some(code), "{report}");
+    report
+}
+
+#[track_caller]
+fn has(report: &Value, at: &str, text: &str) {
+    assert!(
+        report
+            .pointer(at)
+            .and_then(Value::as_str)
+            .is_some_and(|said| said.contains(text)),
+        "{report}"
+    );
 }
 
 fn act_with_browser(name: &str, browser: &str, flag: Option<&str>) -> (Output, Value) {
@@ -188,8 +276,7 @@ fn vias(report: &Value) -> Vec<&str> {
 async fn act_reaches_a_goal_records_it_and_replays_it_without_the_model() {
     let model = model().await;
     let script = shop("record");
-    let (first, report) = act(&script, Some(&model), false);
-    assert_eq!(first.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(vias(&report), ["browser", "model", "model", "check"]);
     assert_eq!(
         report["steps"][1]["actions"],
@@ -209,9 +296,7 @@ async fn act_reaches_a_goal_records_it_and_replays_it_without_the_model() {
     );
     let lock = std::fs::read_to_string(format!("{}.lock", script.display())).unwrap();
     assert!(lock.contains("\"move\": \"press\""));
-
-    let (second, replayed) = act(&script, None, true);
-    assert_eq!(second.status.code(), Some(0), "{replayed}");
+    let replayed = replays(&script);
     assert_eq!(vias(&replayed), ["browser", "replay", "cache", "check"]);
     assert_eq!(replayed["model_calls"], 0);
     assert!(
@@ -232,7 +317,6 @@ async fn a_renamed_control_fails_a_locked_run_and_is_healed_by_the_model() {
     let script = script("heal", &page, SCRIPT);
     assert_eq!(act(&script, Some(&model), false).0.status.code(), Some(0));
     edit_page(&script, ">Sign in</button>", ">Log in</button>");
-
     let (locked, report) = act(&script, None, true);
     assert_eq!(locked.status.code(), Some(1), "{report}");
     assert!(
@@ -241,7 +325,6 @@ async fn a_renamed_control_fails_a_locked_run_and_is_healed_by_the_model() {
             .unwrap()
             .contains("--locked")
     );
-
     let (healed, report) = act(&script, Some(&model), false);
     assert_eq!(healed.status.code(), Some(0), "{report}");
     assert_eq!(report["steps"][1]["via"], "healed");
@@ -256,22 +339,17 @@ async fn an_unrecognized_control_is_decided_afresh() {
     unrecognized["recorded"] = choice("none");
     unrecognized["recorded_reversed"] = choice("none");
     let model = mock([
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
-        ("Welcome", decision("done", "001", "001")),
+        ("\"holds\"", verdict(0.95)),
+        ("Welcome", does("done")),
         ("typed", unrecognized),
-        ("", decision("type", "001", "001")),
+        ("", does("type")),
     ])
     .await;
     let script = shop("afresh");
     assert_eq!(act(&script, Some(&model), false).0.status.code(), Some(0));
     edit_page(&script, ">Sign in</button>", ">Log in</button>");
     edit_page(&script, "<label>Email", "<label>E-mail");
-
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(report["steps"][1]["via"], "model");
     assert_eq!(
         report["steps"][1]["actions"][1],
@@ -282,7 +360,7 @@ async fn an_unrecognized_control_is_decided_afresh() {
 #[tokio::test]
 async fn a_script_on_stdin_reports_a_broken_claim_and_exits_one() {
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.1), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.1)).await;
     let page = temp_path("claim.html");
     std::fs::write(&page, SHOP.replace("BUTTON", "Sign in")).unwrap();
     let mut child = command(Some(&model))
@@ -324,15 +402,12 @@ fn long_claim(name: &str) -> std::path::PathBuf {
 #[tokio::test]
 async fn a_claim_about_a_long_screen_says_how_much_the_model_saw() {
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.1), "sight": yes(0.0) })).await;
-    let (output, report) = act(&long_claim("long"), Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
-    assert!(
-        report["steps"][1]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("the model saw only the first 6000 characters"),
-        "{report}"
+    answer_always(&model, verdict(0.1)).await;
+    let report = exits(1, act(&long_claim("long"), Some(&model), false));
+    has(
+        &report,
+        "/steps/1/detail",
+        "the model saw only the first 6000 characters",
     );
 }
 
@@ -409,13 +484,10 @@ fn an_empty_secret_stops_the_script_before_it_runs() {
             .unwrap()
             .contains("set the environment variable IU2U_EMPTY_SECRET")
     );
-
     let silent = temp_path("empty-run.e2e");
     std::fs::write(&silent, "with token = run true\nrun echo never\n").unwrap();
-    let (output, report) = act(&silent, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
+    let report = exits(2, act(&silent, None, false));
     assert_eq!(report["error"], "with token: the command printed nothing");
-
     let failing = temp_path("failing-run.e2e");
     std::fs::write(
         &failing,
@@ -434,29 +506,26 @@ fn an_empty_secret_stops_the_script_before_it_runs() {
         report["error"],
         "with token: the command ended with exit 1: (secret \"password\")"
     );
-
     let printed = temp_path("printed-run.e2e");
     std::fs::write(
         &printed,
         "with token = run printf 'tok-printed-31337\\n'; exit 1\nrun echo never\n",
     )
     .unwrap();
-    let (output, report) = act(&printed, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
+    let report = exits(2, act(&printed, None, false));
     assert_eq!(report["error"], "with token: the command ended with exit 1");
 }
 
 #[tokio::test]
 async fn an_inconclusive_claim_fails_the_script_and_records_nothing() {
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.6), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.6)).await;
     let script = script(
         "inconclusive",
         "<!doctype html><p>Hello</p>",
         "open PAGE\nexpect the page greets the visitor\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     assert_eq!(report["steps"][1]["status"], "inconclusive");
     assert!(!Path::new(&format!("{}.lock", script.display())).exists());
 }
@@ -464,14 +533,8 @@ async fn an_inconclusive_claim_fails_the_script_and_records_nothing() {
 #[tokio::test]
 async fn a_claim_takes_the_values_it_names() {
     let model = mock([
-        (
-            "points to http://api.test/files/a.css",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.05), "sight": yes(0.0) }),
-        ),
+        ("points to http://api.test/files/a.css", verdict(0.95)),
+        ("\"holds\"", verdict(0.05)),
     ])
     .await;
     let script = script(
@@ -479,8 +542,7 @@ async fn a_claim_takes_the_values_it_names() {
         "<!doctype html><a href=\"http://api.test/files/a.css\">a.css</a>",
         "with api = http://api.test\nwith key = $IU2U_TEST_SECRET\nopen PAGE\nexpect the link a.css points to $api/files/a.css and not to $key\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     for request in model.received_requests().await.unwrap() {
         assert!(!String::from_utf8_lossy(&request.body).contains("7f3a"));
     }
@@ -489,14 +551,8 @@ async fn a_claim_takes_the_values_it_names() {
 #[tokio::test]
 async fn a_long_output_shows_the_model_its_end() {
     let model = mock([
-        (
-            "SUMMARY all good",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.05), "sight": yes(0.0) }),
-        ),
+        ("SUMMARY all good", verdict(0.95)),
+        ("\"holds\"", verdict(0.05)),
     ])
     .await;
     let script = script(
@@ -504,8 +560,7 @@ async fn a_long_output_shows_the_model_its_end() {
         "",
         "run seq -f 'line %g' 1 2000; echo SUMMARY all good\nsee \"line 1\"\nexpect the summary says all is good\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert!(
         report["steps"][2]["detail"]
             .as_str()
@@ -518,7 +573,7 @@ async fn a_long_output_shows_the_model_its_end() {
 #[tokio::test]
 async fn a_claim_about_a_changed_screen_is_asked_again() {
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.95)).await;
     let script = script(
         "reclaim",
         "<!doctype html><p>Order shipped</p>",
@@ -526,20 +581,16 @@ async fn a_claim_about_a_changed_screen_is_asked_again() {
     );
     assert_eq!(act(&script, Some(&model), false).0.status.code(), Some(0));
     edit_page(&script, "shipped", "cancelled");
-
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, true));
     assert_eq!(report["steps"][1]["via"], "cache");
-
-    let (asked, report) = act(&script, Some(&model), false);
-    assert_eq!(asked.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(report["steps"][1]["via"], "model");
 }
 
 #[tokio::test]
 async fn a_failing_claim_on_a_screen_that_keeps_changing_stops_within_its_time() {
     let holds = MockServer::start().await;
-    answer_always(&holds, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
+    answer_always(&holds, verdict(0.95)).await;
     let script = script(
         "ticking-claim",
         "<!doctype html><p>Order shipped</p><p id=\"c\"></p><script>let n = 0; setTimeout(() => setInterval(() => c.textContent = 'Tick ' + ++n, 100), 800);</script>",
@@ -548,9 +599,8 @@ async fn a_failing_claim_on_a_screen_that_keeps_changing_stops_within_its_time()
     assert_eq!(act(&script, Some(&holds), false).0.status.code(), Some(0));
     edit_page(&script, "shipped", "cancelled");
     let fails = MockServer::start().await;
-    answer_always(&fails, json!({ "holds": yes(0.05), "sight": yes(0.0) })).await;
-    let (output, report) = act(&script, Some(&fails), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    answer_always(&fails, verdict(0.05)).await;
+    let report = exits(1, act(&script, Some(&fails), false));
     assert!(
         report["steps"][2]["seconds"].as_f64().unwrap() < 3.0,
         "{report}"
@@ -571,24 +621,13 @@ async fn a_claim_about_a_header_is_asked_again_when_the_header_changes() {
         .respond_with(ResponseTemplate::new(200).insert_header("x-state", "done"))
         .mount(&api)
         .await;
-    let model = mock([
-        (
-            "x-state: done",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
-        ("", json!({ "holds": yes(0.05), "sight": yes(0.0) })),
-    ])
-    .await;
-    let script = script(
+    let model = mock([("x-state: done", verdict(0.95)), ("", verdict(0.05))]).await;
+    let script = site_script(
         "header-claim",
-        "",
-        &format!(
-            "request GET {}/job\nexpect the x-state header says done within 8s\n",
-            api.uri()
-        ),
+        &api,
+        "request GET SITE/job\nexpect the x-state header says done within 8s\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -605,155 +644,115 @@ async fn a_claim_about_a_header_is_not_replayed_once_the_header_changes() {
         .respond_with(ResponseTemplate::new(200).insert_header("x-state", "failed"))
         .mount(&api)
         .await;
-    let model = mock([
-        (
-            "x-state: done",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
-        ("", json!({ "holds": yes(0.05), "sight": yes(0.0) })),
-    ])
-    .await;
-    let script = script(
+    let model = mock([("x-state: done", verdict(0.95)), ("", verdict(0.05))]).await;
+    let script = site_script(
         "header-replay",
-        "",
-        &format!(
-            "request GET {}/job\nexpect the x-state header says done\n",
-            api.uri()
-        ),
+        &api,
+        "request GET SITE/job\nexpect the x-state header says done\n",
     );
     assert_eq!(act(&script, Some(&model), false).0.status.code(), Some(0));
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     assert_eq!(report["steps"][1]["via"], "model", "{report}");
 }
 
 #[tokio::test]
 async fn a_claim_that_holds_while_the_screen_changes_is_recorded_with_the_screen_that_lasts() {
-    let model = mock_after(
-        Duration::from_millis(1500),
-        [(
-            "\"holds\"",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        )],
-    )
-    .await;
+    let model = mock_after(Duration::from_millis(1500), [("\"holds\"", verdict(0.95))]).await;
     let script = script(
         "lasting",
         "<!doctype html><p id=\"s\">Order shipped, packing</p><script>setTimeout(() => s.textContent = 'Order shipped, packed', 800)</script>",
         "open PAGE\nexpect the order is on its way\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(report["model_calls"], 2, "{report}");
     edit_page(&script, "shipped, packing", "shipped, packed");
 
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
+    replays(&script);
 }
 
 #[tokio::test]
 async fn a_claim_on_a_screen_that_keeps_changing_asks_less_and_less_often() {
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.05), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.05)).await;
     let script = script(
         "ticking",
         "<!doctype html><p id=\"t\">0</p><script>setInterval(() => t.textContent = Date.now(), 300)</script>",
         "open PAGE\nexpect the build finished within 6s\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     let calls = report["model_calls"].as_u64().unwrap();
     assert!((3..=5).contains(&calls), "{report}");
 }
 
 #[tokio::test]
 async fn a_claim_that_comes_true_while_asks_are_spaced_out_is_still_judged() {
-    let model = mock([
-        ("Done", json!({ "holds": yes(0.95), "sight": yes(0.0) })),
-        ("", json!({ "holds": yes(0.05), "sight": yes(0.0) })),
-    ])
-    .await;
+    let model = mock([("Done", verdict(0.95)), ("", verdict(0.05))]).await;
     let script = script(
         "late-done",
         "<!doctype html><p id=\"t\">Building 0</p><script>let n = 0; const tick = setInterval(() => t.textContent = 'Building ' + ++n, 300); setTimeout(() => { clearInterval(tick); t.textContent = 'Done'; }, 8300)</script>",
         "open PAGE\nexpect the build finished within 9s\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
 async fn a_claim_keeps_its_lock_when_only_its_time_to_wait_changes() {
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.95)).await;
     let script = script(
         "within-key",
         "<!doctype html><p>Order confirmed</p>",
         "open PAGE\nexpect the order is confirmed within 1m\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     let longer = std::fs::read_to_string(&script)
         .unwrap()
         .replace("within 1m", "within 2m");
     std::fs::write(&script, longer).unwrap();
 
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
+    replays(&script);
 }
 
 #[tokio::test]
 async fn the_time_a_claim_may_wait_is_not_a_number_it_checks() {
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.95)).await;
     let script = script(
         "within-number",
         "<!doctype html><p>Order confirmed</p><p>Updated 5 minutes ago</p>",
         "open PAGE\nexpect the order is confirmed within 5s\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     edit_page(&script, "Updated 5", "Updated 6");
 
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
+    replays(&script);
 }
 
 #[tokio::test]
 async fn a_locked_claim_holds_a_named_value_to_its_new_value() {
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.95)).await;
     let script = script(
         "named-value",
         "<!doctype html><p>Prototype 4711 created</p>",
         "with id = 4711\nopen PAGE\nexpect the page says prototype $id was created\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     let next = std::fs::read_to_string(&script)
         .unwrap()
         .replace("with id = 4711", "with id = 4712");
     std::fs::write(&script, next).unwrap();
     edit_page(&script, "4711", "4710");
-
-    let (wrong, report) = act(&script, None, true);
-    assert_eq!(wrong.status.code(), Some(1), "{report}");
+    exits(1, act(&script, None, true));
     edit_page(&script, "4710", "4712");
-    let (right, report) = act(&script, None, true);
-    assert_eq!(right.status.code(), Some(0), "{report}");
+    replays(&script);
 }
 
 #[tokio::test]
 async fn a_claim_about_a_message_that_goes_is_recorded_with_the_screen_that_showed_it() {
     let model = mock_after(
         Duration::from_secs(6),
-        [
-            ("Saved", json!({ "holds": yes(0.95), "sight": yes(0.0) })),
-            (
-                "\"holds\"",
-                json!({ "holds": yes(0.05), "sight": yes(0.0) }),
-            ),
-        ],
+        [("Saved", verdict(0.95)), ("\"holds\"", verdict(0.05))],
     )
     .await;
     let script = script(
@@ -761,19 +760,17 @@ async fn a_claim_about_a_message_that_goes_is_recorded_with_the_screen_that_show
         "<!doctype html><p id=\"t\" role=\"status\">Saved</p><script>setTimeout(() => t.textContent = '', 5000)</script>",
         "open PAGE\nexpect a message says it was saved\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(report["model_calls"], 2, "{report}");
 
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
+    replays(&script);
 }
 
 #[tokio::test]
 async fn a_lock_that_cannot_be_written_keeps_the_report() {
     use std::os::unix::fs::PermissionsExt;
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.95)).await;
     let folder = temp_path("read-only");
     std::fs::create_dir_all(&folder).unwrap();
     let page = folder.join("page.html");
@@ -792,10 +789,7 @@ async fn a_lock_that_cannot_be_written_keeps_the_report() {
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(output.status.code(), Some(2), "{report}");
     assert_eq!(report["steps"][1]["status"], "passed", "{report}");
-    assert!(
-        report["error"].as_str().unwrap().contains("cannot write"),
-        "{report}"
-    );
+    has(&report, "/error", "cannot write");
 }
 
 #[tokio::test]
@@ -810,8 +804,7 @@ async fn a_request_that_never_ends_does_not_hold_up_the_page() {
         server.uri()
     );
     let script = script("poll", &page, "open PAGE\nsee \"Hello\"\n");
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[test]
@@ -822,10 +815,7 @@ fn a_browser_that_fails_to_start_says_why() {
         None,
     );
     assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(
-        report["error"].as_str().unwrap().contains("libnss3.so"),
-        "{report}"
-    );
+    has(&report, "/error", "libnss3.so");
 }
 
 #[test]
@@ -836,7 +826,7 @@ fn the_browser_runs_headless_unless_headful_is_passed() {
             "#!/bin/sh\ncase \" $* \" in *' --headless '*) echo mode=headless >&2 ;; *) echo mode=window >&2 ;; esac\nexit 1\n",
             flag,
         );
-        assert!(report["error"].as_str().unwrap().contains(mode), "{report}");
+        has(&report, "/error", mode);
     }
 }
 
@@ -847,11 +837,9 @@ fn a_script_error_exits_two() {
     let (output, report) = act(&script, None, false);
     assert_eq!(output.status.code(), Some(2));
     assert!(report["error"].as_str().unwrap().contains("line 1"));
-
     let (missing, report) = act(&temp_path("missing.e2e"), None, false);
     assert_eq!(missing.status.code(), Some(2));
     assert!(report["error"].as_str().unwrap().contains("cannot read"));
-
     let vision = command(None)
         .arg(&script)
         .env("IU2U_VISION", "yes")
@@ -859,7 +847,6 @@ fn a_script_error_exits_two() {
         .unwrap();
     assert_eq!(vision.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&vision.stderr).contains("IU2U_VISION must be true or false"));
-
     let empty = temp_path("comment-only.e2e");
     std::fs::write(&empty, "# only a comment\nwith key = value\n").unwrap();
     let (output, report) = act(&empty, None, false);
@@ -875,7 +862,6 @@ async fn a_changed_result_fails_a_locked_run_and_a_failed_run_keeps_the_lock() {
     edit_page(&script, "'Welcome '", "'Declined '");
     let lock = format!("{}.lock", script.display());
     let recorded = std::fs::read_to_string(&lock).unwrap();
-
     let (locked, report) = act(&script, None, true);
     assert_eq!(locked.status.code(), Some(1), "{report}");
     assert_eq!(report["steps"][1]["via"], "replay");
@@ -885,10 +871,8 @@ async fn a_changed_result_fails_a_locked_run_and_a_failed_run_keeps_the_lock() {
             .unwrap()
             .contains("--locked")
     );
-
-    let stuck = mock([("", decision("stuck", "001", "001"))]).await;
-    let (failed, report) = act(&script, Some(&stuck), false);
-    assert_eq!(failed.status.code(), Some(1), "{report}");
+    let stuck = mock([("", does("stuck"))]).await;
+    exits(1, act(&script, Some(&stuck), false));
     assert_eq!(std::fs::read_to_string(&lock).unwrap(), recorded);
 }
 
@@ -899,15 +883,11 @@ async fn a_renamed_value_is_named_instead_of_blaming_the_screen() {
     assert_eq!(act(&script, Some(&model), false).0.status.code(), Some(0));
     let text = std::fs::read_to_string(&script).unwrap();
     std::fs::write(&script, text.replace("with email =", "with login =")).unwrap();
-
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(1), "{report}");
-    assert!(
-        report["steps"][1]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("\"email\", which the script no longer has"),
-        "{report}"
+    let report = exits(1, act(&script, None, true));
+    has(
+        &report,
+        "/steps/1/detail",
+        "\"email\", which the script no longer has",
     );
 }
 
@@ -939,16 +919,14 @@ fn a_secret_stays_out_of_failed_steps_and_errors() {
         "<!doctype html><p>Hello tok-5f3a9c1e7b</p>",
         "with token = run printf 'tok-%s' 5f3a9c1e7b\nopen PAGE\nrun echo ok\nsee \"Signed in as $token\" within 0s\n",
     );
-    let (output, seen) = act(&failing, None, false);
-    assert_eq!(output.status.code(), Some(1), "{seen}");
+    let seen = exits(1, act(&failing, None, false));
     assert!(seen["screenshot"].is_null(), "{seen}");
     let erroring = script(
         "secret-request",
         "",
         "with token = run printf 'tok-%s' 5f3a9c1e7b\nrequest GET http://127.0.0.1:9/items?key=$token\n",
     );
-    let (output, sent) = act(&erroring, None, false);
-    assert_eq!(output.status.code(), Some(2), "{sent}");
+    let sent = exits(2, act(&erroring, None, false));
     for report in [seen, sent] {
         assert!(!report.to_string().contains("5f3a9c1e7b"), "{report}");
     }
@@ -964,14 +942,11 @@ async fn a_secret_read_for_a_request_is_never_offered_for_typing() {
         ),
     ])
     .await;
-    let model = mock([("", decision("type", "001", "001"))]).await;
-    let script = script(
+    let model = mock([("", does("type"))]).await;
+    let script = site_script(
         "env-secret",
-        "",
-        &format!(
-            "request GET {uri}/api\n  authorization: Bearer $IU2U_TEST_SECRET\nopen {uri}/app\ndo search for cats\n",
-            uri = site.uri()
-        ),
+        &site,
+        "request GET SITE/api\n  authorization: Bearer $IU2U_TEST_SECRET\nopen SITE/app\ndo search for cats\n",
     );
     act(&script, Some(&model), false);
     let asked = model.received_requests().await.unwrap();
@@ -988,8 +963,7 @@ fn see_finds_a_secret_where_the_screen_hides_it() {
         &format!("<!doctype html><p>Key {SECRET}</p>"),
         "with key = $IU2U_TEST_SECRET\nopen PAGE\nsee \"$key\"\nsee no \"$key\" within 0s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, false));
     assert_eq!(report["steps"][1]["status"], "passed", "{report}");
     assert_eq!(report["steps"][2]["status"], "failed", "{report}");
 }
@@ -1003,15 +977,8 @@ async fn typing_into_a_field_that_cannot_take_focus_types_nowhere() {
         page,
         "open PAGE\nwith password = hunter2\ndo type the password\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
-    assert!(
-        report["steps"][1]["actions"][0]
-            .as_str()
-            .unwrap()
-            .contains("cannot take focus"),
-        "{report}"
-    );
+    let report = exits(1, act(&script, Some(&model), false));
+    has(&report, "/steps/1/actions/0", "cannot take focus");
     assert!(
         !report["screen"].as_str().unwrap().contains("hunter2"),
         "{report}"
@@ -1021,7 +988,7 @@ async fn typing_into_a_field_that_cannot_take_focus_types_nowhere() {
 #[tokio::test]
 async fn act_types_into_a_rich_text_editor() {
     let model = mock([
-        ("typed", decision("done", "001", "001")),
+        ("typed", does("done")),
         ("", decision("type", "001", "002")),
     ])
     .await;
@@ -1031,8 +998,7 @@ async fn act_types_into_a_rich_text_editor() {
         page,
         "open PAGE\ndo write \"hi there\" in the note\nsee \"hi there\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert!(
         report["steps"][1]["actions"][0]
             .as_str()
@@ -1040,41 +1006,25 @@ async fn act_types_into_a_rich_text_editor() {
             .starts_with("typed \"hi there\" into textbox \"Note\""),
         "{report}"
     );
-    assert!(
-        report["screen"]
-            .as_str()
-            .unwrap()
-            .contains("spinbutton \"Quantity\" = \"1\""),
-        "{report}"
-    );
+    has(&report, "/screen", "spinbutton \"Quantity\" = \"1\"");
 }
 
 #[tokio::test]
 async fn a_page_that_opens_a_new_tab_keeps_running_in_front() {
-    let model = mock([
-        ("Counting", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Counting").await;
     let page = r#"<!doctype html><button onclick="const other = window.open(''); let ticks = 0; out.textContent = 'Counting'; const timer = setInterval(() => { if (++ticks === 150) { clearInterval(timer); out.textContent = 'Finished while ' + document.visibilityState + ' and the other tab is ' + other.document.visibilityState + ', blurred ' + blurs + ' times'; } }, 10);">Help</button><p id="out"></p><script>let blurs = 0; onblur = () => blurs++;</script>"#;
     let script = script(
         "newtab",
         page,
         "open PAGE\ndo open the help\nsee \"Finished while visible and the other tab is hidden, blurred 0 times\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 async fn pressed_once(name: &str, page: &str) {
-    let model = mock([
-        ("Saved", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Saved").await;
     let script = script(name, page, "open PAGE\ndo save\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"],
         json!(["pressed button \"Save\""]),
@@ -1083,10 +1033,9 @@ async fn pressed_once(name: &str, page: &str) {
 }
 
 async fn not_pressed(name: &str, page: &str, reason: &str) {
-    let model = mock([("", decision("press", "001", "001"))]).await;
+    let model = mock([("", does("press"))]).await;
     let script = script(name, page, "open PAGE\ndo save\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     assert_eq!(
         report["steps"][1]["actions"][0],
         format!("tried but could not do this: pressed button \"Save\" ({reason})"),
@@ -1155,7 +1104,7 @@ async fn covered_until_told(
     let telling = told.clone();
     Mock::given(method("POST"))
         .and(body_string_contains("Saved"))
-        .respond_with(reply(decision("done", "001", "001")))
+        .respond_with(reply(does("done")))
         .mount(&model)
         .await;
     Mock::given(method("POST"))
@@ -1168,7 +1117,7 @@ async fn covered_until_told(
         .mount(&model)
         .await;
     Mock::given(method("POST"))
-        .respond_with(reply(decision("press", "001", "001")))
+        .respond_with(reply(does("press")))
         .mount(&model)
         .await;
     let site = cover_site(told, saving).await;
@@ -1178,21 +1127,25 @@ async fn covered_until_told(
 }
 
 async fn cover_site(gone: Arc<AtomicBool>, saving: Duration) -> MockServer {
-    let site = site(&[(
-        "/app",
+    flag_site(
         &format!(
-            r#"<!doctype html><button onclick="setTimeout(() => out.textContent = 'Saved', {})">Save</button><div id="cover" style="position: fixed; inset: 0"></div><p id="out"></p><script>const check = () => fetch('/cover').then(answer => answer.text()).then(cover => cover === 'gone' ? document.getElementById('cover').remove() : setTimeout(check, 200)); check();</script>"#,
+            r#"<!doctype html><button onclick="setTimeout(() => out.textContent = 'Saved', {})">Save</button><div id="cover" style="position: fixed; inset: 0"></div><p id="out"></p><script>const check = () => fetch('/flag').then(answer => answer.text()).then(flag => flag === 'on' ? document.getElementById('cover').remove() : setTimeout(check, 200)); check();</script>"#,
             saving.as_millis()
         ),
-    )])
-    .await;
+        gone,
+    )
+    .await
+}
+
+async fn flag_site(page: &str, flag: Arc<AtomicBool>) -> MockServer {
+    let site = site(&[("/app", page)]).await;
     Mock::given(method("GET"))
-        .and(path("/cover"))
+        .and(path("/flag"))
         .respond_with(move |_: &wiremock::Request| {
-            ResponseTemplate::new(200).set_body_string(if gone.load(Ordering::SeqCst) {
-                "gone"
+            ResponseTemplate::new(200).set_body_string(if flag.load(Ordering::SeqCst) {
+                "on"
             } else {
-                "here"
+                "off"
             })
         })
         .mount(&site)
@@ -1207,7 +1160,7 @@ async fn a_press_the_model_waits_out_is_tried_again_after_each_wait() {
     let model = MockServer::start().await;
     Mock::given(method("POST"))
         .and(body_string_contains("Saved"))
-        .respond_with(reply(decision("done", "001", "001")))
+        .respond_with(reply(does("done")))
         .mount(&model)
         .await;
     let ungoing = gone.clone();
@@ -1229,13 +1182,8 @@ async fn a_press_the_model_waits_out_is_tried_again_after_each_wait() {
         .mount(&model)
         .await;
     let site = cover_site(gone, Duration::ZERO).await;
-    let script = script(
-        "waited-out",
-        "",
-        &format!("open {}/app\ndo save\n", site.uri()),
-    );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let script = site_script("waited-out", &site, "open SITE/app\ndo save\n");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"]
             .as_array()
@@ -1257,13 +1205,8 @@ async fn a_press_blocked_for_a_moment_is_tried_again_after_a_wait() {
     assert_eq!(output.status.code(), Some(0), "{report}");
     assert_eq!(report["steps"][1]["actions"][0], REFUSED_SAVE, "{report}");
     assert_eq!(report["steps"][1]["actions"][1], "waited", "{report}");
-
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
-    assert!(
-        replayed["screen"].as_str().unwrap().contains("Saved"),
-        "{replayed}"
-    );
+    let replayed = replays(&script);
+    has(&replayed, "/screen", "Saved");
 }
 
 #[tokio::test]
@@ -1301,7 +1244,7 @@ async fn wrong_chooser_first(
     let model = mock_after(
         thinking,
         [
-            (given.as_str(), decision("done", "001", "001")),
+            (given.as_str(), does("done")),
             (moves_on, decision("press", "002", "001")),
             ("", decision("press", "001", "002")),
         ],
@@ -1317,10 +1260,8 @@ async fn wrong_chooser_first(
             note.display()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
+    let report = passes(&script, &model);
+    replays(&script);
     report
 }
 
@@ -1329,9 +1270,9 @@ async fn a_replayed_press_whose_chooser_now_takes_no_files_stays_in_the_lock() {
     let note = temp_path("now-refused-note.txt");
     std::fs::write(&note, "note").unwrap();
     let model = mock([
-        ("Files now-refused-note.txt", decision("done", "001", "001")),
+        ("Files now-refused-note.txt", does("done")),
         ("could not take the files", decision("press", "002", "001")),
-        ("", decision("press", "001", "001")),
+        ("", does("press")),
     ])
     .await;
     let script = script(
@@ -1342,17 +1283,14 @@ async fn a_replayed_press_whose_chooser_now_takes_no_files_stays_in_the_lock() {
             note.display()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     edit_page(
         &script,
         "onclick=\"fi.click()\">Upload",
         "onclick=\"di.click(); fb.hidden = false\">Upload",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
+    passes(&script, &model);
+    replays(&script);
 }
 
 #[tokio::test]
@@ -1402,14 +1340,13 @@ async fn a_chooser_that_opens_while_the_model_decides_is_answered_before_the_nex
 
 #[tokio::test]
 async fn a_press_that_stays_covered_stops_after_its_one_retry() {
-    let model = mock([("", decision("press", "001", "001"))]).await;
+    let model = mock([("", does("press"))]).await;
     let script = script(
         "always-covered",
         r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><div style="position: fixed; inset: 0"></div><p id="out"></p><p id="clock">0</p><script>setInterval(() => clock.textContent++, 200)</script>"#,
         "open PAGE\ndo save\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     assert_eq!(
         report["steps"][1]["actions"],
         json!([REFUSED_SAVE, REFUSED_SAVE]),
@@ -1443,8 +1380,7 @@ async fn presses_that_stay_covered_stop_even_when_the_model_takes_turns_with_the
         r#"<!doctype html><button>Save</button><button>Submit</button><div style="position: fixed; inset: 0"></div>"#,
         "open PAGE\ndo save\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     assert_eq!(
         report["steps"][1]["actions"].as_array().unwrap().len(),
         4,
@@ -1461,7 +1397,7 @@ async fn presses_that_stay_covered_stop_even_when_the_model_takes_turns_with_the
 async fn a_press_whose_files_do_not_fit_is_not_pressed_again() {
     let note = temp_path("unfit-note.txt");
     std::fs::write(&note, "note").unwrap();
-    let model = mock([("", decision("press", "001", "001"))]).await;
+    let model = mock([("", does("press"))]).await;
     let script = script(
         "unfit",
         "<!doctype html><button onclick=\"fi.click()\">Upload</button><input id=\"fi\" type=\"file\" webkitdirectory style=\"display:none\"><p>Nothing yet</p>",
@@ -1494,47 +1430,31 @@ async fn a_press_whose_files_do_not_fit_is_not_pressed_again() {
 
 #[tokio::test]
 async fn a_replay_waits_for_a_control_that_something_covers_for_a_moment() {
-    let model = mock([
-        ("Saved", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Saved").await;
     let page = r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><p id="out"></p><!--cover-->"#;
     let script = script("uncovered", page, "open PAGE\ndo save\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     edit_page(
         &script,
         "<!--cover-->",
         r#"<div id="cover" style="position: fixed; inset: 0"></div><script>setTimeout(() => cover.remove(), 1500);</script>"#,
     );
-
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
-    assert!(
-        replayed["screen"].as_str().unwrap().contains("Saved"),
-        "{replayed}"
-    );
+    let replayed = replays(&script);
+    has(&replayed, "/screen", "Saved");
 }
 
 #[tokio::test]
 async fn a_replay_tries_a_covered_control_once_more_as_the_model_run_did() {
-    let model = mock([
-        ("Saved", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Saved").await;
     let page = r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><div id="cover" style="position: fixed; inset: 0"></div><p id="out"></p><script>const look = Document.prototype.elementFromPoint; Document.prototype.elementFromPoint = function (...point) { Document.prototype.elementFromPoint = look; setTimeout(() => cover.remove(), 7000); return look.apply(this, point); };</script>"#;
     let script = script("covered-long", page, "open PAGE\ndo save\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
+    passes(&script, &model);
+    replays(&script);
 }
 
 #[tokio::test]
 async fn act_types_into_the_parts_of_a_date_field() {
-    let model = mock([("typed", decision("done", "001", "001"))]).await;
+    let model = mock([("typed", does("done"))]).await;
     Mock::given(method("POST"))
         .respond_with(|request: &wiremock::Request| {
             let body: Value = request.body_json().unwrap();
@@ -1560,20 +1480,13 @@ async fn act_types_into_the_parts_of_a_date_field() {
         r#"<!doctype html><label>Birth <input type="date"></label>"#,
         "open PAGE\ndo set the birth day to \"15\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    assert!(
-        report["screen"]
-            .as_str()
-            .unwrap()
-            .contains("spinbutton \"Day Day\" = \"15\""),
-        "{report}"
-    );
+    let report = passes(&script, &model);
+    has(&report, "/screen", "spinbutton \"Day Day\" = \"15\"");
 }
 
 #[tokio::test]
 async fn a_secret_shown_in_pieces_stops_the_step_before_it_is_sent() {
-    let model = mock([("", decision("done", "001", "001"))]).await;
+    let model = mock([("", does("done"))]).await;
     let script = script(
         "pieces",
         "<!doctype html><p><code>sk-live</code> <code>7f3a</code></p>",
@@ -1590,18 +1503,13 @@ async fn a_secret_shown_in_pieces_stops_the_step_before_it_is_sent() {
 
 #[tokio::test]
 async fn a_field_that_reformats_what_is_typed_takes_it_once() {
-    let model = mock([
-        ("typed", decision("done", "001", "001")),
-        ("", decision("type", "001", "001")),
-    ])
-    .await;
+    let model = mock([("typed", does("done")), ("", does("type"))]).await;
     let script = script(
         "coupon",
         r#"<!doctype html><label>Coupon <input oninput="this.value = this.value.toUpperCase()"></label>"#,
         "open PAGE\ndo apply the coupon \"save10\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     let screen = report["screen"].as_str().unwrap();
     assert!(
         screen.contains("textbox \"Coupon\" = \"SAVE10\"") && screen.matches("SAVE10").count() == 1,
@@ -1612,18 +1520,13 @@ async fn a_field_that_reformats_what_is_typed_takes_it_once() {
 }
 
 async fn press_and_see(name: &str, page: &str, text: &str) {
-    let model = mock([
-        ("pressed", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("pressed").await;
     let script = script(
         name,
         page,
         &format!("open PAGE\ndo press the button\nsee {text:?}\n"),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -1649,7 +1552,7 @@ async fn a_press_does_not_hold_the_mouse_button_while_moving() {
 #[tokio::test]
 async fn a_dismissed_alert_stays_on_the_screen_until_the_next_action() {
     let model = mock([
-        ("pressed", decision("done", "001", "001")),
+        ("pressed", does("done")),
         ("Goal: close", decision("press", "002", "001")),
         ("", decision("press", "001", "002")),
     ])
@@ -1659,8 +1562,7 @@ async fn a_dismissed_alert_stays_on_the_screen_until_the_next_action() {
         r#"<!doctype html><button onclick="alert('Saved')">Save</button><button onclick="out.textContent = 'Closed'">Close</button><p id="out"></p>"#,
         "open PAGE\ndo save\nsee \"Saved (dismissed)\"\ndo close\nsee \"Closed\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert!(
         !report["screen"].as_str().unwrap().contains("Saved"),
         "{report}"
@@ -1671,10 +1573,7 @@ async fn a_dismissed_alert_stays_on_the_screen_until_the_next_action() {
 async fn an_alert_raised_while_the_model_decides_is_still_shown() {
     let model = mock_after(
         Duration::from_millis(2500),
-        [
-            ("pressed", decision("done", "001", "001")),
-            ("", decision("press", "001", "001")),
-        ],
+        [("pressed", does("done")), ("", does("press"))],
     )
     .await;
     let script = script(
@@ -1682,8 +1581,7 @@ async fn an_alert_raised_while_the_model_decides_is_still_shown() {
         r#"<!doctype html><button onclick="out.textContent = 'Pressed'">Go</button><p id="out"></p><script>setTimeout(() => alert('Card expired'), 2000);</script>"#,
         "open PAGE\ndo press the button\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     let asked = model.received_requests().await.unwrap();
     assert!(
         asked.iter().any(|request| {
@@ -1716,7 +1614,7 @@ fn todos(items: &[&str]) -> String {
 #[tokio::test]
 async fn a_reordered_list_is_not_replayed_by_position() {
     let model = mock([
-        ("pressed", decision("done", "001", "001")),
+        ("pressed", does("done")),
         ("", decision("press", "001", "003")),
     ])
     .await;
@@ -1731,9 +1629,7 @@ async fn a_reordered_list_is_not_replayed_by_position() {
         todos(&["Eggs", "Milk", "Bread"]),
     )
     .unwrap();
-
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(1), "{replayed}");
+    let replayed = exits(1, act(&script, None, true));
     let screen = replayed["screen"].as_str().unwrap();
     assert!(
         ["Eggs", "Milk", "Bread"]
@@ -1750,8 +1646,7 @@ fn pages_are_asked_to_reduce_motion() {
         "<!doctype html><p id=\"m\"></p><script>m.textContent = matchMedia('(prefers-reduced-motion: reduce)').matches ? 'Motion reduced' : 'Motion on';</script>",
         "open PAGE\nsee \"Motion reduced\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 async fn site(pages: &[(&str, &str)]) -> MockServer {
@@ -1778,16 +1673,12 @@ async fn a_request_shows_its_response_to_the_steps_after_it_and_hides_secrets() 
         )
         .mount(&api)
         .await;
-    let script = script(
+    let script = site_script(
         "request",
-        "",
-        &format!(
-            "request GET {}/api/session\n  authorization: Bearer $IU2U_TEST_SECRET\nsee \"HTTP 401 Unauthorized\"\nsee error: \"Sign-in required\"\n",
-            api.uri()
-        ),
+        &api,
+        "request GET SITE/api/session\n  authorization: Bearer $IU2U_TEST_SECRET\nsee \"HTTP 401 Unauthorized\"\nsee error: \"Sign-in required\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     assert_eq!(report["steps"][0]["via"], "http");
     assert_eq!(report["steps"][0]["detail"], "HTTP 401 Unauthorized");
     let screen = report["screen"].as_str().unwrap();
@@ -1813,8 +1704,7 @@ async fn a_wait_after_the_checks_of_a_response_looks_at_the_page_again() {
             api.uri()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -1834,8 +1724,7 @@ async fn a_value_with_quotes_keeps_a_json_body_valid() {
             api.uri()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -1871,8 +1760,7 @@ async fn requests_send_json_and_forms_and_show_redirects_without_following_them(
             merge = merge.display()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
     let asked: Vec<String> = api
         .received_requests()
         .await
@@ -1893,16 +1781,12 @@ async fn a_long_text_body_cut_inside_a_character_still_shows_as_text() {
         )
         .mount(&api)
         .await;
-    let script = script(
+    let script = site_script(
         "long-body",
-        "",
-        &format!(
-            "request GET {}/long\nsee no \"binary body\" within 0s\nsee \"the body continues\"\n",
-            api.uri()
-        ),
+        &api,
+        "request GET SITE/long\nsee no \"binary body\" within 0s\nsee \"the body continues\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -1916,16 +1800,12 @@ async fn a_form_without_files_is_sent_url_encoded() {
         .respond_with(ResponseTemplate::new(200).set_body_string("token issued"))
         .mount(&api)
         .await;
-    let script = script(
+    let script = site_script(
         "urlencoded",
-        "",
-        &format!(
-            "request POST {}/token\n  form grant_type = client_credentials\n  form scope = read write\nsee \"token issued\"\n",
-            api.uri()
-        ),
+        &api,
+        "request POST SITE/token\n  form grant_type = client_credentials\n  form scope = read write\nsee \"token issued\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[test]
@@ -1940,8 +1820,7 @@ fn a_form_with_a_file_refuses_a_content_type_of_its_own() {
             file.display()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
+    let report = exits(2, act(&script, None, false));
     assert!(
         report["error"].as_str().unwrap().ends_with(
             "a form with a file sets its own content-type; leave out the content-type header"
@@ -1976,8 +1855,7 @@ async fn a_json_file_is_sent_as_it_is() {
             body.display()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -1987,23 +1865,15 @@ async fn a_relative_request_goes_to_the_open_page_and_needs_one() {
         ("/api/items", "[1,2,3]"),
     ])
     .await;
-    let script = script(
+    let script = site_script(
         "relative",
-        "",
-        &format!(
-            "open {}/\nsee \"Home\"\nrequest GET /api/items\nsee \"[2]: 3\"\nsee no \"[3]\"\n",
-            site.uri()
-        ),
+        &site,
+        "open SITE/\nsee \"Home\"\nrequest GET /api/items\nsee \"[2]: 3\"\nsee no \"[3]\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
     let alone = self::script("alone", "", "request GET /api/items\n");
-    let (output, report) = act(&alone, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(
-        report["error"].as_str().unwrap().contains("is relative"),
-        "{report}"
-    );
+    let report = exits(2, act(&alone, None, false));
+    has(&report, "/error", "is relative");
 }
 
 #[tokio::test]
@@ -2025,8 +1895,7 @@ async fn routes_send_a_site_elsewhere_answer_in_its_place_and_answer_once() {
             uri = site.uri()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     assert_eq!(
         report["screen"]
             .as_str()
@@ -2045,12 +1914,8 @@ fn a_route_to_another_address_refuses_a_star_even_from_a_value() {
         "",
         "with sso = http://127.0.0.1:9/d*/p.html\nroute $sso to http://127.0.0.1:9\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(
-        report["error"].as_str().unwrap().contains("without *"),
-        "{report}"
-    );
+    let report = exits(2, act(&script, None, false));
+    has(&report, "/error", "without *");
 }
 
 #[test]
@@ -2060,15 +1925,8 @@ fn a_route_answer_that_is_html_shows_as_a_page() {
         "",
         "route http://down.example.test answer 503 <!doctype html><title>Down</title><h1>Back soon</h1>\nopen http://down.example.test/status\nsee \"Back soon\"\nsee no \"<h1>\" within 0s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    assert!(
-        report["screen"]
-            .as_str()
-            .unwrap()
-            .contains("heading \"Back soon\""),
-        "{report}"
-    );
+    let report = runs(&script);
+    has(&report, "/screen", "heading \"Back soon\"");
 }
 
 #[tokio::test]
@@ -2091,15 +1949,8 @@ async fn a_route_answers_a_page_from_another_origin() {
             site.uri()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    assert!(
-        report["screen"]
-            .as_str()
-            .unwrap()
-            .contains("/items\" = \"2 requests\""),
-        "{report}"
-    );
+    let report = runs(&script);
+    has(&report, "/screen", "/items\" = \"2 requests\"");
 }
 
 #[tokio::test]
@@ -2124,16 +1975,12 @@ async fn a_route_sees_requests_the_browser_cache_would_answer() {
         )
         .mount(&site)
         .await;
-    let script = script(
+    let script = site_script(
         "cached",
-        "",
-        &format!(
-            "open {uri}/first\nroute */field.png answer 404\nopen {uri}/second\nsee \"*/field.png 1 request\"\n",
-            uri = site.uri()
-        ),
+        &site,
+        "open SITE/first\nroute */field.png answer 404\nopen SITE/second\nsee \"*/field.png 1 request\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -2143,16 +1990,12 @@ async fn a_held_request_the_page_aborts_is_no_longer_held() {
         "<!doctype html><p id=\"out\">Loading</p><script>const stop = new AbortController(); fetch('/api/slow', { signal: stop.signal }).catch(() => out.textContent = 'Gave up'); setTimeout(() => stop.abort(), 1000);</script>",
     )])
     .await;
-    let script = script(
+    let script = site_script(
         "held-aborted",
-        "",
-        &format!(
-            "route */api/slow hold\nopen {}/app\nsee \"1 held until release\"\nsee \"Gave up\" within 5s\nsee no \"held until release\"\n",
-            site.uri()
-        ),
+        &site,
+        "route */api/slow hold\nopen SITE/app\nsee \"1 held until release\"\nsee \"Gave up\" within 5s\nsee no \"held until release\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -2165,16 +2008,12 @@ async fn a_held_request_goes_with_the_page_that_sent_it() {
         ("/other", "<!doctype html><p>Page B</p>"),
     ])
     .await;
-    let script = script(
+    let script = site_script(
         "held-gone",
-        "",
-        &format!(
-            "route */api/slow hold\nopen {uri}/app\nsee \"1 held until release\"\nopen {uri}/other\nsee \"Page B\"\nsee no \"held until release\" within 0s\n",
-            uri = site.uri()
-        ),
+        &site,
+        "route */api/slow hold\nopen SITE/app\nsee \"1 held until release\"\nopen SITE/other\nsee \"Page B\"\nsee no \"held until release\" within 0s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -2189,16 +2028,12 @@ async fn a_held_request_waits_for_its_release_without_holding_up_the_steps() {
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
         .mount(&site)
         .await;
-    let script = script(
+    let script = site_script(
         "hold",
-        "",
-        &format!(
-            "route */api/slow hold\nopen {}/app\nsee \"Loading slow\"\nsee \"1 held until release\"\nrelease */api/slow\nsee \"Slow done\"\nsee no \"held until release\"\n",
-            site.uri()
-        ),
+        &site,
+        "route */api/slow hold\nopen SITE/app\nsee \"Loading slow\"\nsee \"1 held until release\"\nrelease */api/slow\nsee \"Slow done\"\nsee no \"held until release\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     assert!(
         report["steps"][1]["seconds"].as_f64().unwrap() < 1.5,
         "{report}"
@@ -2209,12 +2044,8 @@ async fn a_held_request_waits_for_its_release_without_holding_up_the_steps() {
         "{report}"
     );
     let unheld = self::script("unheld", "", "release */api/nothing\n");
-    let (output, report) = act(&unheld, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(
-        report["error"].as_str().unwrap().contains("no route holds"),
-        "{report}"
-    );
+    let report = exits(2, act(&unheld, None, false));
+    has(&report, "/error", "no route holds");
 }
 
 #[tokio::test]
@@ -2226,22 +2057,12 @@ async fn a_held_picture_does_not_hold_up_the_steps() {
     .await;
     let model = MockServer::start().await;
     answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.9) })).await;
-    let script = script(
+    let script = site_script(
         "held-picture",
-        "",
-        &format!(
-            "route */slow.png hold\nopen {}/app\nexpect the page says it loads a picture\nsee \"Picture done\" within 1s\n",
-            site.uri()
-        ),
+        &site,
+        "route */slow.png hold\nopen SITE/app\nexpect the page says it loads a picture\nsee \"Picture done\" within 1s\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, sees(&script, &model));
     assert!(
         report["steps"][1]["seconds"].as_f64().unwrap() < 2.0,
         "{report}"
@@ -2263,24 +2084,14 @@ async fn back_forward_and_reload_walk_the_history() {
         ),
     ])
     .await;
-    let script = script(
+    let script = site_script(
         "history",
-        "",
-        &format!(
-            "open {uri}/one\nopen {uri}/two\nback\nsee \"First page\"\nsee \"{uri}/one\"\nforward\nsee \"Second page\"\nreload\nsee \"Second page\"\nforward\n",
-            uri = site.uri()
-        ),
+        &site,
+        "open SITE/one\nopen SITE/two\nback\nsee \"First page\"\nsee \"SITE/one\"\nforward\nsee \"Second page\"\nreload\nsee \"Second page\"\nforward\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
+    let report = exits(2, act(&script, None, false));
     assert_eq!(report["steps"].as_array().unwrap().len(), 10, "{report}");
-    assert!(
-        report["error"]
-            .as_str()
-            .unwrap()
-            .contains("no page to go forward to"),
-        "{report}"
-    );
+    has(&report, "/error", "no page to go forward to");
 }
 
 #[tokio::test]
@@ -2290,13 +2101,8 @@ async fn the_screen_names_the_page_address_link_targets_tooltips_and_busy_parts(
         "<!doctype html><title>App</title><a href=\"/next\">Next</a><button title=\"Shows the grid\" aria-pressed=\"true\">Grid</button><ul aria-busy=\"true\" aria-label=\"Results\"><li>One</li></ul><div aria-busy=\"true\"><p>Loading cards</p></div>",
     )])
     .await;
-    let script = script(
-        "enriched",
-        "",
-        &format!("open {}/app\nsee \"Shows the grid\"\n", site.uri()),
-    );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let script = site_script("enriched", &site, "open SITE/app\nsee \"Shows the grid\"\n");
+    let report = runs(&script);
     let screen = report["screen"].as_str().unwrap();
     for expected in [
         format!("page \"App\" · focused · url \"{}/app\"", site.uri()),
@@ -2323,11 +2129,7 @@ async fn every_tab_has_the_same_page_size() {
         ),
     ])
     .await;
-    let model = mock([
-        ("Help center", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Help center").await;
     let script = script(
         "page-size",
         "",
@@ -2337,8 +2139,7 @@ async fn every_tab_has_the_same_page_size() {
         )
         .replace("$hub", &site.uri()),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -2354,21 +2155,13 @@ async fn a_followed_tab_shows_only_its_own_failed_requests() {
         ),
     ])
     .await;
-    let model = mock([
-        ("Help center", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = pressing("Help center").await;
+    let script = site_script(
         "own-failures",
-        "",
-        &format!(
-            "open {uri}/app\nsee \"failed: http://127.0.0.1:9/logo.png\"\ndo open the help\nsee \"Help center\"\nwait 1s\nsee no \"failed:\" within 0s\n",
-            uri = site.uri()
-        ),
+        &site,
+        "open SITE/app\nsee \"failed: http://127.0.0.1:9/logo.png\"\ndo open the help\nsee \"Help center\"\nwait 1s\nsee no \"failed:\" within 0s\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -2384,29 +2177,15 @@ async fn a_link_that_opens_a_new_tab_is_followed() {
         ),
     ])
     .await;
-    let model = mock([
-        ("Help center", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = pressing("Help center").await;
+    let script = site_script(
         "follow",
-        "",
-        &format!(
-            "open {uri}/app\ndo open the help\nsee \"Help center\"\nsee \"{uri}/help\"\nback\n",
-            uri = site.uri()
-        ),
+        &site,
+        "open SITE/app\ndo open the help\nsee \"Help center\"\nsee \"SITE/help\"\nback\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
+    let report = exits(2, act(&script, Some(&model), false));
     assert_eq!(report["steps"][3]["status"], "passed", "{report}");
-    assert!(
-        report["error"]
-            .as_str()
-            .unwrap()
-            .contains("no page to go back to"),
-        "{report}"
-    );
+    has(&report, "/error", "no page to go back to");
 }
 
 #[tokio::test]
@@ -2438,15 +2217,8 @@ async fn a_frame_inside_a_frame_from_another_site_shows_its_own_clickable_parts(
         "",
         &format!("open http://127.0.0.1:{port}/app\nsee \"Open card\"\n"),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    assert!(
-        report["screen"]
-            .as_str()
-            .unwrap()
-            .contains("\"Open card\" · clickable"),
-        "{report}"
-    );
+    let report = runs(&script);
+    has(&report, "/screen", "\"Open card\" · clickable");
 }
 
 #[tokio::test]
@@ -2471,11 +2243,7 @@ async fn a_file_chooser_inside_a_frame_from_another_site_gets_the_named_file() {
         ))
         .mount(&site)
         .await;
-    let model = mock([
-        ("Files cross-note.txt", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Files cross-note.txt").await;
     let script = script(
         "cross-chooser",
         "",
@@ -2484,8 +2252,7 @@ async fn a_file_chooser_inside_a_frame_from_another_site_gets_the_named_file() {
             note.display()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -2509,11 +2276,7 @@ async fn a_route_set_later_reaches_a_frame_from_another_site() {
             .mount(&site)
             .await;
     }
-    let model = mock([
-        ("routed api", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("routed api").await;
     let script = script(
         "cross-route",
         "",
@@ -2521,19 +2284,14 @@ async fn a_route_set_later_reaches_a_frame_from_another_site() {
             "open http://127.0.0.1:{port}/app\nsee \"Nothing yet\"\nroute */api answer 200 routed api\ndo load the data\n"
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
 async fn a_file_picker_inside_a_frame_gets_the_named_file() {
     let note = temp_path("framed-note.txt");
     std::fs::write(&note, "hello").unwrap();
-    let model = mock([
-        ("Opened hello", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Opened hello").await;
     let page = r#"<!doctype html><iframe style="width: 100%; height: 300px; border: 0" srcdoc="<button onclick='showOpenFilePicker().then(async ([file]) => out.textContent = &quot;Opened &quot; + (await (await file.getFile()).text()))'>Pick file</button><p id='out'>Nothing yet</p>"></iframe>"#;
     let script = script(
         "framed-picker",
@@ -2543,8 +2301,7 @@ async fn a_file_picker_inside_a_frame_gets_the_named_file() {
             note.display()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -2561,21 +2318,13 @@ async fn a_followed_tab_gets_the_routes_and_injected_scripts_from_its_first_page
         ("/api", "real api"),
     ])
     .await;
-    let model = mock([
-        ("Help center", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = pressing("Help center").await;
+    let script = site_script(
         "follow-prepared",
-        "",
-        &format!(
-            "inject window.__flag = 1\nroute */api answer 200 routed api\nopen {uri}/app\ndo open the help\nsee \"flag set\"\nsee \"routed api\"\n",
-            uri = site.uri()
-        ),
+        &site,
+        "inject window.__flag = 1\nroute */api answer 200 routed api\nopen SITE/app\ndo open the help\nsee \"flag set\"\nsee \"routed api\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -2591,21 +2340,13 @@ async fn a_followed_tab_that_closes_goes_back_to_the_tab_that_opened_it() {
         ),
     ])
     .await;
-    let model = mock([
-        ("Help center", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = pressing("Help center").await;
+    let script = site_script(
         "closing",
-        "",
-        &format!(
-            "open {uri}/app\ndo open the help\nsee \"Help center\"\ninject document.addEventListener('DOMContentLoaded', () => document.body.append('Injected'))\nwait 3s\nsee \"App page\"\nsee no \"Injected\"\nreload\nsee \"Injected\"\n",
-            uri = site.uri()
-        ),
+        &site,
+        "open SITE/app\ndo open the help\nsee \"Help center\"\ninject document.addEventListener('DOMContentLoaded', () => document.body.append('Injected'))\nwait 3s\nsee \"App page\"\nsee no \"Injected\"\nreload\nsee \"Injected\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -2622,21 +2363,13 @@ async fn the_step_after_a_followed_tab_closes_goes_to_the_tab_that_opened_it() {
         ("/close", ""),
     ])
     .await;
-    let model = mock([
-        ("Help center", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = pressing("Help center").await;
+    let script = site_script(
         "closing-reload",
-        "",
-        &format!(
-            "route */close hold\nopen {uri}/app\ndo open the help\nrelease */close\nsee \"App page\" within 30s\nreload\nsee \"App page\"\n",
-            uri = site.uri()
-        ),
+        &site,
+        "route */close hold\nopen SITE/app\ndo open the help\nrelease */close\nsee \"App page\" within 30s\nreload\nsee \"App page\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -2652,21 +2385,13 @@ async fn a_tab_that_closes_before_it_is_followed_leaves_the_page_it_came_from() 
         ),
     ])
     .await;
-    let model = mock([
-        ("pressed", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = pressing("pressed").await;
+    let script = site_script(
         "quick-popup",
-        "",
-        &format!(
-            "open {uri}/app\ndo open the popup\nsee \"App page\"\n",
-            uri = site.uri()
-        ),
+        &site,
+        "open SITE/app\ndo open the popup\nsee \"App page\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -2680,21 +2405,13 @@ async fn a_held_request_is_released_from_the_tab_that_sent_it() {
         ("/api/pay", "paid"),
     ])
     .await;
-    let model = mock([
-        ("Secure check", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = pressing("Secure check").await;
+    let script = site_script(
         "held-tab",
-        "",
-        &format!(
-            "route */api/pay hold\nopen {uri}/app\ndo pay\nsee \"Secure check\"\nrelease */api/pay\n",
-            uri = site.uri()
-        ),
+        &site,
+        "route */api/pay hold\nopen SITE/app\ndo pay\nsee \"Secure check\"\nrelease */api/pay\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     let paid = site
         .received_requests()
         .await
@@ -2711,13 +2428,8 @@ async fn links_that_open_a_new_tab_say_so() {
         "<!doctype html><a href=\"/help\" target=\"_blank\">Help</a> <a href=\"/home\" target=\"_self\">Home</a><svg><a href=\"/chart\" target=\"_blank\"><text y=\"20\">Chart</text></a></svg>",
     )])
     .await;
-    let script = script(
-        "tabs",
-        "",
-        &format!("open {}/app\nsee \"Home\"\n", site.uri()),
-    );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let script = site_script("tabs", &site, "open SITE/app\nsee \"Home\"\n");
+    let report = runs(&script);
     let screen = report["screen"].as_str().unwrap();
     assert!(
         screen.contains(&format!(
@@ -2739,21 +2451,13 @@ async fn a_table_row_that_opens_on_a_click_can_be_pressed() {
         "<!doctype html><table><thead><tr><th>Name</th></tr></thead><tbody><tr onclick=\"out.textContent = 'Opened Aviso'\"><td>Aviso de plaga</td></tr></tbody></table><p id=\"out\">Closed</p>",
     )])
     .await;
-    let model = mock([
-        ("Opened Aviso", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = pressing("Opened Aviso").await;
+    let script = site_script(
         "row",
-        "",
-        &format!(
-            "open {}/app\ndo open the row of Aviso de plaga\nsee \"Opened Aviso\"\n",
-            site.uri()
-        ),
+        &site,
+        "open SITE/app\ndo open the row of Aviso de plaga\nsee \"Opened Aviso\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"][0], "pressed row \"Aviso de plaga\" · clickable",
         "{report}"
@@ -2764,10 +2468,7 @@ async fn a_table_row_that_opens_on_a_click_can_be_pressed() {
 async fn a_row_that_shows_something_else_by_the_time_of_the_press_is_not_pressed() {
     let model = mock_after(
         Duration::from_millis(2500),
-        [
-            ("Opened", decision("done", "001", "001")),
-            ("", decision("press", "001", "001")),
-        ],
+        [("Opened", does("done")), ("", does("press"))],
     )
     .await;
     let script = script(
@@ -2775,8 +2476,7 @@ async fn a_row_that_shows_something_else_by_the_time_of_the_press_is_not_pressed
         "<!doctype html><table><tbody><tr onclick=\"out.textContent = 'Opened ' + this.textContent\"><td id=\"cell\">DEV-105 Fix login</td></tr></tbody></table><p id=\"out\">Closed</p><script>setTimeout(() => cell.textContent = 'DEV-099 Other', 5000)</script>",
         "open PAGE\ndo open DEV-105\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     let refused = report["steps"][1]["actions"][0].as_str().unwrap();
     assert!(
         refused.starts_with("tried but could not do this")
@@ -2796,18 +2496,13 @@ async fn a_long_table_leaves_room_for_the_controls_under_it() {
         &format!("<!doctype html><p id=\"out\"></p><table><tbody>{rows}</tbody></table><button onclick=\"out.textContent = 'Page 2'\">Next page</button>"),
     )])
     .await;
-    let model = mock([
-        ("Page 2", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = pressing("Page 2").await;
+    let script = site_script(
         "long-table",
-        "",
-        &format!("open {}/app\ndo go to the next page\n", site.uri()),
+        &site,
+        "open SITE/app\ndo go to the next page\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"][0], "pressed button \"Next page\"",
         "{report}"
@@ -2821,8 +2516,7 @@ async fn a_root_that_listens_for_the_clicks_of_a_whole_page_is_not_a_control() {
         "<!doctype html><div id=\"root\"><div class=\"app\"><h1>Order 4711</h1><p>Your order shipped</p><p>Thanks for buying with us</p></div></div><script>root.addEventListener('click', () => {});</script>",
         "open PAGE\nsee \"Your order shipped\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     let screen = report["screen"].as_str().unwrap();
     assert!(!screen.contains("clickable"), "{screen}");
     assert_eq!(screen.matches("Your order shipped").count(), 1, "{screen}");
@@ -2836,22 +2530,18 @@ async fn a_part_the_page_made_clickable_without_a_role_can_be_pressed() {
     )])
     .await;
     let model = mock([
-        ("Card opened", decision("done", "001", "001")),
+        ("Card opened", does("done")),
         ("open the card", decision("press", "003", "001")),
-        ("Cleared", decision("done", "001", "001")),
+        ("Cleared", does("done")),
         ("", decision("press", "002", "002")),
     ])
     .await;
-    let script = script(
+    let script = site_script(
         "clickable",
-        "",
-        &format!(
-            "open {}/app\ndo clear the issue\nsee \"Cleared\"\ndo open the card\nsee \"Card opened\"\n",
-            site.uri()
-        ),
+        &site,
+        "open SITE/app\ndo clear the issue\nsee \"Cleared\"\ndo open the card\nsee \"Card opened\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"][0], "pressed generic \"\" · clickable",
         "{report}"
@@ -2878,16 +2568,12 @@ async fn wait_lets_real_time_pass_on_the_same_screen() {
         "<!doctype html><p id=\"out\">Before</p><script>setTimeout(() => out.textContent = 'After', 700)</script>",
     )])
     .await;
-    let script = script(
+    let script = site_script(
         "wait",
-        "",
-        &format!(
-            "open {}/app\nsee \"Before\"\nwait 1s\nsee \"After\" within 0s\n",
-            site.uri()
-        ),
+        &site,
+        "open SITE/app\nsee \"Before\"\nwait 1s\nsee \"After\" within 0s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     assert_eq!(report["steps"][2]["via"], "wait", "{report}");
     assert!(
         report["steps"][2]["seconds"].as_f64().unwrap() >= 1.0,
@@ -2902,8 +2588,7 @@ async fn the_page_clock_runs_its_timers_ahead_without_waiting() {
         "<!doctype html><p id=\"out\">Waiting</p><p id=\"ticks\"></p><script>const start = new Date(); let count = 0; setTimeout(() => out.textContent = `Done after ${Math.round((Date.now() - start) / 1000)}s`, 60000); setInterval(() => ticks.textContent = `${++count} ticks`, 3000);</script>",
         "clock install\nopen PAGE\nsee \"Waiting\"\nclock run 60s\nsee \"Done after 60s\" within 0s\nsee \"20 ticks\" within 0s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     let seconds: f64 = report["steps"]
         .as_array()
         .unwrap()
@@ -2921,16 +2606,14 @@ async fn a_failed_script_leaves_a_screenshot_until_it_passes() {
         "open PAGE\nsee \"Gone\" within 0s\n",
     );
     let shot = temp_path("failed-shot.e2e.failed.png");
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, false));
     assert_eq!(report["screenshot"], shot.display().to_string());
     assert!(std::fs::read(&shot).unwrap().starts_with(b"\x89PNG"));
     let passing = std::fs::read_to_string(&script)
         .unwrap()
         .replace("\"Gone\" within 0s", "\"Here\"");
     std::fs::write(&script, passing).unwrap();
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
     assert!(!shot.exists());
 }
 
@@ -2941,8 +2624,7 @@ async fn the_page_clock_runs_ahead_past_a_page_that_polls_without_a_delay() {
         "<!doctype html><p id=\"out\">Waiting</p><script>const poll = () => setTimeout(poll); poll(); setTimeout(() => out.textContent = 'Ten seconds passed', 10000);</script>",
         "clock install\nopen PAGE\nclock run 10s\nsee \"Ten seconds passed\" within 0s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     assert!(
         report["steps"][2]["seconds"].as_f64().unwrap() < 5.0,
         "{report}"
@@ -2956,8 +2638,7 @@ async fn a_frozen_page_clock_keeps_its_time_while_its_timers_and_events_run() {
         "<!doctype html><div id=\"outer\"><button id=\"inner\">Go</button></div><p id=\"out\">Waiting</p><script>const start = Date.now(); setTimeout(() => { const attached = Date.now(); inner.addEventListener('click', event => event.stamped = Date.now()); outer.addEventListener('click', event => out.textContent = event.stamped > attached && new Date().getTime() - start < 1000 ? 'Time stood still' : 'Time moved'); inner.click(); }, 2000);</script>",
         "clock freeze\nopen PAGE\nsee \"Time stood still\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -2967,8 +2648,7 @@ async fn an_event_after_a_clock_run_is_stamped_with_the_page_clock() {
         "<!doctype html><button id=\"go\">Go</button><p id=\"out\">Waiting</p><script>setTimeout(() => { const attached = performance.now(); go.addEventListener('click', event => out.textContent = event.timeStamp >= attached ? 'Stamped on time' : 'Stamped late'); go.click(); }, 30000);</script>",
         "clock install\nopen PAGE\nclock run 30s\nsee \"Stamped on time\" within 0s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -2978,15 +2658,8 @@ async fn a_clock_run_on_a_page_without_the_clock_says_where_to_install_it() {
         "<!doctype html><p>Waiting</p>",
         "open PAGE\nclock run 3s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(
-        report["error"]
-            .as_str()
-            .unwrap()
-            .contains("put clock install before its open"),
-        "{report}"
-    );
+    let report = exits(2, act(&script, None, false));
+    has(&report, "/error", "put clock install before its open");
 }
 
 #[tokio::test]
@@ -2996,21 +2669,13 @@ async fn the_model_can_point_at_a_control_to_show_its_tooltip() {
         "<!doctype html><button onmouseenter=\"tip.textContent = 'Visible to Sandra Kim'\">Reserved</button><p id=\"tip\"></p>",
     )])
     .await;
-    let model = mock([
-        ("Visible to Sandra Kim", decision("done", "001", "001")),
-        ("", decision("hover", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = mock([("Visible to Sandra Kim", does("done")), ("", does("hover"))]).await;
+    let script = site_script(
         "hover",
-        "",
-        &format!(
-            "open {}/app\ndo show who can see it\nsee \"Visible to Sandra Kim\"\n",
-            site.uri()
-        ),
+        &site,
+        "open SITE/app\ndo show who can see it\nsee \"Visible to Sandra Kim\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"],
         json!(["pointed at button \"Reserved\""])
@@ -3019,21 +2684,13 @@ async fn the_model_can_point_at_a_control_to_show_its_tooltip() {
 
 #[tokio::test]
 async fn see_and_expect_wait_as_long_as_their_within_says() {
-    let model = mock([
-        (
-            "Build failed",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
-        ("", json!({ "holds": yes(0.1), "sight": yes(0.0) })),
-    ])
-    .await;
+    let model = mock([("Build failed", verdict(0.95)), ("", verdict(0.1))]).await;
     let script = script(
         "within",
         "<!doctype html><p id=\"s\">Building</p><script>setTimeout(() => s.textContent = 'Build failed', 6000);</script>",
         "open PAGE\nexpect the build failed within 9s\nsee \"Build failed\" within 1s\nsee \"Never shown\" within 1s\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     let steps = report["steps"].as_array().unwrap();
     assert_eq!(steps[1]["status"], "passed", "{report}");
     assert!(steps[1]["seconds"].as_f64().unwrap() >= 5.5, "{report}");
@@ -3069,9 +2726,9 @@ async fn a_goal_gives_the_page_the_files_and_folders_it_names() {
     )])
     .await;
     let model = mock([
-        ("Folder chosen-project", decision("done", "001", "001")),
+        ("Folder chosen-project", does("done")),
         ("Goal: upload the project", decision("press", "002", "001")),
-        ("Files first.txt", decision("done", "001", "001")),
+        ("Files first.txt", does("done")),
         ("", decision("press", "001", "002")),
     ])
     .await;
@@ -3086,8 +2743,7 @@ async fn a_goal_gives_the_page_the_files_and_folders_it_names() {
             site.uri()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"],
         json!([
@@ -3116,12 +2772,12 @@ async fn a_file_chooser_gets_only_what_its_input_takes() {
     )])
     .await;
     let model = mock([
-        ("Folder of 3", decision("done", "001", "001")),
+        ("Folder of 3", does("done")),
         (
             "Goal: upload the notes and the project",
             decision("press", "002", "001"),
         ),
-        ("Files only-first.txt", decision("done", "001", "001")),
+        ("Files only-first.txt", does("done")),
         ("", decision("press", "001", "002")),
     ])
     .await;
@@ -3136,8 +2792,7 @@ async fn a_file_chooser_gets_only_what_its_input_takes() {
             site.uri()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"][1], "gave the file chooser notes (only-first.txt)",
         "{report}"
@@ -3152,7 +2807,7 @@ async fn a_file_chooser_gets_only_what_its_input_takes() {
 async fn a_file_chooser_the_page_ignores_is_not_pressed_again_and_again() {
     let note = temp_path("ignored.txt");
     std::fs::write(&note, "one").unwrap();
-    let model = mock([("", decision("press", "001", "001"))]).await;
+    let model = mock([("", does("press"))]).await;
     let script = script(
         "ignored-upload",
         "<!doctype html><button onclick=\"fi.click()\">Choose file</button><input id=\"fi\" type=\"file\" style=\"display:none\"><p>Nothing yet</p>",
@@ -3161,8 +2816,7 @@ async fn a_file_chooser_the_page_ignores_is_not_pressed_again_and_again() {
             note.display()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     assert!(
         report["steps"][1]["detail"]
             .as_str()
@@ -3187,21 +2841,16 @@ async fn a_wait_the_model_asks_for_does_not_allow_the_same_press_again() {
     let model = MockServer::start().await;
     Mock::given(method("POST"))
         .and(body_string_contains("pressed button"))
-        .respond_with(reply(decision("wait", "001", "001")))
+        .respond_with(reply(does("wait")))
         .up_to_n_times(1)
         .mount(&model)
         .await;
     Mock::given(method("POST"))
-        .respond_with(reply(decision("press", "001", "001")))
+        .respond_with(reply(does("press")))
         .mount(&model)
         .await;
-    let script = script(
-        "zoom-once",
-        "",
-        &format!("open {}/app\ndo zoom in\n", site.uri()),
-    );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let script = site_script("zoom-once", &site, "open SITE/app\ndo zoom in\n");
+    let report = exits(1, act(&script, Some(&model), false));
     let zooms = site
         .received_requests()
         .await
@@ -3229,7 +2878,7 @@ async fn going_back_to_an_earlier_tab_that_shows_late_waits_for_it_again() {
 
 async fn goes_back_to_an_earlier_tab(name: &str, tab: &str, end: &str, late_ms: u64) {
     let model = mock([
-        ("Chose Yearly", decision("done", "001", "001")),
+        ("Chose Yearly", does("done")),
         ("Showing Yearly", decision("press", "001", "002")),
         ("", decision("press", "002", "001")),
     ])
@@ -3241,27 +2890,20 @@ async fn goes_back_to_an_earlier_tab(name: &str, tab: &str, end: &str, late_ms: 
         ),
         "open PAGE\ndo look at Yearly, then Monthly, then choose Yearly\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
 async fn a_replay_that_hands_over_to_the_model_does_not_press_again() {
-    let model = mock([
-        ("Saved", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Saved").await;
     let script = script(
         "replay-late",
         "<!doctype html><button onclick=\"setTimeout(() => out.textContent = 'Saved', 0)\">Save</button><p id=\"out\"></p>",
         "open PAGE\ndo save\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     edit_page(&script, "'Saved', 0)", "'Saved', 1500)");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"]
             .as_array()
@@ -3279,18 +2921,13 @@ async fn a_replay_that_hands_over_to_the_model_does_not_press_again() {
 
 #[tokio::test]
 async fn a_press_whose_effect_comes_late_is_not_pressed_again() {
-    let model = mock([
-        ("Saved", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Saved").await;
     let script = script(
         "late-effect",
         "<!doctype html><button onclick=\"setTimeout(() => out.textContent = 'Saved', 1500)\">Save</button><p id=\"out\"></p>",
         "open PAGE\ndo save\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"][0], "pressed button \"Save\"",
         "{report}"
@@ -3309,18 +2946,13 @@ async fn a_press_whose_effect_comes_late_is_not_pressed_again() {
 
 #[tokio::test]
 async fn enter_in_one_field_and_then_in_the_next_is_not_a_repeat() {
-    let model = mock([
-        ("Sent", decision("done", "001", "001")),
-        ("", decision("enter", "001", "001")),
-    ])
-    .await;
+    let model = mock([("Sent", does("done")), ("", does("enter"))]).await;
     let script = script(
         "two-enters",
         "<!doctype html><label>Code <input value=\"12\" autofocus onkeydown=\"if (event.key === 'Enter') next.focus()\"></label><label>Check <input id=\"next\" value=\"34\" onkeydown=\"if (event.key === 'Enter') out.textContent = 'Sent'\"></label><p id=\"out\"></p>",
         "open PAGE\ndo submit the code\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -3335,11 +2967,7 @@ async fn a_picker_that_opens_after_its_do_gets_none_of_its_files() {
         ("/later", ""),
     ])
     .await;
-    let model = mock([
-        ("Files step-note.txt", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Files step-note.txt").await;
     let script = script(
         "after-do",
         "",
@@ -3349,19 +2977,14 @@ async fn a_picker_that_opens_after_its_do_gets_none_of_its_files() {
             site.uri()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
 async fn a_file_chooser_that_opens_late_gets_the_named_file() {
     let note = temp_path("late-note.txt");
     std::fs::write(&note, "late").unwrap();
-    let model = mock([
-        ("Files late-note.txt", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Files late-note.txt").await;
     let script = script(
         "late-chooser",
         "<!doctype html><button onclick=\"setTimeout(() => fi.click(), 1500)\">Upload</button><input id=\"fi\" type=\"file\" style=\"display:none\" onchange=\"out.textContent = 'Files ' + this.files[0].name\"><p id=\"out\">Nothing yet</p>",
@@ -3370,17 +2993,15 @@ async fn a_file_chooser_that_opens_late_gets_the_named_file() {
             note.display()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
+    passes(&script, &model);
+    replays(&script);
 }
 
 #[tokio::test]
 async fn a_file_chooser_that_opens_late_and_cannot_take_the_files_tells_the_model() {
     let note = temp_path("late-folder-note.txt");
     std::fs::write(&note, "late").unwrap();
-    let model = mock([("", decision("press", "001", "001"))]).await;
+    let model = mock([("", does("press"))]).await;
     let script = script(
         "late-folder",
         "<!doctype html><button onclick=\"setTimeout(() => di.click(), 1500)\">Upload</button><input id=\"di\" type=\"file\" webkitdirectory style=\"display:none\"><p>Nothing yet</p>",
@@ -3408,11 +3029,7 @@ async fn a_file_chooser_that_opens_late_and_cannot_take_the_files_tells_the_mode
 async fn a_replay_that_cannot_give_the_files_presses_once() {
     let note = temp_path("pressed-once.txt");
     std::fs::write(&note, "one").unwrap();
-    let model = mock([
-        ("Files pressed-once.txt", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Files pressed-once.txt").await;
     let script = script(
         "press-once",
         "<!doctype html><button onclick=\"fi.click()\">Choose file</button><input id=\"fi\" type=\"file\" style=\"display:none\" onchange=\"out.textContent = 'Files ' + [...this.files].map(f => f.name).join(', ')\"><p id=\"out\">Nothing yet</p>",
@@ -3421,11 +3038,9 @@ async fn a_replay_that_cannot_give_the_files_presses_once() {
             note.display()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     edit_page(&script, "type=\"file\"", "type=\"file\" webkitdirectory");
-    let (output, report) = act(&script, None, true);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, true));
     let actions = report["steps"][1]["actions"].as_array().unwrap();
     assert_eq!(actions.len(), 2, "{report}");
     assert!(
@@ -3435,12 +3050,10 @@ async fn a_replay_that_cannot_give_the_files_presses_once() {
             .starts_with("a file chooser or picker could not take the files"),
         "{report}"
     );
-    assert!(
-        report["steps"][1]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("the page asked for a folder, but the goal names only files"),
-        "{report}"
+    has(
+        &report,
+        "/steps/1/detail",
+        "the page asked for a folder, but the goal names only files",
     );
 }
 
@@ -3453,10 +3066,10 @@ async fn a_zip_named_again_stays_readable_by_the_page() {
     )])
     .await;
     let model = mock([
-        ("Read ", decision("done", "001", "001")),
-        ("Failed ", decision("done", "001", "001")),
+        ("Read ", does("done")),
+        ("Failed ", does("done")),
         ("send the package", decision("press", "002", "001")),
-        ("Files zipped-twice.zip", decision("done", "001", "001")),
+        ("Files zipped-twice.zip", does("done")),
         ("", decision("press", "001", "002")),
     ])
     .await;
@@ -3469,8 +3082,7 @@ async fn a_zip_named_again_stays_readable_by_the_page() {
             site.uri()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -3481,11 +3093,7 @@ async fn a_zip_value_gives_the_page_its_folder_as_one_zip() {
         "<!doctype html><button onclick=\"fi.click()\">Choose package</button><input id=\"fi\" type=\"file\" style=\"display:none\" onchange=\"out.textContent = 'Files ' + [...this.files].map(f => f.name + ' ' + f.size).join(', ')\"><p id=\"out\">Nothing yet</p>",
     )])
     .await;
-    let model = mock([
-        ("Files zipped-project.zip", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Files zipped-project.zip").await;
     let script = script(
         "zipped",
         "",
@@ -3495,8 +3103,7 @@ async fn a_zip_value_gives_the_page_its_folder_as_one_zip() {
             site.uri()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     let note = temp_path("not-a-folder.txt");
     std::fs::write(&note, "x").unwrap();
     let wrong = self::script(
@@ -3508,15 +3115,8 @@ async fn a_zip_value_gives_the_page_its_folder_as_one_zip() {
             site.uri()
         ),
     );
-    let (output, report) = act(&wrong, Some(&model), false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(
-        report["error"]
-            .as_str()
-            .unwrap()
-            .contains("zip takes one folder"),
-        "{report}"
-    );
+    let report = exits(2, act(&wrong, Some(&model), false));
+    has(&report, "/error", "zip takes one folder");
 }
 
 #[tokio::test]
@@ -3530,11 +3130,11 @@ async fn file_system_pickers_get_the_named_files_and_folders_or_are_cancelled() 
     )])
     .await;
     let model = mock([
-        ("Picker failed", decision("done", "001", "001")),
+        ("Picker failed", does("done")),
         ("Goal: pick a folder", decision("press", "001", "002")),
-        ("Opened hello", decision("done", "001", "001")),
+        ("Opened hello", does("done")),
         ("Goal: open the note", decision("press", "002", "001")),
-        ("Picked picked-project", decision("done", "001", "001")),
+        ("Picked picked-project", does("done")),
         ("", decision("press", "001", "002")),
     ])
     .await;
@@ -3548,8 +3148,7 @@ async fn file_system_pickers_get_the_named_files_and_folders_or_are_cancelled() 
             site.uri()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][7]["actions"][1],
         "a file chooser opened, but the goal names no file to give it",
@@ -3580,27 +3179,17 @@ async fn a_download_shows_on_the_screen_with_its_name_and_size() {
         )
         .mount(&site)
         .await;
-    let model = mock([
-        ("downloaded", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
-    let script = script(
+    let model = pressing("downloaded").await;
+    let script = site_script(
         "download",
-        "",
-        &format!(
-            "open {}/app\ndo download the version\nsee \"alta-de-explotacion-v1.zip 2048 bytes\" within 10s\n",
-            site.uri()
-        ),
+        &site,
+        "open SITE/app\ndo download the version\nsee \"alta-de-explotacion-v1.zip 2048 bytes\" within 10s\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    assert!(
-        report["screen"]
-            .as_str()
-            .unwrap()
-            .contains("download \"alta-de-explotacion-v1.zip\" = \"2048 bytes\" · downloaded"),
-        "{report}"
+    let report = passes(&script, &model);
+    has(
+        &report,
+        "/screen",
+        "download \"alta-de-explotacion-v1.zip\" = \"2048 bytes\" · downloaded",
     );
 }
 
@@ -3611,8 +3200,7 @@ async fn a_frame_marked_as_presentation_is_still_read() {
         r#"<!doctype html><iframe role="presentation" srcdoc="<p>Inside presentation</p>"></iframe><iframe role="none" srcdoc="<p>Inside none</p>"></iframe>"#,
         "open PAGE\nsee \"Inside presentation\"\nsee \"Inside none\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -3637,12 +3225,12 @@ async fn the_screen_reads_and_acts_inside_iframes_of_any_origin() {
     ])
     .await;
     let model = mock([
-        ("Notes pressed", decision("done", "001", "001")),
+        ("Notes pressed", does("done")),
         (
             "Goal: press the notes button",
             decision("press", "002", "001"),
         ),
-        ("Pressed inside", decision("done", "001", "001")),
+        ("Pressed inside", does("done")),
         ("", decision("press", "001", "002")),
     ])
     .await;
@@ -3654,21 +3242,16 @@ async fn the_screen_reads_and_acts_inside_iframes_of_any_origin() {
             hub.uri()
         ),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    assert!(
-        report["screen"]
-            .as_str()
-            .unwrap()
-            .contains("- iframe \"Preview\"\n    - page \"Preview\""),
-        "{report}"
+    let report = passes(&script, &model);
+    has(
+        &report,
+        "/screen",
+        "- iframe \"Preview\"\n    - page \"Preview\"",
     );
-    assert!(
-        report["screen"]
-            .as_str()
-            .unwrap()
-            .contains("- iframe \"Notes\" = \"sandbox allow-scripts allow-same-origin\""),
-        "{report}"
+    has(
+        &report,
+        "/screen",
+        "- iframe \"Notes\" = \"sandbox allow-scripts allow-same-origin\"",
     );
 }
 
@@ -3697,8 +3280,7 @@ fn scripts_run_commands_start_services_read_their_logs_and_reuse_steps() {
             site.display()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, false));
     let steps = report["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 12, "{report}");
     assert_eq!(steps[0]["detail"], "exit 0");
@@ -3727,16 +3309,12 @@ async fn extract_takes_a_value_from_the_screen_and_replays_where_it_came_from() 
         json!({ "extract": choice("004"), "extract_reversed": choice("001") }),
     )])
     .await;
-    let script = script(
+    let script = site_script(
         "extract",
-        "",
-        &format!(
-            "open {}/app\nextract next = the address the Next link goes to\nopen $next\nsee \"Step\"\n",
-            site.uri()
-        ),
+        &site,
+        "open SITE/app\nextract next = the address the Next link goes to\nopen $next\nsee \"Step\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["detail"],
         format!("next = \"{}/next/42\"", site.uri())
@@ -3751,17 +3329,13 @@ async fn extract_takes_a_value_from_the_screen_and_replays_where_it_came_from() 
         .with_priority(1)
         .mount(&site)
         .await;
-    let (output, report) = act(&script, None, true);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = replays(&script);
     assert_eq!(report["steps"][1]["via"], "replay");
     assert_eq!(
         report["steps"][1]["detail"],
         format!("next = \"{page}/next/43\"")
     );
-    assert!(
-        report["screen"].as_str().unwrap().contains("Step 43"),
-        "{report}"
-    );
+    has(&report, "/screen", "Step 43");
 }
 
 #[tokio::test]
@@ -3776,11 +3350,9 @@ async fn extract_never_replays_one_of_two_alike_places() {
         "<!doctype html><a href=\"a.html\">Edit</a><a href=\"b.html\">Edit</a>",
         "open PAGE\nextract next = the address of the second Edit link\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     let picked = report["steps"][1]["detail"].as_str().unwrap().to_owned();
     assert!(picked.ends_with("b.html\""), "{report}");
-
     let (locked, report) = act(&script, None, true);
     assert_ne!(
         report["steps"][1]["detail"].as_str(),
@@ -3810,8 +3382,7 @@ async fn extract_replays_a_text_whose_numbers_change() {
         "<!doctype html><p>Order 4711</p>",
         "open PAGE\nextract order = the order number\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["detail"], "order = \"Order 4711\"",
         "{report}"
@@ -3819,18 +3390,14 @@ async fn extract_replays_a_text_whose_numbers_change() {
     let lock = std::fs::read_to_string(format!("{}.lock", script.display())).unwrap();
     assert!(!lock.contains("4711"), "{lock}");
     edit_page(&script, "Order 4711", "Order 4712");
-
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
+    let report = replays(&script);
     assert_eq!(report["steps"][1]["via"], "replay", "{report}");
     assert_eq!(
         report["steps"][1]["detail"], "order = \"Order 4712\"",
         "{report}"
     );
     edit_page(&script, "Order 4712", "Order 4713</p><p>Order 5");
-
-    let (ambiguous, report) = act(&script, None, true);
-    assert_eq!(ambiguous.status.code(), Some(1), "{report}");
+    exits(1, act(&script, None, true));
 }
 
 #[tokio::test]
@@ -3845,16 +3412,13 @@ async fn extract_waits_for_the_place_it_recorded() {
         "<!doctype html><p id=\"o\">Order 4711</p>",
         "open PAGE\nextract order = the order number\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     edit_page(
         &script,
         "<p id=\"o\">Order 4711</p>",
         "<p id=\"o\">Loading</p><script>setTimeout(() => o.textContent = 'Order 4712', 400)</script>",
     );
-
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
+    let report = replays(&script);
     assert_eq!(
         report["steps"][1]["detail"], "order = \"Order 4712\"",
         "{report}"
@@ -3876,13 +3440,7 @@ fn extract_never_replaces_a_secret() {
         .unwrap();
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(
-        report["error"]
-            .as_str()
-            .unwrap()
-            .contains("$token is a secret"),
-        "{report}"
-    );
+    has(&report, "/error", "$token is a secret");
 }
 
 #[tokio::test]
@@ -3900,8 +3458,7 @@ async fn extract_takes_a_whole_field_and_leaves_out_texts_with_secrets() {
         ),
         "with who = $IU2U_TEST_SECRET\nopen PAGE\nextract code = the code in the field\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["detail"],
         format!("code = {code:?}"),
@@ -3924,13 +3481,10 @@ async fn extract_leaves_out_a_response_value_with_an_encoded_secret() {
         json!({ "extract": choice("none"), "extract_reversed": choice("none") }),
     )])
     .await;
-    let script = script(
+    let script = site_script(
         "encoded-secret",
-        "",
-        &format!(
-            "with token = $IU2U_TEST_SECRET\nrequest GET {}/callback\nextract next = where the callback goes\n",
-            api.uri()
-        ),
+        &api,
+        "with token = $IU2U_TEST_SECRET\nrequest GET SITE/callback\nextract next = where the callback goes\n",
     );
     let output = command(Some(&model))
         .arg("--json")
@@ -3960,16 +3514,12 @@ async fn extract_says_when_values_were_left_out() {
         json!({ "extract": choice("none"), "extract_reversed": choice("none") }),
     )])
     .await;
-    let script = script(
+    let script = site_script(
         "many",
-        "",
-        &format!(
-            "request GET {}/people\nextract id = the id of the last person\n",
-            api.uri()
-        ),
+        &api,
+        "request GET SITE/people\nextract id = the id of the last person\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     assert!(
         report["steps"][1]["detail"]
             .as_str()
@@ -3991,8 +3541,7 @@ async fn extract_replays_an_output_line_by_what_it_says() {
         "",
         "run printf 'Created user 41\\n'\nextract id = the id of the new user\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["detail"], "id = \"Created user 41\"",
         "{report}"
@@ -4002,9 +3551,7 @@ async fn extract_replays_an_output_line_by_what_it_says() {
         "printf 'warning: this node is old\\nCreated user 42\\n' || printf '",
     );
     std::fs::write(&script, shifted).unwrap();
-
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
+    let report = replays(&script);
     assert_eq!(
         report["steps"][1]["detail"], "id = \"Created user 42\"",
         "{report}"
@@ -4019,29 +3566,24 @@ fn a_command_that_prints_a_lot_keeps_only_its_last_mebibyte() {
         "",
         &format!("run {noisy}\nsee \"LAST\"\nsee \"only its last 1048576 bytes are kept\"\n"),
     );
-    let (output, report) = act(&printed, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&printed);
     let value = script(
         "noisy-value",
         "",
         &format!("with big = run {noisy}\nwait 1ms\n"),
     );
-    let (output, report) = act(&value, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(
-        report["error"]
-            .as_str()
-            .unwrap()
-            .contains("with big: the command printed more than 1048576 bytes"),
-        "{report}"
+    let report = exits(2, act(&value, None, false));
+    has(
+        &report,
+        "/error",
+        "with big: the command printed more than 1048576 bytes",
     );
     let quiet = script(
         "noisy-errors",
         "",
         "with token = run head -c 2000000 /dev/zero | tr '\\0' x >&2; echo tok-123\nrun test \"$token\" = tok-123\n",
     );
-    let (output, report) = act(&quiet, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&quiet);
 }
 
 #[test]
@@ -4051,8 +3593,7 @@ fn logs_of_a_service_that_prints_a_lot_keep_only_their_last_mebibyte() {
         "",
         "start noisy = head -c 3000000 /dev/zero | tr '\\0' b | fold -w 100; echo; echo DONE; sleep 30\nlogs noisy\nsee \"DONE\" within 10s\nsee \"the log began earlier; only its last 1048576 bytes are kept\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[test]
@@ -4062,8 +3603,7 @@ fn run_shows_its_output_in_the_order_it_was_written() {
         "",
         "run echo first; echo second >&2; echo third\nsee \"third\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     let screen = report["screen"].as_str().unwrap();
     let at = |text: &str| screen.find(text).unwrap();
     assert!(
@@ -4084,8 +3624,7 @@ async fn extract_from_a_long_output_offers_its_last_lines() {
         "",
         "run seq -f 'line %g' 1 400; echo 'Created user 42'\nextract id = the id of the new user\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["detail"], "id = \"Created user 42\"",
         "{report}"
@@ -4122,16 +3661,12 @@ async fn extract_takes_a_field_from_a_json_response() {
         ),
     ])
     .await;
-    let script = script(
+    let script = site_script(
         "json",
-        "",
-        &format!(
-            "with token = $IU2U_TEST_SECRET\nrequest POST {uri}/api/prototypes\nextract id = the id of the new prototype\nextract place = the address of the new prototype\nrequest DELETE {uri}$place\nsee \"HTTP 204\"\n",
-            uri = api.uri()
-        ),
+        &api,
+        "with token = $IU2U_TEST_SECRET\nrequest POST SITE/api/prototypes\nextract id = the id of the new prototype\nextract place = the address of the new prototype\nrequest DELETE SITE$place\nsee \"HTTP 204\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(report["steps"][1]["detail"], "id = \"p-7\"");
     assert_eq!(
         report["steps"][2]["detail"], "place = \"/api/prototypes/p-7\"",
@@ -4144,17 +3679,7 @@ async fn extract_takes_a_field_from_a_json_response() {
 
 #[tokio::test]
 async fn an_inline_image_leaves_the_rest_of_the_page_in_view() {
-    let model = mock([
-        (
-            "Hello there",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.05), "sight": yes(0.0) }),
-        ),
-    ])
-    .await;
+    let model = mock([("Hello there", verdict(0.95)), ("\"holds\"", verdict(0.05))]).await;
     let image = "A".repeat(8000);
     let script = script(
         "inline-image",
@@ -4163,45 +3688,24 @@ async fn an_inline_image_leaves_the_rest_of_the_page_in_view() {
         ),
         "open PAGE\nexpect the page greets the visitor\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
 async fn a_model_that_sees_presses_a_spot_that_no_control_stands_for() {
-    let model = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(body_string_contains("Hit the marker"))
-        .and(body_string_contains("\"operation\":{"))
-        .respond_with(reply(json!({ "operation": choice("done") })))
-        .mount(&model)
-        .await;
-    for (question, label) in [
-        ("operation", "spot"),
-        ("spot", "019"),
-        ("spot_reversed", "030"),
-        ("spot_closer", "001"),
-        ("spot_closer_reversed", "064"),
-    ] {
-        Mock::given(method("POST"))
-            .and(body_string_contains(format!("\"{question}\":{{")))
-            .respond_with(reply(json!({ question: choice(label) })))
-            .mount(&model)
-            .await;
-    }
+    presses_the_marker("spot", "").await;
+}
+
+async fn presses_the_marker(name: &str, head: &str) {
+    let model = spot_model("Hit the marker").await;
     let script = script(
-        "spot",
-        "<!doctype html><body style=\"margin: 0\"><div style=\"height: 100vh; background: #eef\"></div><p id=\"out\" style=\"position: fixed; bottom: 0; margin: 0\">Waiting</p><script>document.addEventListener('click', event => { const [x, y] = [event.clientX / innerWidth, event.clientY / innerHeight]; out.textContent = x > 0.218 && x < 0.243 && y > 0.291 && y < 0.323 ? 'Hit the marker' : `Missed at ${x} ${y}`; });</script>",
+        name,
+        &format!(
+            "<!doctype html>{head}<body style=\"margin: 0\"><div style=\"height: 100vh; background: #eef\"></div><p id=\"out\" style=\"position: fixed; bottom: 0; margin: 0\">Waiting</p><script>document.addEventListener('click', event => {{ const [x, y] = [event.clientX / innerWidth, event.clientY / innerHeight]; out.textContent = x > 0.218 && x < 0.243 && y > 0.291 && y < 0.323 ? 'Hit the marker' : `Missed at ${{x}} ${{y}}`; }});</script>"
+        ),
         "open PAGE\ndo press the marker on the map\nsee \"Hit the marker\"\nsee no \"001\"\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = succeeded(sees(&script, &model));
     assert_eq!(
         report["steps"][1]["actions"][0], "pressed the spot 23% across and 31% down the screen",
         "{report}"
@@ -4215,99 +3719,28 @@ async fn a_model_that_sees_presses_a_spot_that_no_control_stands_for() {
         .find(|body| body.contains("\"spot_closer\":{"))
         .unwrap();
     assert!(closer.contains("\"data_base64\":\"iVBORw0KGgo"), "{closer}");
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
+    let report = replays(&script);
     assert_eq!(report["model_calls"], 0, "{report}");
 }
 
 #[tokio::test]
 async fn a_spot_grid_shows_above_a_modal_dialog() {
-    let model = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(body_string_contains("Grid on top"))
-        .and(body_string_contains("\"operation\":{"))
-        .respond_with(reply(json!({ "operation": choice("done") })))
-        .mount(&model)
-        .await;
-    for (question, label) in [
-        ("operation", "spot"),
-        ("spot", "019"),
-        ("spot_reversed", "030"),
-        ("spot_closer", "001"),
-        ("spot_closer_reversed", "064"),
-    ] {
-        Mock::given(method("POST"))
-            .and(body_string_contains(format!("\"{question}\":{{")))
-            .respond_with(reply(json!({ question: choice(label) })))
-            .mount(&model)
-            .await;
-    }
+    let model = spot_model("Grid on top").await;
     let script = script(
         "spot-modal",
         "<!doctype html><body style=\"margin: 0\"><dialog id=\"map\" style=\"width: 100vw; height: 100vh; max-width: none; max-height: none; margin: 0; border: 0\"><p id=\"out\">Waiting</p></dialog><script>map.showModal(); new MutationObserver(() => { const grid = document.getElementById('__iu2u_grid'); if (grid) out.textContent = grid.matches(':popover-open') ? 'Grid on top' : 'Grid under'; }).observe(document.documentElement, { childList: true });</script>",
         "open PAGE\ndo press the marker on the map\nsee \"Grid on top\"\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    succeeded(sees(&script, &model));
 }
 
 #[tokio::test]
 async fn a_spot_grid_is_drawn_on_a_page_with_a_strict_content_policy() {
-    let model = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(body_string_contains("Hit the marker"))
-        .and(body_string_contains("\"operation\":{"))
-        .respond_with(reply(json!({ "operation": choice("done") })))
-        .mount(&model)
-        .await;
-    for (question, label) in [
-        ("operation", "spot"),
-        ("spot", "019"),
-        ("spot_reversed", "030"),
-        ("spot_closer", "001"),
-        ("spot_closer_reversed", "064"),
-    ] {
-        Mock::given(method("POST"))
-            .and(body_string_contains(format!("\"{question}\":{{")))
-            .respond_with(reply(json!({ question: choice(label) })))
-            .mount(&model)
-            .await;
-    }
-    let script = script(
+    presses_the_marker(
         "spot-csp",
-        "<!doctype html><meta http-equiv=\"Content-Security-Policy\" content=\"style-src 'self'; require-trusted-types-for 'script'\"><body style=\"margin: 0\"><div style=\"height: 100vh; background: #eef\"></div><p id=\"out\" style=\"position: fixed; bottom: 0; margin: 0\">Waiting</p><script>document.addEventListener('click', event => { const [x, y] = [event.clientX / innerWidth, event.clientY / innerHeight]; out.textContent = x > 0.218 && x < 0.243 && y > 0.291 && y < 0.323 ? 'Hit the marker' : `Missed at ${x} ${y}`; });</script>",
-        "open PAGE\ndo press the marker on the map\nsee \"Hit the marker\"\nsee no \"001\"\n",
-    );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(0), "{report}");
-    assert_eq!(
-        report["steps"][1]["actions"][0], "pressed the spot 23% across and 31% down the screen",
-        "{report}"
-    );
-    let closer = model
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
-        .find(|body| body.contains("\"spot_closer\":{"))
-        .unwrap();
-    assert!(closer.contains("\"data_base64\":\"iVBORw0KGgo"), "{closer}");
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
-    assert_eq!(report["model_calls"], 0, "{report}");
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"style-src 'self'; require-trusted-types-for 'script'\">",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -4329,14 +3762,7 @@ async fn a_model_that_sees_gets_a_screenshot_with_every_question() {
         "<!doctype html><p style=\"color: green\">Latest version</p>",
         "open PAGE\nexpect the version is shown in green\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = succeeded(sees(&script, &model));
     assert_eq!(
         report["steps"][1]["detail"],
         "the model is 95% sure it holds"
@@ -4353,7 +3779,7 @@ async fn a_model_without_a_screenshot_is_told_the_screen_is_text_only() {
         .and(body_string_contains(
             "The screen is given as text only: it does not show colours, positions, sizes or pictures.",
         ))
-        .respond_with(reply(json!({ "holds": yes(0.95), "sight": yes(0.0) })))
+        .respond_with(reply(verdict(0.95)))
         .mount(&model)
         .await;
     let script = script(
@@ -4361,8 +3787,7 @@ async fn a_model_without_a_screenshot_is_told_the_screen_is_text_only() {
         "<!doctype html><p>Latest version</p>",
         "open PAGE\nexpect the page shows the latest version\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -4377,27 +3802,13 @@ async fn a_model_that_sees_gets_one_screenshot_per_screen() {
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
         .mount(&site)
         .await;
-    let model = mock([
-        ("Ana", decision("done", "001", "001")),
-        ("", decision("type", "001", "002")),
-    ])
-    .await;
-    let script = script(
+    let model = mock([("Ana", does("done")), ("", decision("type", "001", "002"))]).await;
+    let script = site_script(
         "one-shot",
-        "",
-        &format!(
-            "with name = Ana\nopen {}/app\ndo type the name\n",
-            site.uri()
-        ),
+        &site,
+        "with name = Ana\nopen SITE/app\ndo type the name\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = succeeded(sees(&script, &model));
     assert_eq!(report["model_calls"], 5, "{report}");
     assert!(
         report["steps"][1]["seconds"].as_f64().unwrap() < 18.0,
@@ -4417,13 +3828,10 @@ async fn a_model_that_sees_gets_a_new_screenshot_in_each_step() {
         ("/recolor", ""),
     ])
     .await;
-    let script = script(
+    let script = site_script(
         "recolored",
-        "",
-        &format!(
-            "route */recolor hold\nopen {}/app\nexpect the status is shown\nrelease */recolor\nwait 1s\nexpect the status is shown in green\n",
-            site.uri()
-        ),
+        &site,
+        "route */recolor hold\nopen SITE/app\nexpect the status is shown\nrelease */recolor\nwait 1s\nexpect the status is shown in green\n",
     );
     let output = command(Some(&model))
         .arg(&script)
@@ -4448,25 +3856,30 @@ async fn a_model_that_sees_gets_a_new_screenshot_in_each_step() {
 
 #[tokio::test]
 async fn a_claim_on_how_the_page_looks_is_asked_again_when_only_its_look_changes() {
+    let asked = Arc::new(AtomicBool::new(false));
     let model = MockServer::start().await;
+    let asking = asked.clone();
     Mock::given(method("POST"))
-        .respond_with(reply(json!({ "holds": yes(0.05), "sight": yes(0.9) })))
+        .respond_with(move |_: &wiremock::Request| {
+            asking.store(true, Ordering::SeqCst);
+            reply(json!({ "holds": yes(0.05), "sight": yes(0.9) }))
+        })
         .up_to_n_times(1)
         .with_priority(1)
         .mount(&model)
         .await;
     answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.9) })).await;
-    let script = script(
+    let site = flag_site(
+        r#"<!doctype html><p id="s" style="color: red">Status</p><script>const check = () => fetch('/flag').then(answer => answer.text()).then(flag => flag === 'on' ? s.style.color = 'green' : setTimeout(check, 200)); check();</script>"#,
+        asked,
+    )
+    .await;
+    let script = site_script(
         "turns-green",
-        "<!doctype html><p id=\"s\" style=\"color: red\">Status</p><script>setTimeout(() => s.style.color = 'green', 1000)</script>",
-        "open PAGE\nexpect the status is shown in green within 10s\n",
+        &site,
+        "open SITE/app\nexpect the status is shown in green within 10s\n",
     );
-    let output = command(Some(&model))
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(0));
+    succeeded(sees(&script, &model));
     assert_eq!(model.received_requests().await.unwrap().len(), 2);
 }
 
@@ -4479,14 +3892,7 @@ async fn a_model_that_sees_is_not_held_up_by_a_page_that_reloads_itself() {
         "<!doctype html><meta http-equiv=\"refresh\" content=\"1\"><p>Loading</p>",
         "open PAGE\nexpect the page shows the report within 8s\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, sees(&script, &model));
     assert!(
         report["steps"][1]["seconds"].as_f64().unwrap() < 28.0,
         "{report}"
@@ -4502,15 +3908,7 @@ async fn a_model_that_sees_gets_no_screenshot_while_a_secret_shows() {
         &format!("<!doctype html><p>Token {SECRET}</p>"),
         "with token = $IU2U_TEST_SECRET\nopen PAGE\nexpect the token is shown\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .env("IU2U_TEST_SECRET", SECRET)
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = succeeded(sees(&script, &model));
     assert!(
         report["steps"][1]["detail"]
             .as_str()
@@ -4548,15 +3946,7 @@ async fn a_model_that_sees_gets_no_screenshot_of_a_secret_painted_outside_the_pa
             &format!("<!doctype html><p>Settings</p>{page}"),
             "with token = $IU2U_TEST_SECRET\nopen PAGE\nexpect the settings are shown\n",
         );
-        let output = command(Some(&model))
-            .arg("--json")
-            .arg(&script)
-            .env("IU2U_VISION", "true")
-            .env("IU2U_TEST_SECRET", SECRET)
-            .output()
-            .unwrap();
-        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(output.status.code(), Some(0), "{report}");
+        let report = succeeded(sees(&script, &model));
         let sent = model
             .received_requests()
             .await
@@ -4582,24 +3972,13 @@ async fn a_model_that_sees_gets_no_screenshot_of_a_secret_that_shows_while_it_is
         .mount(&site)
         .await;
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
-    let script = script(
+    answer_always(&model, verdict(0.95)).await;
+    let script = site_script(
         "late-secret",
-        "",
-        &format!(
-            "with token = $IU2U_TEST_SECRET\nopen {}/app\nexpect the settings are shown\n",
-            site.uri()
-        ),
+        &site,
+        "with token = $IU2U_TEST_SECRET\nopen SITE/app\nexpect the settings are shown\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .env("IU2U_TEST_SECRET", SECRET)
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    succeeded(sees(&script, &model));
     for request in model.received_requests().await.unwrap() {
         assert!(!String::from_utf8_lossy(&request.body).contains("iu2u-screenshot"));
     }
@@ -4636,7 +4015,7 @@ async fn a_page_with_a_frame_act_did_not_read_gets_no_screenshot_while_secrets_e
             .await;
     }
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.95)).await;
     let script = script(
         "unread-frame",
         "",
@@ -4644,15 +4023,7 @@ async fn a_page_with_a_frame_act_did_not_read_gets_no_screenshot_while_secrets_e
             "with token = $IU2U_TEST_SECRET\nopen http://127.0.0.1:{port}/app\nsee \"Frame 10\"\nexpect the frames are shown\n"
         ),
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .env("IU2U_TEST_SECRET", SECRET)
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    succeeded(sees(&script, &model));
     let requests = model.received_requests().await.unwrap();
     assert!(!requests.is_empty());
     for request in requests {
@@ -4677,14 +4048,7 @@ async fn a_spot_grid_is_not_sent_once_a_secret_shows_on_the_page() {
         ),
         "with token = $IU2U_TEST_SECRET\nopen PAGE\ndo press the capital on the map\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .env("IU2U_TEST_SECRET", SECRET)
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let (_, report) = sees(&script, &model);
     assert!(
         report
             .to_string()
@@ -4724,22 +4088,12 @@ async fn a_model_that_sees_gets_the_screenshot_once_the_pictures_on_it_load() {
         })
         .mount(&model)
         .await;
-    let script = script(
+    let script = site_script(
         "pictures",
-        "",
-        &format!(
-            "open {}/app\nsee \"Field\"\nexpect the field picture is shown\n",
-            site.uri()
-        ),
+        &site,
+        "open SITE/app\nsee \"Field\"\nexpect the field picture is shown\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = succeeded(sees(&script, &model));
     let (picture, asked) = (
         picture.lock().unwrap().unwrap(),
         asked.lock().unwrap().unwrap(),
@@ -4794,14 +4148,8 @@ async fn a_model_that_sees_gets_the_part_of_a_scrolled_page_in_view() {
 #[tokio::test]
 async fn a_claim_is_asked_again_while_the_screen_changes_for_a_moment() {
     let model = mock([
-        (
-            "Order shipped",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.05), "sight": yes(0.0) }),
-        ),
+        ("Order shipped", verdict(0.95)),
+        ("\"holds\"", verdict(0.05)),
     ])
     .await;
     let script = script(
@@ -4809,8 +4157,7 @@ async fn a_claim_is_asked_again_while_the_screen_changes_for_a_moment() {
         "<!doctype html><p id=\"o\">Packing</p><script>setTimeout(() => o.textContent = 'Order shipped', 1500);</script>",
         "open PAGE\nexpect the order is on its way\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["detail"],
         "the model is 95% sure it holds"
@@ -4827,14 +4174,12 @@ async fn a_claim_that_needs_sight_warns_without_vision_and_on_replay() {
         "<!doctype html><p style=\"color: green\">Latest version</p>",
         "open PAGE\nexpect the version is shown in green\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["detail"],
         "the model is 95% sure it holds; this claim needs to see the page, but the model only read its text: set IU2U_VISION=true with a model that sees"
     );
-    let (output, report) = act(&script, None, true);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = replays(&script);
     assert_eq!(
         report["steps"][1]["detail"],
         "replayed from the text of the screen: how the page looks was not checked without the model"
@@ -4851,14 +4196,7 @@ async fn a_claim_that_needs_sight_is_asked_again_by_a_model_that_sees() {
         "open PAGE\nexpect the Delete text is shown in red\n",
     );
     for _ in 0..2 {
-        let output = command(Some(&model))
-            .arg("--json")
-            .arg(&script)
-            .env("IU2U_VISION", "true")
-            .output()
-            .unwrap();
-        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(output.status.code(), Some(0), "{report}");
+        let report = succeeded(sees(&script, &model));
         assert_eq!(report["steps"][1]["via"], "model", "{report}");
     }
 }
@@ -4872,13 +4210,7 @@ async fn a_claim_that_needs_sight_warns_when_no_screenshot_goes_with_it() {
         "",
         "run echo Latest\nexpect the output is shown in bold\n",
     );
-    let output = command(Some(&model))
-        .arg("--json")
-        .arg(&script)
-        .env("IU2U_VISION", "true")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let (output, report) = sees(&script, &model);
     assert_eq!(output.status.code(), Some(0), "{report}");
     assert_eq!(
         report["steps"][1]["detail"],
@@ -4889,12 +4221,9 @@ async fn a_claim_that_needs_sight_warns_when_no_screenshot_goes_with_it() {
 #[tokio::test]
 async fn a_replay_ignores_numbers_that_change_unless_the_step_mentions_them() {
     let model = mock([
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
-        ("Published", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
+        ("\"holds\"", verdict(0.95)),
+        ("Published", does("done")),
+        ("", does("press")),
     ])
     .await;
     let script = script(
@@ -4902,24 +4231,20 @@ async fn a_replay_ignores_numbers_that_change_unless_the_step_mentions_them() {
         "<!doctype html><p>Updated 22 days ago, build 4711</p><p>3 items in the list</p><button onclick=\"out.textContent = 'Published at ' + Date.now()\">Publish</button><p id=\"out\"></p>",
         "open PAGE\ndo publish the prototype\nexpect the list shows 3 items\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     edit_page(
         &script,
         "22 days ago, build 4711",
         "23 days ago, build 4712",
     );
-    let (output, report) = act(&script, None, true);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = replays(&script);
     assert_eq!(report["steps"][1]["via"], "replay", "{report}");
     assert_eq!(report["steps"][2]["via"], "cache", "{report}");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(report["steps"][1]["via"], "replay", "{report}");
     assert_eq!(report["steps"][2]["via"], "model", "{report}");
     edit_page(&script, "3 items", "4 items");
-    let (output, report) = act(&script, None, true);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, true));
     assert_eq!(report["steps"][1]["via"], "replay", "{report}");
     assert_eq!(report["steps"][2]["status"], "failed", "{report}");
 }
@@ -4967,11 +4292,7 @@ fn a_before_script_starts_services_and_values_for_every_script() {
 
 #[tokio::test]
 async fn a_script_value_from_a_command_wins_over_the_before_script() {
-    let model = mock([
-        ("Hello (secret", decision("done", "001", "001")),
-        ("", decision("type", "001", "001")),
-    ])
-    .await;
+    let model = mock([("Hello (secret", does("done")), ("", does("type"))]).await;
     let before = script("shadow-setup", "", "with name = run printf Admin\n");
     let typing = script(
         "shadow-later",
@@ -4996,8 +4317,7 @@ fn the_logs_of_a_service_show_even_with_bytes_that_are_not_text() {
         "",
         "start noisy = printf 'caf\\351 ERROR\\nready\\n'; sleep 30\nlogs noisy\nsee \"ready\" within 5s\nsee \"ERROR\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[test]
@@ -5025,23 +4345,16 @@ async fn a_file_from_the_before_script_can_be_given_to_the_page() {
         "<!doctype html><button onclick=\"fi.click()\">Choose file</button><input id=\"fi\" type=\"file\" style=\"display:none\" onchange=\"out.textContent = 'Files ' + [...this.files].map(f => f.name + ' ' + f.size).join(', ')\"><p id=\"out\">Nothing yet</p>",
     )])
     .await;
-    let model = mock([
-        ("Files shared-note.txt", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Files shared-note.txt").await;
     let before = script(
         "files-setup",
         "",
         &format!("with note = file {}\n", note.display()),
     );
-    let attaching = script(
+    let attaching = site_script(
         "files-later",
-        "",
-        &format!(
-            "open {}/app\ndo attach the note\nsee \"Files shared-note.txt 5\"\n",
-            site.uri()
-        ),
+        &site,
+        "open SITE/app\ndo attach the note\nsee \"Files shared-note.txt 5\"\n",
     );
     let output = command(Some(&model))
         .arg("--json")
@@ -5056,11 +4369,7 @@ async fn a_file_from_the_before_script_can_be_given_to_the_page() {
 
 #[tokio::test]
 async fn a_value_from_the_before_script_can_be_typed() {
-    let model = mock([
-        ("Hello Sandra", decision("done", "001", "001")),
-        ("", decision("type", "001", "001")),
-    ])
-    .await;
+    let model = mock([("Hello Sandra", does("done")), ("", does("type"))]).await;
     let before = script("typed-setup", "", "with name = Sandra\n");
     let typing = script(
         "typed-later",
@@ -5095,27 +4404,18 @@ async fn a_start_that_waits_goes_back_to_the_page() {
             uri = api.uri()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
-fn interrupt_when_started(
-    name: &str,
-    steps: &str,
-    pid_files: &[&Path],
-) -> (Option<i32>, Vec<String>) {
-    signal_when_started("-INT", name, steps, pid_files)
-}
-
-fn signal_when_started(
-    signal: &str,
-    name: &str,
-    steps: &str,
-    pid_files: &[&Path],
-) -> (Option<i32>, Vec<String>) {
+#[track_caller]
+fn stopped_by(signal: &str, code: i32, name: &str, steps: &str, pid_files: &[&Path]) {
     let script = temp_path(&format!("{name}.e2e"));
     std::fs::write(&script, steps).unwrap();
-    let mut running = command(None).arg(&script).spawn().unwrap();
+    let mut running = command(None)
+        .arg(&script)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
     let started = std::time::Instant::now();
     let pids: Vec<String> = pid_files
         .iter()
@@ -5151,13 +4451,19 @@ fn signal_when_started(
     for pid in &alive {
         Command::new("kill").args(["-9", pid]).status().unwrap();
     }
-    (status.code(), alive)
+    assert_eq!(status.code(), Some(code));
+    assert!(
+        alive.is_empty(),
+        "still running after the signal: {alive:?}"
+    );
 }
 
 #[test]
 fn an_interrupted_run_stops_the_services_and_commands_it_started() {
     let (service, command_child) = (temp_path("idle.pid"), temp_path("ran.pid"));
-    let (code, alive) = interrupt_when_started(
+    stopped_by(
+        "-INT",
+        130,
         "interrupted",
         &format!(
             "start idle = echo $$ > {} && exec sleep 300\nrun sleep 300 & echo $! > {}; wait\n",
@@ -5165,11 +4471,6 @@ fn an_interrupted_run_stops_the_services_and_commands_it_started() {
             command_child.display()
         ),
         &[&service, &command_child],
-    );
-    assert_eq!(code, Some(130));
-    assert!(
-        alive.is_empty(),
-        "still running after the interrupt: {alive:?}"
     );
 }
 
@@ -5224,8 +4525,9 @@ fn a_run_stopped_by_a_signal_reports_the_script_it_stopped() {
 #[test]
 fn a_terminate_signal_stops_the_run_and_its_services() {
     let service = temp_path("terminated.pid");
-    let (code, alive) = signal_when_started(
+    stopped_by(
         "-TERM",
+        143,
         "terminated",
         &format!(
             "start idle = echo $$ > {} && exec sleep 300\nwait 30s\n",
@@ -5233,29 +4535,20 @@ fn a_terminate_signal_stops_the_run_and_its_services() {
         ),
         &[&service],
     );
-    assert_eq!(code, Some(143));
-    assert!(
-        alive.is_empty(),
-        "still running after the signal: {alive:?}"
-    );
 }
 
 #[test]
 fn a_hang_up_stops_the_run_and_its_services() {
     let service = temp_path("hung-up.pid");
-    let (code, alive) = signal_when_started(
+    stopped_by(
         "-HUP",
+        129,
         "hung-up",
         &format!(
             "start idle = echo $$ > {} && exec sleep 300\nwait 30s\n",
             service.display()
         ),
         &[&service],
-    );
-    assert_eq!(code, Some(129));
-    assert!(
-        alive.is_empty(),
-        "still running after the signal: {alive:?}"
     );
 }
 
@@ -5273,7 +4566,7 @@ fn a_hang_up_the_run_was_told_to_ignore_does_not_stop_it() {
     )
     .unwrap();
     let mut command = command(None);
-    command.arg(&script);
+    command.arg(&script).stdout(Stdio::null());
     unsafe {
         command.pre_exec(|| {
             libc::signal(libc::SIGHUP, libc::SIG_IGN);
@@ -5294,7 +4587,9 @@ fn a_hang_up_the_run_was_told_to_ignore_does_not_stop_it() {
 #[test]
 fn an_interrupt_while_a_service_stops_still_kills_it() {
     let service = temp_path("stopping.pid");
-    let (code, alive) = interrupt_when_started(
+    stopped_by(
+        "-INT",
+        130,
         "interrupted-stop",
         &format!(
             "start stubborn = sh -c 'trap \"\" TERM; sleep 2; sleep 77 & echo $! > {}; wait'\nwait 1s\n",
@@ -5302,28 +4597,20 @@ fn an_interrupt_while_a_service_stops_still_kills_it() {
         ),
         &[&service],
     );
-    assert_eq!(code, Some(130));
-    assert!(
-        alive.is_empty(),
-        "still running after the interrupt: {alive:?}"
-    );
 }
 
 #[test]
 fn an_interrupt_stops_a_service_still_waiting_to_answer() {
     let child = temp_path("waiting.pid");
-    let (code, alive) = interrupt_when_started(
+    stopped_by(
+        "-INT",
+        130,
         "interrupted-start",
         &format!(
             "start web = sleep 300 & echo $! > {}; wait at http://127.0.0.1:9/\n",
             child.display()
         ),
         &[&child],
-    );
-    assert_eq!(code, Some(130));
-    assert!(
-        alive.is_empty(),
-        "still running after the interrupt: {alive:?}"
     );
 }
 
@@ -5339,8 +4626,7 @@ fn a_service_whose_children_ignore_the_stop_is_killed_when_the_script_ends() {
         ),
     )
     .unwrap();
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
     let pid = std::fs::read_to_string(&pid).unwrap().trim().to_owned();
     let alive = Command::new("kill")
         .args(["-0", &pid])
@@ -5362,8 +4648,7 @@ fn stubborn_services_are_stopped_together() {
         "start first = sh -c 'trap \"\" TERM; exec sleep 77'; echo done\nstart second = sh -c 'trap \"\" TERM; exec sleep 78'; echo done\nwait 1s\n",
     );
     let started = std::time::Instant::now();
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     assert!(started.elapsed() < Duration::from_secs(9), "{report}");
 }
 
@@ -5401,28 +4686,15 @@ fn an_interrupt_stops_a_run_waiting_for_its_script_on_stdin() {
 #[tokio::test]
 async fn a_service_whose_address_already_answers_does_not_start() {
     let busy = site(&[("/", "old server")]).await;
-    let script = script(
-        "taken-address",
-        "",
-        &format!("start web = sleep 30 at {}/\n", busy.uri()),
-    );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(
-        report["error"]
-            .as_str()
-            .unwrap()
-            .contains("already answers"),
-        "{report}"
-    );
-
+    let script = site_script("taken-address", &busy, "start web = sleep 30 at SITE/\n");
+    let report = exits(2, act(&script, None, false));
+    has(&report, "/error", "already answers");
     let bare = self::script(
         "bare-address",
         "",
         "with hub = localhost:5793\nstart web = sleep 30 at $hub\n",
     );
-    let (output, report) = act(&bare, None, false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
+    let report = exits(2, act(&bare, None, false));
     assert!(
         report["error"]
             .as_str()
@@ -5439,8 +4711,7 @@ fn the_folder_for_logs_and_zips_is_private() {
         "",
         "run ls -ld \"${TMPDIR:-/tmp}\"/iu2u-act-$PPID\nsee \"drwx------\"\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[test]
@@ -5451,8 +4722,7 @@ fn a_command_leaves_nothing_running_behind_it() {
         "",
         &format!("run sleep 300 & echo $! > {} within 5s\n", pid.display()),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     assert!(
         report["steps"][0]["seconds"].as_f64().unwrap() < 2.0,
         "{report}"
@@ -5488,8 +4758,7 @@ fn a_service_that_stops_before_it_answers_shows_what_it_said() {
             "",
             &format!("start quiet = {command} at http://127.0.0.1:{port}/\n"),
         );
-        let (output, report) = act(&script, None, false);
-        assert_eq!(output.status.code(), Some(2), "{report}");
+        let report = exits(2, act(&script, None, false));
         assert!(
             report["error"]
                 .as_str()
@@ -5521,8 +4790,7 @@ fn each_request_opens_its_own_connection() {
             server.display()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[test]
@@ -5546,8 +4814,7 @@ fn see_within_keeps_asking_while_the_server_is_down_for_a_moment() {
             server.display()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -5557,16 +4824,12 @@ async fn see_reads_the_page_address_but_not_where_links_point() {
         "<!doctype html><a href=\"/logout?next=/login\">Sign out</a>",
     )])
     .await;
-    let script = script(
+    let script = site_script(
         "addresses",
-        "",
-        &format!(
-            "open {uri}/app?tab=2\nsee no \"login\" within 0s\nsee \"{uri}/app\"\nsee \"tab=2\"\nsee no \"{uri}/logout\" within 0s\nsee no \"?next=/login\" within 0s\n",
-            uri = site.uri()
-        ),
+        &site,
+        "open SITE/app?tab=2\nsee no \"login\" within 0s\nsee \"SITE/app\"\nsee \"tab=2\"\nsee no \"SITE/logout\" within 0s\nsee no \"?next=/login\" within 0s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -5584,25 +4847,20 @@ async fn a_claim_on_a_response_replays_on_another_day() {
         .mount(&api)
         .await;
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
-    let script = script(
+    answer_always(&model, verdict(0.95)).await;
+    let script = site_script(
         "dated",
-        "",
-        &format!(
-            "request GET {}/health\nexpect the service is healthy\n",
-            api.uri()
-        ),
+        &api,
+        "request GET SITE/health\nexpect the service is healthy\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     api.reset().await;
     Mock::given(method("GET"))
         .and(path("/health"))
         .respond_with(answer("Fri"))
         .mount(&api)
         .await;
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
+    replays(&script);
 }
 
 #[tokio::test]
@@ -5622,8 +4880,7 @@ async fn a_broken_json_body_is_sent_as_written() {
             api.uri()
         ),
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[tokio::test]
@@ -5634,16 +4891,12 @@ async fn within_never_sends_a_post_again() {
         .respond_with(ResponseTemplate::new(500).set_body_string("busy"))
         .mount(&api)
         .await;
-    let script = script(
+    let script = site_script(
         "post-within",
-        "",
-        &format!(
-            "request POST {}/orders\nsee \"HTTP 201\" within 30s\n",
-            api.uri()
-        ),
+        &api,
+        "request POST SITE/orders\nsee \"HTTP 201\" within 30s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, false));
     assert_eq!(api.received_requests().await.unwrap().len(), 1);
     assert!(
         report["steps"][1]["seconds"].as_f64().unwrap() < 1.0,
@@ -5661,21 +4914,16 @@ async fn a_claim_without_within_sends_its_request_once() {
     };
     created("first").up_to_n_times(1).mount(&api).await;
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
-    let script = script(
+    answer_always(&model, verdict(0.95)).await;
+    let script = site_script(
         "post-once",
-        "",
-        &format!(
-            "request POST {}/orders\nexpect the order was created\n",
-            api.uri()
-        ),
+        &api,
+        "request POST SITE/orders\nexpect the order was created\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     api.reset().await;
     created("second").mount(&api).await;
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(1), "{report}");
+    exits(1, act(&script, None, true));
     assert_eq!(api.received_requests().await.unwrap().len(), 1);
 }
 
@@ -5697,28 +4945,16 @@ async fn a_locked_claim_within_asks_a_response_again() {
             .await;
     };
     job().await;
-    let model = mock([
-        ("finished", json!({ "holds": yes(0.95), "sight": yes(0.0) })),
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.05), "sight": yes(0.0) }),
-        ),
-    ])
-    .await;
-    let script = script(
+    let model = mock([("finished", verdict(0.95)), ("\"holds\"", verdict(0.05))]).await;
+    let script = site_script(
         "locked-poll",
-        "",
-        &format!(
-            "request GET {}/job\nexpect the job is complete within 10s\n",
-            api.uri()
-        ),
+        &api,
+        "request GET SITE/job\nexpect the job is complete within 10s\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
     api.reset().await;
     job().await;
-    let (locked, report) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{report}");
+    replays(&script);
 }
 
 #[tokio::test]
@@ -5736,16 +4972,12 @@ async fn see_within_asks_a_response_again_until_it_shows_the_text() {
         .respond_with(ResponseTemplate::new(200).set_body_string("{\"status\":\"ok\"}"))
         .mount(&api)
         .await;
-    let script = script(
+    let script = site_script(
         "poll-response",
-        "",
-        &format!(
-            "request GET {}/build\nsee \"building\"\nsee \"ok\" within 10s\nsee no \"building\"\nsee \"never\" within 1s\n",
-            api.uri()
-        ),
+        &api,
+        "request GET SITE/build\nsee \"building\"\nsee \"ok\" within 10s\nsee no \"building\"\nsee \"never\" within 1s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, false));
     let steps = report["steps"].as_array().unwrap();
     assert_eq!(steps[2]["status"], "passed", "{report}");
     assert_eq!(steps[4]["status"], "failed", "{report}");
@@ -5771,21 +5003,17 @@ async fn a_response_asked_again_never_outlasts_within() {
         )
         .mount(&api)
         .await;
-    let script = script(
+    let script = site_script(
         "slow-poll",
-        "",
-        &format!("request GET {}/build\nsee \"ok\" within 1s\n", api.uri()),
+        &api,
+        "request GET SITE/build\nsee \"ok\" within 1s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, false));
     assert!(
         report["steps"][1]["seconds"].as_f64().unwrap() < 5.0,
         "{report}"
     );
-    assert!(
-        report["screen"].as_str().unwrap().contains("building"),
-        "{report}"
-    );
+    has(&report, "/screen", "building");
 }
 
 #[test]
@@ -5795,8 +5023,7 @@ fn requests_that_fail_show_on_the_screen() {
         "<!doctype html><p>Gallery</p><img alt=\"Missing\" src=\"http://127.0.0.1:9/missing.png?at=1\"><img alt=\"Retried\" src=\"http://127.0.0.1:9/missing.png?at=1&retry=1\">",
         "open PAGE\nsee \"failed: http://127.0.0.1:9/missing.png\" within 5s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     let screen = report["screen"].as_str().unwrap();
     assert_eq!(
         screen
@@ -5817,16 +5044,12 @@ async fn failed_requests_go_with_the_page_that_made_them() {
         ),
     ])
     .await;
-    let script = script(
+    let script = site_script(
         "failures-go",
-        "",
-        &format!(
-            "open {uri}/b\nopen {uri}/a\nsee \"failed: http://127.0.0.1:9/logo.png\" within 5s\nback\nsee \"Page B\"\nsee no \"failed:\" within 0s\n",
-            uri = site.uri()
-        ),
+        &site,
+        "open SITE/b\nopen SITE/a\nsee \"failed: http://127.0.0.1:9/logo.png\" within 5s\nback\nsee \"Page B\"\nsee no \"failed:\" within 0s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    runs(&script);
 }
 
 #[test]
@@ -5836,8 +5059,7 @@ fn failed_requests_show_in_the_order_of_their_addresses() {
         "<!doctype html><p>Gallery</p><img alt=\"Second\" src=\"http://127.0.0.1:9/second.png\"><script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<img alt=\"First\" src=\"http://127.0.0.1:9/first.png\">'), 300);</script>",
         "open PAGE\nsee \"failed: http://127.0.0.1:9/first.png\" within 5s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = runs(&script);
     let screen = report["screen"].as_str().unwrap();
     assert!(
         screen.find("failed: http://127.0.0.1:9/first.png")
@@ -5853,35 +5075,26 @@ fn a_text_that_see_no_saw_go_is_not_seen_again() {
         "<!doctype html><p id=\"item\">Item A</p><script>setTimeout(() => item.remove(), 1000)</script>",
         "open PAGE\nsee no \"Item A\" within 5s\nsee \"Item A\" within 0s\n",
     );
-    let (output, report) = act(&script, None, false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, false));
     assert_eq!(report["steps"][2]["status"], "failed", "{report}");
 }
 
 #[tokio::test]
 async fn a_message_that_went_is_still_seen_after_a_long_wait() {
-    let model = mock([
-        ("Saved", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Saved").await;
     let script = script(
         "long-toast",
         "<!doctype html><button onclick=\"toast.textContent = 'Saved'; setTimeout(() => toast.textContent = '', 1000); setTimeout(() => out.textContent = 'Done', 7000)\">Save</button><p id=\"toast\" role=\"status\"></p><p id=\"out\"></p>",
         "open PAGE\ndo save\nsee \"Done\" within 15s\nsee \"Saved\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
 async fn see_counts_a_message_that_showed_and_went_since_the_last_action() {
     let model = mock_after(
         Duration::from_millis(1500),
-        [
-            ("Account split", decision("done", "001", "001")),
-            ("", decision("press", "001", "001")),
-        ],
+        [("Account split", does("done")), ("", does("press"))],
     )
     .await;
     let script = script(
@@ -5889,8 +5102,7 @@ async fn see_counts_a_message_that_showed_and_went_since_the_last_action() {
         "<!doctype html><button onclick=\"toast.textContent = 'Account split'; setTimeout(() => toast.textContent = '', 1000)\">Split</button><p id=\"toast\" role=\"status\"></p>",
         "open PAGE\ndo split the account\nsee \"Account split\"\nsee no \"Account split\"\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[test]
@@ -5979,7 +5191,7 @@ fn the_results_show_each_step_the_failing_line_of_its_script_and_the_totals() {
 #[tokio::test]
 async fn the_results_say_how_much_the_model_saw_for_a_claim_that_holds() {
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.95)).await;
     let (output, shown) = shown(&[&long_claim("long-readable")], Some(&model), false);
     assert_eq!(output.status.code(), Some(0), "{shown}");
     assert!(
@@ -5994,7 +5206,7 @@ async fn the_results_say_how_much_the_model_saw_for_a_claim_that_holds() {
 #[tokio::test]
 async fn the_results_mark_an_unsure_claim_and_say_what_a_pass_needs() {
     let model = MockServer::start().await;
-    answer_always(&model, json!({ "holds": yes(0.74996), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.74996)).await;
     let script = script(
         "unsure",
         "<!doctype html><p>Hello</p>",
@@ -6015,7 +5227,7 @@ async fn the_results_mark_an_unsure_claim_and_say_what_a_pass_needs() {
 #[tokio::test]
 async fn a_model_request_that_times_out_is_sent_again() {
     let model = MockServer::start().await;
-    let holds = json!({ "holds": yes(0.95), "sight": yes(0.0) });
+    let holds = verdict(0.95);
     Mock::given(method("POST"))
         .respond_with(reply(holds.clone()).set_delay(Duration::from_secs(3)))
         .up_to_n_times(1)
@@ -6048,14 +5260,13 @@ async fn a_model_request_answered_with_a_server_error_is_sent_again() {
         .with_priority(1)
         .mount(&model)
         .await;
-    answer_always(&model, json!({ "holds": yes(0.95), "sight": yes(0.0) })).await;
+    answer_always(&model, verdict(0.95)).await;
     let script = script(
         "retried-502",
         "<!doctype html><p>Hello</p>",
         "open PAGE\nexpect the page says hello\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(report["model_calls"], 2, "{report}");
 }
 
@@ -6091,15 +5302,8 @@ async fn the_json_report_keeps_every_character_the_model_server_sent() {
         "<!doctype html><p>Hello</p>",
         "open PAGE\nexpect the page says hello\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
-    assert!(
-        report["error"]
-            .as_str()
-            .unwrap()
-            .contains("bad \u{7f} body"),
-        "{report}"
-    );
+    let report = exits(2, act(&script, Some(&model), false));
+    has(&report, "/error", "bad \u{7f} body");
     assert_eq!(model.received_requests().await.unwrap().len(), 1);
 }
 
@@ -6118,7 +5322,7 @@ fn the_results_are_colored_when_colors_are_forced() {
 #[tokio::test]
 async fn one_of_several_identical_controls_replays_locked() {
     let model = mock([
-        ("pressed", decision("done", "001", "001")),
+        ("pressed", does("done")),
         ("", decision("press", "001", "003")),
     ])
     .await;
@@ -6127,15 +5331,12 @@ async fn one_of_several_identical_controls_replays_locked() {
         &todos(&["Milk", "Eggs", "Bread"]),
         "open PAGE\ndo delete the milk\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"][0],
         "pressed button \"Delete\" · in \"Todos\" · 1 of 3"
     );
-
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
+    let replayed = replays(&script);
     assert_eq!(vias(&replayed), ["browser", "replay"]);
     let screen = replayed["screen"].as_str().unwrap();
     assert!(
@@ -6151,8 +5352,7 @@ fn a_step_missing_from_the_lock_fails_a_locked_run_and_says_so() {
         "<!doctype html><p>Hello</p>",
         "open PAGE\nexpect the page says hello\n",
     );
-    let (output, report) = act(&script, None, true);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, None, true));
     assert!(
         report["steps"][1]["detail"]
             .as_str()
@@ -6166,40 +5366,35 @@ async fn act_waits_out_a_screen_that_is_still_loading_and_replays_it_locked() {
     let model = mock_after(
         Duration::from_millis(400),
         [
-            ("Finished", decision("done", "001", "001")),
-            ("Loading", decision("wait", "001", "001")),
-            ("", decision("press", "001", "001")),
+            ("Finished", does("done")),
+            ("Loading", does("wait")),
+            ("", does("press")),
         ],
     )
     .await;
     let page = r#"<!doctype html><button onclick="out.textContent = 'Loading'; setTimeout(() => { out.textContent = 'Finished'; setTimeout(() => { out.textContent = 'Expired'; }, 4000); }, 8000)">Save</button><p id="out"></p>"#;
     let script = script("slow", page, "open PAGE\ndo save the draft\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     let actions = report["steps"][1]["actions"].as_array().unwrap();
     assert!(actions.iter().filter(|action| *action == "waited").count() >= 2);
-
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
+    let replayed = replays(&script);
     assert_eq!(vias(&replayed), ["browser", "replay"]);
 
     edit_page(&script, "}, 8000)", "}, 0)");
-    let (fast, replayed) = act(&script, None, true);
-    assert_eq!(fast.status.code(), Some(0), "{replayed}");
+    replays(&script);
 }
 
 #[tokio::test]
 async fn waiting_does_not_use_up_the_actions_of_a_goal() {
     let model = mock([
-        ("Finished", decision("done", "001", "001")),
-        ("Loading", decision("wait", "001", "001")),
-        ("", decision("press", "001", "001")),
+        ("Finished", does("done")),
+        ("Loading", does("wait")),
+        ("", does("press")),
     ])
     .await;
     let page = r#"<!doctype html><button onclick="let n = 0; out.textContent = 'Loading 0'; const tick = setInterval(() => { n += 1; out.textContent = n < 24 ? 'Loading ' + n : 'Finished'; if (n >= 24) clearInterval(tick); }, 600);">Export</button><p id="out"></p>"#;
     let script = script("export", page, "open PAGE\ndo export the report\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     let waits = report["steps"][1]["actions"]
         .as_array()
         .unwrap()
@@ -6209,8 +5404,7 @@ async fn waiting_does_not_use_up_the_actions_of_a_goal() {
     assert!(waits >= 15, "{report}");
 
     edit_page(&script, "'Finished'", "'Broken'");
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(1), "{replayed}");
+    let replayed = exits(1, act(&script, None, true));
     assert!(replayed["seconds"].as_f64().unwrap() < 60.0, "{replayed}");
     let lock = std::fs::read_to_string(format!("{}.lock", script.display())).unwrap();
     assert!(lock.contains("\"ms\""), "{lock}");
@@ -6219,15 +5413,14 @@ async fn waiting_does_not_use_up_the_actions_of_a_goal() {
 #[tokio::test]
 async fn a_progress_display_that_never_stops_changing_is_waited_out() {
     let model = mock([
-        ("Exported", decision("done", "001", "001")),
-        ("%", decision("wait", "001", "001")),
-        ("", decision("press", "001", "001")),
+        ("Exported", does("done")),
+        ("%", does("wait")),
+        ("", does("press")),
     ])
     .await;
     let page = r#"<!doctype html><button onclick="let n = 0; const tick = setInterval(() => { n += 1; out.textContent = n < 60 ? n + '%' : 'Exported'; if (n >= 60) clearInterval(tick); }, 100);">Export</button><p id="out"></p>"#;
     let script = script("progress", page, "open PAGE\ndo export the report\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert!(report["model_calls"].as_u64().unwrap() < 10, "{report}");
 }
 
@@ -6235,13 +5428,12 @@ async fn a_progress_display_that_never_stops_changing_is_waited_out() {
 async fn an_error_mid_script_keeps_what_was_already_done() {
     let model = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(reply(decision("type", "001", "001")))
+        .respond_with(reply(does("type")))
         .up_to_n_times(3)
         .mount(&model)
         .await;
     common::fail_always(&model, 503).await;
-    let (output, report) = act(&shop("midway"), Some(&model), false);
-    assert_eq!(output.status.code(), Some(2), "{report}");
+    let report = exits(2, act(&shop("midway"), Some(&model), false));
     assert_eq!(report["status"], "error");
     assert_eq!(report["steps"][0]["status"], "passed");
     assert_eq!(report["steps"][1]["status"], "error");
@@ -6252,10 +5444,7 @@ async fn an_error_mid_script_keeps_what_was_already_done() {
             .starts_with("typed \"qa@example.com\""),
         "{report}"
     );
-    assert!(
-        report["error"].as_str().unwrap().contains("line 3"),
-        "{report}"
-    );
+    has(&report, "/error", "line 3");
     assert!(
         report["error"].as_str().unwrap().ends_with(&format!(
             ": {}",
@@ -6270,41 +5459,35 @@ async fn a_locked_replay_waits_for_a_control_that_shows_up_late() {
     let model = mock_after(
         Duration::from_millis(700),
         [
-            ("Published", decision("done", "001", "001")),
+            ("Published", does("done")),
             ("Publish", decision("press", "002", "001")),
-            ("pressed", decision("wait", "001", "001")),
-            ("", decision("press", "001", "001")),
+            ("pressed", does("wait")),
+            ("", does("press")),
         ],
     )
     .await;
     let page = r#"<!doctype html><button onclick="setTimeout(() => { publish.hidden = false; }, 1500)">Save</button><button id="publish" hidden onclick="out.textContent = 'Published'">Publish</button><p id="out"></p>"#;
     let script = script("late", page, "open PAGE\ndo save and then publish\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
+    passes(&script, &model);
+    let replayed = replays(&script);
     assert_eq!(vias(&replayed), ["browser", "replay"]);
-
-    let (unlocked, replayed) = act(&script, Some(&model), false);
-    assert_eq!(unlocked.status.code(), Some(0), "{replayed}");
+    let replayed = passes(&script, &model);
     assert_eq!(replayed["model_calls"], 0, "{replayed}");
 }
 
 async fn stopped(name: &str, page: &str, model: &MockServer) -> String {
     let script = script(name, page, "open PAGE\ndo reach the goal\n");
-    let (output, report) = act(&script, Some(model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(model), false));
     report["steps"][1]["detail"].as_str().unwrap().into()
 }
 
 #[tokio::test]
 async fn a_step_stops_when_the_model_repeats_itself_gives_up_or_stays_unsure() {
-    let mut unsure = decision("press", "001", "001");
+    let mut unsure = does("press");
     unsure["operation"] = json!({ "type": "choice", "choice": "press", "confidence": 0.4, "probabilities": { "press": 0.4, "done": 0.35, "none": 0.25 } });
     for (name, answers, detail) in [
-        ("repeat", decision("press", "001", "001"), "would repeat"),
-        ("stuck", decision("stuck", "001", "001"), "sees no way"),
+        ("repeat", does("press"), "would repeat"),
+        ("stuck", does("stuck"), "sees no way"),
         ("unsure", unsure, "unsure which operation"),
     ] {
         let model = mock([("", answers)]).await;
@@ -6315,7 +5498,7 @@ async fn a_step_stops_when_the_model_repeats_itself_gives_up_or_stays_unsure() {
 
 #[tokio::test]
 async fn a_step_stops_after_too_many_actions() {
-    let model = mock([("", decision("press", "001", "001"))]).await;
+    let model = mock([("", does("press"))]).await;
     let page = r#"<!doctype html><button onclick="this.textContent = 'Count ' + ++count">Count 0</button><script>let count = 0;</script>"#;
     let detail = stopped("many", page, &model).await;
     assert!(detail.contains("more than 15 actions"), "{detail}");
@@ -6323,15 +5506,10 @@ async fn a_step_stops_after_too_many_actions() {
 
 #[tokio::test]
 async fn a_goal_may_take_exactly_the_most_actions() {
-    let model = mock([
-        ("Count 15", decision("done", "001", "001")),
-        ("", decision("press", "001", "001")),
-    ])
-    .await;
+    let model = pressing("Count 15").await;
     let page = r#"<!doctype html><button onclick="this.textContent = 'Count ' + ++count">Count 0</button><script>let count = 0;</script>"#;
     let script = script("fifteen", page, "open PAGE\ndo count to fifteen\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(report["steps"][1]["actions"].as_array().unwrap().len(), 15);
 }
 
@@ -6348,7 +5526,7 @@ fn locked_needs_script_files() {
 
 #[tokio::test]
 async fn a_failed_step_on_a_crowded_screen_says_which_controls_were_left_out() {
-    let model = mock([("", decision("stuck", "001", "001"))]).await;
+    let model = mock([("", does("stuck"))]).await;
     let links: String = (0..260)
         .map(|index| format!("<a href=\"#{index}\">Link {index}</a>"))
         .collect();
@@ -6362,7 +5540,7 @@ async fn a_failed_step_on_a_crowded_screen_says_which_controls_were_left_out() {
 
 #[tokio::test]
 async fn a_failed_step_on_a_long_screen_says_how_much_the_model_saw() {
-    let model = mock([("", decision("stuck", "001", "001"))]).await;
+    let model = mock([("", does("stuck"))]).await;
     let items: String = (1..=400)
         .map(|item| format!("<p>Item {item} costs ${}</p>", 1000 - item))
         .collect();
@@ -6378,7 +5556,7 @@ async fn a_failed_step_on_a_long_screen_says_how_much_the_model_saw() {
 
 #[tokio::test]
 async fn a_step_stops_after_too_many_decisions() {
-    let model = mock([("", decision("wait", "001", "001"))]).await;
+    let model = mock([("", does("wait"))]).await;
     let page = r#"<!doctype html><p id="tick">Tick 0</p><button>Pay</button><script>let count = 0; setInterval(() => tick.textContent = 'Tick ' + ++count, 400);</script>"#;
     let detail = stopped("decisions", page, &model).await;
     assert!(detail.contains("not reached in 30 decisions"), "{detail}");
@@ -6386,11 +5564,7 @@ async fn a_step_stops_after_too_many_decisions() {
 
 #[tokio::test]
 async fn scrolling_a_page_that_cannot_scroll_moves_the_box_that_can() {
-    let model = mock([
-        ("Box end", decision("done", "001", "001")),
-        ("", decision("scroll", "001", "001")),
-    ])
-    .await;
+    let model = mock([("Box end", does("done")), ("", does("scroll"))]).await;
     let terms: String = (0..60)
         .map(|index| format!("<p>Term {index}</p>"))
         .collect();
@@ -6402,17 +5576,12 @@ async fn scrolling_a_page_that_cannot_scroll_moves_the_box_that_can() {
         &page,
         "open PAGE\ndo read the terms to the end\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
 async fn scrolling_moves_the_page_rather_than_a_side_box() {
-    let model = mock([
-        ("Page scrolled", decision("done", "001", "001")),
-        ("", decision("scroll", "001", "001")),
-    ])
-    .await;
+    let model = mock([("Page scrolled", does("done")), ("", does("scroll"))]).await;
     let links: String = (0..100)
         .map(|index| format!("<p>Chapter {index}</p>"))
         .collect();
@@ -6424,8 +5593,7 @@ async fn scrolling_moves_the_page_rather_than_a_side_box() {
         &page,
         "open PAGE\ndo read further down the article\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert!(
         !report["screen"]
             .as_str()
@@ -6437,11 +5605,7 @@ async fn scrolling_moves_the_page_rather_than_a_side_box() {
 
 #[tokio::test]
 async fn scrolling_moves_the_open_list_rather_than_the_page() {
-    let model = mock([
-        ("List end", decision("done", "001", "001")),
-        ("", decision("scroll", "001", "001")),
-    ])
-    .await;
+    let model = mock([("List end", does("done")), ("", does("scroll"))]).await;
     let options: String = (0..100)
         .map(|index| format!("<div role=\"option\">Issue {index}</div>"))
         .collect();
@@ -6453,8 +5617,7 @@ async fn scrolling_moves_the_open_list_rather_than_the_page() {
         &page,
         "open PAGE\ndo show the last issue of the list\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     let actions = report["steps"][1]["actions"].as_array().unwrap();
     assert!(actions.len() > 1, "{report}");
     assert!(
@@ -6465,39 +5628,26 @@ async fn scrolling_moves_the_open_list_rather_than_the_page() {
 
 #[tokio::test]
 async fn scrolling_moves_a_frame_that_fills_the_page() {
-    let model = mock([
-        ("Frame scrolled", decision("done", "001", "001")),
-        ("", decision("scroll", "001", "001")),
-    ])
-    .await;
+    let model = mock([("Frame scrolled", does("done")), ("", does("scroll"))]).await;
     let page = r#"<!doctype html><body style="margin: 0"><iframe style="display: block; width: 100%; height: 100vh; border: 0" srcdoc="<p id='out'>Top</p><div style='height: 5000px'></div><script>onscroll = () => out.textContent = 'Frame scrolled'</script>"></iframe></body>"#;
     let script = script(
         "frame-scroll",
         page,
         "open PAGE\ndo scroll down the document\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-
+    passes(&script, &model);
     let short = self::script(
         "short-frame",
         r#"<!doctype html><body style="margin: 0"><iframe style="display: block; width: 100%; height: 100vh; border: 0" srcdoc="<p>Nothing more</p>"></iframe></body>"#,
         "open PAGE\ndo scroll down the document\n",
     );
-    let (output, report) = act(&short, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
-    assert!(
-        report["steps"][1]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("unchanged screen"),
-        "{report}"
-    );
+    let report = exits(1, act(&short, Some(&model), false));
+    has(&report, "/steps/1/detail", "unchanged screen");
 }
 
 #[tokio::test]
 async fn scrolling_a_frame_from_another_site_stops_on_the_repeat() {
-    let model = mock([("", decision("scroll", "001", "001"))]).await;
+    let model = mock([("", does("scroll"))]).await;
     let site = site(&[("/frame", "<!doctype html><p>Nothing more</p>")]).await;
     let port = site.address().port();
     Mock::given(method("GET"))
@@ -6513,8 +5663,7 @@ async fn scrolling_a_frame_from_another_site_stops_on_the_repeat() {
         "",
         &format!("open http://127.0.0.1:{port}/app\ndo scroll down the document\n"),
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     assert_eq!(
         report["steps"][1]["detail"], "it would repeat this on an unchanged screen: scrolled down",
         "{report}"
@@ -6523,14 +5672,13 @@ async fn scrolling_a_frame_from_another_site_stops_on_the_repeat() {
 
 #[tokio::test]
 async fn scrolling_with_nothing_left_to_scroll_stops_on_the_repeat() {
-    let model = mock([("", decision("scroll", "001", "001"))]).await;
+    let model = mock([("", does("scroll"))]).await;
     let script = script(
         "unscrollable",
         "<!doctype html><p>Short page</p>",
         "open PAGE\ndo show more of the page\n",
     );
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    let report = exits(1, act(&script, Some(&model), false));
     assert_eq!(
         report["steps"][1]["detail"], "it would repeat this on an unchanged screen: scrolled down",
         "{report}"
@@ -6539,60 +5687,43 @@ async fn scrolling_with_nothing_left_to_scroll_stops_on_the_repeat() {
 
 #[tokio::test]
 async fn escape_closes_an_open_list_and_replays() {
-    let model = mock([
-        ("Profile", decision("done", "001", "001")),
-        ("", decision("escape", "001", "001")),
-    ])
-    .await;
+    let model = mock([("Profile", does("done")), ("", does("escape"))]).await;
     let page = r#"<!doctype html><div id="list" role="listbox" tabindex="-1"><div role="option">Campus 2026</div></div><script>list.focus(); list.addEventListener('keydown', event => { if (event.key === 'Escape') list.outerHTML = '<button>Profile</button>'; });</script>"#;
     let script = script("escape", page, "open PAGE\ndo close the open list\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["actions"][0], "pressed Escape",
         "{report}"
     );
-
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
-    assert!(
-        replayed["screen"].as_str().unwrap().contains("Profile"),
-        "{replayed}"
-    );
+    let replayed = replays(&script);
+    has(&replayed, "/screen", "Profile");
 }
 
 #[tokio::test]
 async fn a_replayed_enter_still_waits_for_the_page_to_be_ready() {
     let model = mock([
-        ("Found", decision("done", "001", "001")),
-        ("Ready", decision("enter", "001", "001")),
-        ("typed", decision("wait", "001", "001")),
-        ("", decision("type", "001", "001")),
+        ("Found", does("done")),
+        ("Ready", does("enter")),
+        ("typed", does("wait")),
+        ("", does("type")),
     ])
     .await;
     let page = r#"<!doctype html><label>Search <input id="query" oninput="clearTimeout(window.ready); out.textContent = 'Wait'; window.ready = setTimeout(() => { out.textContent = 'Ready'; window.readyAt = performance.now(); }, 2000);" onkeydown="if (event.key === 'Enter') { out.textContent = out.textContent !== 'Ready' ? 'Too early' : performance.now() - window.readyAt < 4000 ? 'Found' : 'Too late'; }"></label><p id="out"></p>"#;
     let script = script("ready", page, "open PAGE\ndo search for \"shirts\"\n");
-    let (output, report) = act(&script, Some(&model), false);
-    assert_eq!(output.status.code(), Some(0), "{report}");
-
-    let (locked, replayed) = act(&script, None, true);
-    assert_eq!(locked.status.code(), Some(0), "{replayed}");
-    assert!(
-        replayed["screen"].as_str().unwrap().contains("Found"),
-        "{replayed}"
-    );
+    passes(&script, &model);
+    let replayed = replays(&script);
+    has(&replayed, "/screen", "Found");
 
     edit_page(&script, "}, 2000)", "}, 0)");
-    let (fast, replayed) = act(&script, None, true);
-    assert_eq!(fast.status.code(), Some(0), "{replayed}");
+    replays(&script);
 }
 
 #[tokio::test]
 async fn act_chooses_an_option_showing_a_secret_and_replays_the_choice() {
     let model = mock([
-        ("chose", decision("done", "001", "001")),
+        ("chose", does("done")),
         ("", {
-            let mut large = decision("choose", "001", "001");
+            let mut large = does("choose");
             large["choose_001"] = choice("002");
             large["choose_001_reversed"] = choice("001");
             large
@@ -6605,8 +5736,7 @@ async fn act_chooses_an_option_showing_a_secret_and_replays_the_choice() {
         &page.replace("ACCOUNT", SECRET),
         "open PAGE\nwith account = $IU2U_TEST_SECRET\ndo pick the large size\nsee \"Picked Large\"\n",
     );
-    let (first, report) = act(&script, Some(&model), false);
-    assert_eq!(first.status.code(), Some(0), "{report}");
+    let report = passes(&script, &model);
     assert!(
         report["steps"][1]["actions"][0]
             .as_str()
@@ -6616,9 +5746,7 @@ async fn act_chooses_an_option_showing_a_secret_and_replays_the_choice() {
     );
     let lock = std::fs::read_to_string(format!("{}.lock", script.display())).unwrap();
     assert!(!report.to_string().contains("7f3a") && !lock.contains("7f3a"));
-
-    let (second, replayed) = act(&script, None, true);
-    assert_eq!(second.status.code(), Some(0), "{replayed}");
+    let replayed = replays(&script);
     assert_eq!(vias(&replayed), ["browser", "replay", "check"]);
     assert!(!replayed["screen"].as_str().unwrap().contains("option"));
 }
@@ -6797,7 +5925,11 @@ fn a_mac_app_stopped_while_it_starts_gets_its_accessibility_switch_back() {
     let log = bundle.with_file_name("starting.log");
     let script = temp_path("starting-app.e2e");
     std::fs::write(&script, format!("app {}\n", bundle.display())).unwrap();
-    let mut running = command(None).arg(&script).spawn().unwrap();
+    let mut running = command(None)
+        .arg(&script)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
     while std::fs::read_to_string(&log).ok().as_deref() != Some("true") {
         if running.try_wait().unwrap().is_some() {
             eprintln!("skipped: this process may not use the accessibility API");
@@ -6827,7 +5959,11 @@ fn an_interrupted_mac_app_gets_its_accessibility_switch_back() {
     let log = bundle.with_file_name("interrupted.log");
     let script = temp_path("interrupted-app.e2e");
     std::fs::write(&script, format!("app {}\nwait 30s\n", bundle.display())).unwrap();
-    let mut running = command(None).arg(&script).spawn().unwrap();
+    let mut running = command(None)
+        .arg(&script)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
     while std::fs::read_to_string(&log).ok().as_deref() != Some("true") {
         if running.try_wait().unwrap().is_some() {
             eprintln!("skipped: this process may not use the accessibility API");
@@ -6928,7 +6064,7 @@ app.run()
 #[tokio::test]
 async fn a_mac_app_slow_to_answer_is_still_read_whole() {
     let (bundle, _quit) = mac_app("Slow", SLOW);
-    let model = mock([("", decision("done", "001", "001"))]).await;
+    let model = mock([("", does("done"))]).await;
     let script = temp_path("slow-app.e2e");
     std::fs::write(
         &script,
@@ -7026,20 +6162,16 @@ impl Drop for Quit {
 async fn act_drives_a_mac_app_through_its_accessibility_tree() {
     let (bundle, _quit) = mac_app("Fixture", FIXTURE);
     let model = mock([
-        (
-            "\"holds\"",
-            json!({ "holds": yes(0.95), "sight": yes(0.0) }),
-        ),
+        ("\"holds\"", verdict(0.95)),
         ("locked field", decision("type", "002", "004")),
-        ("echo Ada", decision("done", "001", "001")),
-        ("pressed Enter", decision("wait", "001", "001")),
-        ("typed", decision("enter", "001", "001")),
+        ("echo Ada", does("done")),
+        ("pressed Enter", does("wait")),
+        ("typed", does("enter")),
         ("", decision("type", "001", "005")),
     ])
     .await;
     let script = temp_path("fixture.e2e");
     std::fs::write(&script, format!("app {}\nwith name = Ada\ndo type the name and submit it\nexpect the window shows echo Ada\nsee \"echo Ada\"\n", bundle.display())).unwrap();
-
     let (first, report) = act(&script, Some(&model), false);
     if report["error"]
         .as_str()
@@ -7054,12 +6186,9 @@ async fn act_drives_a_mac_app_through_its_accessibility_tree() {
     for asked in model.received_requests().await.unwrap() {
         assert!(!String::from_utf8_lossy(&asked.body).contains("Point at one control"));
     }
-
-    let (second, replayed) = act(&script, None, true);
-    assert_eq!(second.status.code(), Some(0), "{replayed}");
+    let replayed = replays(&script);
     assert_eq!(vias(&replayed), ["app", "replay", "cache", "check"]);
     assert_eq!(replayed["model_calls"], 0);
-
     let locked = temp_path("locked.e2e");
     std::fs::write(
         &locked,
@@ -7069,24 +6198,16 @@ async fn act_drives_a_mac_app_through_its_accessibility_tree() {
         ),
     )
     .unwrap();
-    let (refused, report) = act(&locked, Some(&model), false);
-    assert_eq!(refused.status.code(), Some(1), "{report}");
-    assert!(
-        report["steps"][1]["actions"][0]
-            .as_str()
-            .unwrap()
-            .contains("cannot take focus"),
-        "{report}"
-    );
+    let report = exits(1, act(&locked, Some(&model), false));
+    has(&report, "/steps/1/actions/0", "cannot take focus");
     assert!(
         !report["screen"].as_str().unwrap().contains("Bob"),
         "{report}"
     );
-
     let code_model = mock([
-        ("code 42", decision("done", "001", "001")),
-        ("pressed Enter", decision("wait", "001", "001")),
-        ("typed", decision("enter", "001", "001")),
+        ("code 42", does("done")),
+        ("pressed Enter", does("wait")),
+        ("typed", does("enter")),
         ("", decision("type", "003", "003")),
     ])
     .await;
@@ -7099,15 +6220,13 @@ async fn act_drives_a_mac_app_through_its_accessibility_tree() {
         ),
     )
     .unwrap();
-    let (typed, report) = act(&keys, Some(&code_model), false);
-    assert_eq!(typed.status.code(), Some(0), "{report}");
+    let report = passes(&keys, &code_model);
     assert!(
         !report["screen"].as_str().unwrap().contains("old"),
         "{report}"
     );
     let manual = std::fs::read_to_string(bundle.with_file_name("manual.log")).unwrap();
     assert_eq!(manual, "true");
-
     let frozen_model = mock([("", decision("type", "004", "002"))]).await;
     let frozen = temp_path("frozen.e2e");
     std::fs::write(
@@ -7118,18 +6237,10 @@ async fn act_drives_a_mac_app_through_its_accessibility_tree() {
         ),
     )
     .unwrap();
-    let (refused, report) = act(&frozen, Some(&frozen_model), false);
-    assert_eq!(refused.status.code(), Some(1), "{report}");
-    assert!(
-        report["steps"][1]["actions"][0]
-            .as_str()
-            .unwrap()
-            .contains("did not take the text"),
-        "{report}"
-    );
-
+    let report = exits(1, act(&frozen, Some(&frozen_model), false));
+    has(&report, "/steps/1/actions/0", "did not take the text");
     let upper_model = mock([
-        ("typed", decision("done", "001", "001")),
+        ("typed", does("done")),
         ("", decision("type", "005", "001")),
     ])
     .await;
@@ -7142,13 +6253,6 @@ async fn act_drives_a_mac_app_through_its_accessibility_tree() {
         ),
     )
     .unwrap();
-    let (applied, report) = act(&coupon, Some(&upper_model), false);
-    assert_eq!(applied.status.code(), Some(0), "{report}");
-    assert!(
-        report["screen"]
-            .as_str()
-            .unwrap()
-            .contains("textbox \"Coupon\" = \"SAVE10\""),
-        "{report}"
-    );
+    let report = passes(&coupon, &upper_model);
+    has(&report, "/screen", "textbox \"Coupon\" = \"SAVE10\"");
 }
