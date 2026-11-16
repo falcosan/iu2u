@@ -1016,7 +1016,7 @@ async fn a_page_that_opens_a_new_tab_keeps_running_in_front() {
     let script = script(
         "newtab",
         page,
-        "open PAGE\ndo open the help\nsee \"Finished while visible and the other tab is hidden, blurred 0 times\"\n",
+        "open PAGE\ndo open the help\nsee \"Finished while visible and the other tab is hidden, blurred 0 times\" within 30s\n",
     );
     passes(&script, &model);
 }
