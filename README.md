@@ -45,7 +45,7 @@ _iu2u. It's up to you._
 
 ## Install
 
-You need **Rust 1.88+**, **Claude Code**, and a **decision-model server**. The server can run locally or be hosted; it must implement `POST /v1/systemone`. Bring its base URL and model name, or use an [adapter](#adapters) for Apple Intelligence or Claude Code. iu2u does not bundle a model.
+You need **Rust 1.88+**, **Claude Code**, and a **decision-model server**. The server can run locally or be hosted; it must implement `POST /v1/systemone`. Bring its base URL and model name, or use the [adapter](#adapters) for Claude Code. iu2u does not bundle a model.
 
 **1. Install the binary.**
 
@@ -292,18 +292,7 @@ Use the server's base URL: iu2u appends `/v1/systemone`. The API key is sent as 
 
 ## Adapters
 
-An adapter lets iu2u ask a model that has no `/v1/systemone` endpoint. Set `IU2U_MODEL`, or the `model` plugin option, to `apple-intelligence`, `claude` or `claude:<model>`; any other name is a model on a System One server, as above. An adapter asks the model, in one request, for the probability of every answer, option or level as JSON. The model states these probabilities itself, so they are not calibrated the way a decision model's are. Adapters take no screenshots and ignore `IU2U_BASE_URL` and `IU2U_API_KEY`. `trim` asks once per 40 lines, up to 200 requests, and `prune` once per step, up to 150, within a two-minute hook limit: apfel can run out of time on the longest outputs and sessions, which then stay as they were.
-
-### Apple Intelligence
-
-Apple's on-device model, through [apfel](https://github.com/Arthur-Ficial/apfel), installed with Homebrew or any tool that puts it on the `PATH`, such as `mise use -g github:Arthur-Ficial/apfel`:
-
-```sh
-brew install apfel
-export IU2U_MODEL="apple-intelligence"
-```
-
-Each request runs `apfel` once, without your `APFEL_` settings, so no server has to be running: in tests a server answered no faster, because the model handles one request at a time. apfel needs macOS 26 with Apple Intelligence turned on. The model reads 4,096 tokens, or 8,192 on macOS 27 with an M3 or later and 12 GB of memory, which is too little for `act`. It also judges commands poorly: in tests it rated `ls -la` and `cat README.md` as irreversible, so the guard blocks harmless commands. Turn the guard off with `IU2U_GUARD=false`, or the `guard` plugin option, when you use this adapter.
+An adapter lets iu2u ask a model that has no `/v1/systemone` endpoint. Set `IU2U_MODEL`, or the `model` plugin option, to `claude` or `claude:<model>`; any other name is a model on a System One server, as above. An adapter asks the model, in one request, for the probability of every answer, option or level as JSON. The model states these probabilities itself, so they are not calibrated the way a decision model's are. Adapters take no screenshots and ignore `IU2U_BASE_URL` and `IU2U_API_KEY`.
 
 ### Claude Code
 
@@ -311,7 +300,7 @@ Each request runs `apfel` once, without your `APFEL_` settings, so no server has
 export IU2U_MODEL="claude"
 ```
 
-Each request runs `claude --print` with your Claude Code login, or with `ANTHROPIC_API_KEY` or your provider's variables set in the environment: an `apiKeyHelper` or `env` in `settings.json` does not apply. It runs on `haiku` at `medium` effort: set `IU2U_MODEL` to `claude:<model>`, such as `claude:sonnet`, for another model, and `IU2U_EFFORT` for another effort. The session loads no user, project or local settings, no plugins, MCP servers, auto memory, `CLAUDE.md` or tools, and iu2u's own hooks stay off inside it even when managed settings load them. Every request takes a few seconds and counts against your Claude plan, or is billed to your API key. The guard makes one for every shell command, proof one per turn and per subagent, and compass one per prompt; `weigh` and `rank` make one per item, up to 500, and `seek` and `lint` one per excerpt, up to 2,000 per call; `filter` makes one per non-empty line, with no limit, and `act` several per step, trying one that times out up to 3 times.
+Each request runs `claude --print` with your Claude Code login, or with `ANTHROPIC_API_KEY` or your provider's variables set in the environment: an `apiKeyHelper` or `env` in `settings.json` does not apply. It runs on `haiku` at `medium` effort: set `IU2U_MODEL` to `claude:<model>`, such as `claude:sonnet`, for another model, and `IU2U_EFFORT` for another effort. The session loads no user, project or local settings, no plugins, MCP servers, auto memory, `CLAUDE.md` or tools, and iu2u's own hooks stay off inside it even when managed settings load them. Every request takes a few seconds and counts against your Claude plan, or is billed to your API key. The guard makes one for every shell command, proof one per turn and per subagent, and compass one per prompt; `weigh` and `rank` make one per item, up to 500, and `seek` and `lint` one per excerpt, up to 2,000 per call; `filter` makes one per non-empty line, with no limit; `trim` one per 40 lines, up to 200, and `prune` one per step, up to 150, within the two-minute hook limit, so output or a session they cannot finish in time stays as it was; and `act` several per step, trying one that times out up to 3 times.
 
 ## Codex
 

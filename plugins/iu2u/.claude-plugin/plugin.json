@@ -25,7 +25,7 @@
     "model": {
       "type": "string",
       "title": "Model",
-      "description": "Model name on that server, or an adapter: apple-intelligence, claude, or claude:<model> such as claude:sonnet",
+      "description": "Model name on that server, or an adapter: claude, or claude:<model> such as claude:sonnet",
       "required": true
     },
     "effort": {

@@ -1,4 +1,3 @@
-mod apple_intelligence;
 mod claude;
 
 use std::collections::BTreeMap;
@@ -21,24 +20,14 @@ const SYSTEM: &str =
     "Judge the state the user sends and answer every question in the requested JSON.";
 
 #[derive(Clone, Debug)]
-pub(super) enum Adapter {
-    AppleIntelligence,
-    Claude { model: String, effort: String },
-}
-
-#[derive(Debug)]
-pub(super) struct Refused(pub(super) String);
-
-impl std::fmt::Display for Refused {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
+pub(super) struct Adapter {
+    model: String,
+    effort: String,
 }
 
 impl Adapter {
     pub(super) fn from_model(model: &str, effort: Option<String>) -> Result<Option<Self>> {
         let model = match model {
-            "apple-intelligence" => return Ok(Some(Self::AppleIntelligence)),
             "claude" => claude::MODEL,
             _ => match model.strip_prefix("claude:") {
                 Some(model) => model,
@@ -55,18 +44,13 @@ impl Adapter {
             "IU2U_EFFORT must be one of {}, not {effort}",
             claude::EFFORTS.join(", ")
         );
-        Ok(Some(Self::Claude {
+        Ok(Some(Self {
             model: model.into(),
             effort,
         }))
     }
 
-    pub(super) fn program(&self) -> &'static str {
-        match self {
-            Self::AppleIntelligence => apple_intelligence::PROGRAM,
-            Self::Claude { .. } => claude::PROGRAM,
-        }
-    }
+    pub(super) const PROGRAM: &str = claude::PROGRAM;
 
     pub(super) async fn ask(
         &self,
@@ -75,12 +59,7 @@ impl Adapter {
         questions: &Questions,
     ) -> Result<Answers> {
         let (prompt, schema) = (prompt(state, questions), schema(questions));
-        let reply = match self {
-            Self::AppleIntelligence => apple_intelligence::reply(timeout, &prompt, &schema).await?,
-            Self::Claude { model, effort } => {
-                claude::reply(model, effort, timeout, &prompt, &schema).await?
-            }
-        };
+        let reply = claude::reply(&self.model, &self.effort, timeout, &prompt, &schema).await?;
         answers(questions, &reply).with_context(|| {
             format!(
                 "decision model returned unexpected answers: {}",
@@ -298,16 +277,12 @@ mod tests {
     fn the_model_name_picks_the_adapter() {
         let adapter = |model: &str| Adapter::from_model(model, Some("high".into()));
         assert!(matches!(
-            adapter("apple-intelligence"),
-            Ok(Some(Adapter::AppleIntelligence))
-        ));
-        assert!(matches!(
             adapter("claude"),
-            Ok(Some(Adapter::Claude { model, effort })) if model == "haiku" && effort == "high"
+            Ok(Some(Adapter { model, effort })) if model == "haiku" && effort == "high"
         ));
         assert!(matches!(
             adapter("claude:sonnet"),
-            Ok(Some(Adapter::Claude { model, .. })) if model == "sonnet"
+            Ok(Some(Adapter { model, .. })) if model == "sonnet"
         ));
         assert!(adapter("claude:").is_err());
         for model in ["model-x", "llama3:8b", "claudette"] {

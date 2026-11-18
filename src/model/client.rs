@@ -6,7 +6,7 @@ use futures_util::{StreamExt, stream};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
-use super::adapters::{Adapter, Refused};
+use super::adapters::Adapter;
 use super::protocol::{Answers, Questions, answers_from_wire, questions_to_wire};
 use crate::clip;
 
@@ -59,7 +59,7 @@ impl Client {
                 .build()?,
             endpoint: match &adapter {
                 None => format!("{}/v1/systemone", base_url.trim_end_matches('/')),
-                Some(adapter) => adapter.program().into(),
+                Some(_) => Adapter::PROGRAM.into(),
             },
             api_key: api_key.filter(|key| !key.is_empty()),
             model,
@@ -76,7 +76,7 @@ impl Client {
             None => DEFAULT_TIMEOUT_MS,
         };
         let model = setting("MODEL").context(
-            "set IU2U_MODEL to the model name on your decision model server, or to apple-intelligence or claude",
+            "set IU2U_MODEL to the model name on your decision model server, or to claude",
         )?;
         Self::build(
             Adapter::from_model(&model, setting("EFFORT"))?,
@@ -206,11 +206,10 @@ fn cannot_reach(error: &anyhow::Error) -> bool {
 
 fn rejects_only_this_item(error: &anyhow::Error) -> bool {
     let systemic = [StatusCode::REQUEST_TIMEOUT, StatusCode::TOO_MANY_REQUESTS];
-    error.is::<Refused>()
-        || error
-            .downcast_ref::<reqwest::Error>()
-            .and_then(reqwest::Error::status)
-            .is_some_and(|status| status.is_client_error() && !systemic.contains(&status))
+    error
+        .downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+        .is_some_and(|status| status.is_client_error() && !systemic.contains(&status))
 }
 
 pub(crate) fn timed_out(error: &anyhow::Error) -> bool {
@@ -233,19 +232,13 @@ mod tests {
         assert!(cannot_reach(&missing));
     }
 
-    #[test]
-    fn an_item_the_model_refuses_does_not_stop_a_batch() {
-        let refused = anyhow::Error::msg(Refused("apfel refused this item".into()));
-        assert!(rejects_only_this_item(&refused) && !cannot_reach(&refused));
-    }
-
     #[tokio::test]
     async fn adapters_refuse_screenshots() {
         let client = Client::build(
-            Some(Adapter::AppleIntelligence),
+            Adapter::from_model("claude", None).unwrap(),
             DEFAULT_BASE_URL,
             None,
-            "apple-intelligence".into(),
+            "claude".into(),
             Duration::from_secs(1),
         )
         .unwrap();

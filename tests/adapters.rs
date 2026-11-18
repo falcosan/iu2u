@@ -23,11 +23,11 @@ async fn filter(lines: &str, env: &[(&str, &str)]) -> Output {
 }
 
 #[cfg(unix)]
-fn fake(program: &str, name: &str, script: &str) -> (std::path::PathBuf, String) {
+fn fake_claude(name: &str, script: &str) -> (std::path::PathBuf, String) {
     use std::os::unix::fs::PermissionsExt;
     let dir = common::temp_path(name);
     std::fs::create_dir_all(&dir).unwrap();
-    let program = dir.join(program);
+    let program = dir.join("claude");
     std::fs::write(&program, format!("#!/bin/sh\n{script}")).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     let path = format!("{}:/usr/bin:/bin", dir.display());
@@ -36,95 +36,8 @@ fn fake(program: &str, name: &str, script: &str) -> (std::path::PathBuf, String)
 
 #[cfg(unix)]
 #[tokio::test]
-async fn apple_intelligence_answers_through_apfel_without_a_server() {
-    let (dir, path) = fake(
-        "apfel",
-        "apfel-answers",
-        r#"printf '%s\n' "$@" "mcp=${APFEL_MCP-unset}" > "$0.args"
-while [ $# -gt 1 ]; do [ "$1" = --schema ] && cp "$2" "$0.schema"; shift; done
-case $(cat) in *ERROR*) echo '{"q0": 0.9}' ;; *) echo '{"q0": 0.1}' ;; esac"#,
-    );
-    let output = filter(
-        "INFO started\nERROR refused\n",
-        &[
-            ("IU2U_MODEL", "apple-intelligence"),
-            ("APFEL_MCP", "tools.py"),
-            ("PATH", &path),
-        ],
-    )
-    .await;
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "ERROR refused\n");
-    let args = std::fs::read_to_string(dir.join("apfel.args")).unwrap();
-    let args: Vec<&str> = args.lines().collect();
-    assert!(
-        args.windows(2).any(|pair| pair == ["--temperature", "0"])
-            && args.contains(&"--system")
-            && args.contains(&"mcp=unset"),
-        "{args:?}"
-    );
-    let schema = args[args.iter().position(|arg| *arg == "--schema").unwrap() + 1];
-    assert!(!std::path::Path::new(schema).exists());
-    let schema: Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("apfel.schema")).unwrap()).unwrap();
-    assert_eq!(schema["required"], json!(["q0"]));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn apfel_runs_two_at_a_time_and_its_timeout_starts_on_its_turn() {
-    let (_, path) = fake(
-        "apfel",
-        "apfel-two-at-a-time",
-        r#"cat > /dev/null
-mkdir "$0.1" 2> /dev/null && slot="$0.1" || { mkdir "$0.2" 2> /dev/null && slot="$0.2"; } || { echo 'error: [busy]' >&2; exit 6; }
-sleep 0.3
-rmdir "$slot"
-echo '{"q0": 0.9}'"#,
-    );
-    let lines = "ERROR refused\n".repeat(8);
-    let output = filter(
-        &lines,
-        &[
-            ("IU2U_MODEL", "apple-intelligence"),
-            ("IU2U_TIMEOUT_MS", "1000"),
-            ("PATH", &path),
-        ],
-    )
-    .await;
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        lines,
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn an_item_apfel_refuses_reaches_the_caller() {
-    let (_, path) = fake(
-        "apfel",
-        "apfel-refuses",
-        "echo 'error: [context overflow] Input exceeds the context window' >&2\nexit 4",
-    );
-    let output = filter(
-        "ERROR refused\n",
-        &[("IU2U_MODEL", "apple-intelligence"), ("PATH", &path)],
-    )
-    .await;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr.contains("apfel refused this item: error: [context overflow]"),
-        "{stderr}"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
 async fn claude_answers_in_a_session_that_loads_no_settings_hooks_or_tools() {
-    let (dir, path) = fake(
-        "claude",
+    let (dir, path) = fake_claude(
         "claude-answers",
         r#"printf '%s\n' "$@" "memory=$CLAUDE_CODE_DISABLE_AUTO_MEMORY" "session=$IU2U_ADAPTER_SESSION" "effort=${CLAUDE_CODE_EFFORT_LEVEL-unset}" > "$0.args"
 case $(cat) in *ERROR*) holds=0.9 ;; *) holds=0.1 ;; esac
@@ -167,8 +80,7 @@ echo "{\"is_error\": false, \"structured_output\": {\"q0\": $holds}}""#,
 #[cfg(unix)]
 #[tokio::test]
 async fn a_failed_claude_session_reaches_the_caller() {
-    let (_, path) = fake(
-        "claude",
+    let (_, path) = fake_claude(
         "claude-fails",
         r#"echo '{"is_error": true, "result": "Not logged in · Please run /login"}'
 exit 1"#,
@@ -186,7 +98,7 @@ exit 1"#,
 #[cfg(unix)]
 #[tokio::test]
 async fn a_claude_session_that_hangs_is_stopped_at_the_timeout() {
-    let (_, path) = fake("claude", "claude-hangs", "exec sleep 30");
+    let (_, path) = fake_claude("claude-hangs", "exec sleep 30");
     let started = std::time::Instant::now();
     let output = filter(
         "ERROR refused\n",
