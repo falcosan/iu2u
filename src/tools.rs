@@ -4,13 +4,13 @@ mod rank;
 mod seek;
 mod weigh;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
-use crate::model::Answers;
+use crate::model::{Answers, Question, Questions};
 use excerpts::{Excerpt, excerpts};
 
 pub use lint::{LintParams, lint};
@@ -20,6 +20,8 @@ pub use weigh::{WeighParams, weigh};
 
 const MAX_ITEMS: usize = 500;
 const MAX_QUESTIONS: usize = 50;
+const MAX_OPTIONS: usize = 255;
+const MAX_LEVELS: usize = 10;
 const MAX_FILE_BYTES: u64 = 1 << 20;
 const MATCH_AT: f64 = 0.5;
 const EXCERPT_CHARS: usize = 2000;
@@ -34,6 +36,26 @@ fn bounded(what: &str, count: usize, max: usize) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn answerable(questions: &Questions) -> Result<(), String> {
+    questions.iter().try_for_each(|(id, question)| {
+        let (choices, count, max) = match question {
+            Question::Yesno { .. } => return Ok(()),
+            Question::Pick { options, .. } => ("options", options.len(), MAX_OPTIONS),
+            Question::Scale { levels, .. } => {
+                if levels.iter().collect::<HashSet<_>>().len() < levels.len() {
+                    return Err(format!("{id} needs distinct levels"));
+                }
+                ("levels", levels.len(), MAX_LEVELS)
+            }
+        };
+        if (2..=max).contains(&count) {
+            Ok(())
+        } else {
+            Err(format!("{id} needs 2 to {max} {choices}, got {count}"))
+        }
+    })
 }
 
 fn something_judged(results: &[anyhow::Result<Answers>]) -> Result<(), String> {

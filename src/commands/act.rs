@@ -23,7 +23,7 @@ use futures_util::future::join_all;
 use serde_json::{Value, json};
 
 use crate::clip;
-use crate::model::{Answers, Client, Questions, setting};
+use crate::model::{Answers, Client, Questions, setting, timed_out};
 use browser::{Browser, Handling, file_names};
 use decide::{Decision, Input, Verdict};
 use lock::{Lock, Move, Recorded, Replay};
@@ -428,13 +428,13 @@ fn keeps_response(step: &Step) -> bool {
 }
 
 fn transient(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
-        error.is_timeout()
-            || error.is_connect()
-            || error.status().is_some_and(|status| {
-                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-            })
-    })
+    timed_out(error)
+        || error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error.is_connect()
+                || error.status().is_some_and(|status| {
+                    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                })
+        })
 }
 
 fn seconds(since: Instant) -> f64 {
@@ -1741,5 +1741,14 @@ mod tests {
         assert_eq!(percent(0.58), 58);
         assert_eq!(percent(0.74996), 74);
         assert_eq!(percent(decide::HOLDS_AT), 75);
+    }
+
+    #[tokio::test]
+    async fn a_model_that_answers_too_late_is_retried_whatever_runs_it() {
+        let late = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .context("claude did not answer")
+            .unwrap_err();
+        assert!(transient(&late));
     }
 }

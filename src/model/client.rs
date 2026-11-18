@@ -6,6 +6,7 @@ use futures_util::{StreamExt, stream};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
+use super::adapters::{Adapter, Refused};
 use super::protocol::{Answers, Questions, answers_from_wire, questions_to_wire};
 use crate::clip;
 
@@ -13,7 +14,7 @@ pub const CONCURRENCY: usize = 8;
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const ERROR_BODY_CHARS: usize = 300;
+pub(super) const ERROR_BODY_CHARS: usize = 300;
 const SCREENSHOT: &str = "iu2u-screenshot";
 const IMAGES_HEADER: &str = "TypeSafe-Danger-Zone-Images";
 
@@ -23,6 +24,8 @@ pub struct Client {
     endpoint: String,
     api_key: Option<String>,
     model: String,
+    timeout: Duration,
+    adapter: Option<Adapter>,
 }
 
 pub fn setting(name: &str) -> Option<String> {
@@ -39,14 +42,29 @@ impl Client {
         model: String,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::build(None, base_url, api_key, model, timeout)
+    }
+
+    fn build(
+        adapter: Option<Adapter>,
+        base_url: &str,
+        api_key: Option<String>,
+        model: String,
+        timeout: Duration,
+    ) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT.min(timeout))
                 .timeout(timeout)
                 .build()?,
-            endpoint: format!("{}/v1/systemone", base_url.trim_end_matches('/')),
+            endpoint: match &adapter {
+                None => format!("{}/v1/systemone", base_url.trim_end_matches('/')),
+                Some(adapter) => adapter.program().into(),
+            },
             api_key: api_key.filter(|key| !key.is_empty()),
             model,
+            timeout,
+            adapter,
         })
     }
 
@@ -57,11 +75,14 @@ impl Client {
                 .context("IU2U_TIMEOUT_MS must be milliseconds")?,
             None => DEFAULT_TIMEOUT_MS,
         };
-        Self::new(
+        let model = setting("MODEL").context(
+            "set IU2U_MODEL to the model name on your decision model server, or to apple-intelligence or claude",
+        )?;
+        Self::build(
+            Adapter::from_model(&model, setting("EFFORT"))?,
             &setting("BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.into()),
             setting("API_KEY"),
-            setting("MODEL")
-                .context("set IU2U_MODEL to the model name on your decision model server")?,
+            model,
             Duration::from_millis(timeout_ms),
         )
     }
@@ -76,6 +97,13 @@ impl Client {
         questions: &Questions,
         screenshot: Option<&str>,
     ) -> Result<Answers> {
+        if let Some(adapter) = &self.adapter {
+            anyhow::ensure!(
+                screenshot.is_none(),
+                "adapters take no screenshots: unset IU2U_VISION"
+            );
+            return adapter.ask(self.timeout, state, questions).await;
+        }
         let mut body = json!({
             "model": self.model,
             "state": state,
@@ -119,11 +147,11 @@ impl Client {
         states: Vec<String>,
         questions: &Questions,
     ) -> Vec<Result<Answers>> {
-        let (timeouts_in_a_row, unreachable) = (&AtomicUsize::new(0), &AtomicBool::new(false));
+        let (failures_in_a_row, unreachable) = (&AtomicUsize::new(0), &AtomicBool::new(false));
         let mut results: Vec<_> = stream::iter(states.into_iter().enumerate())
             .map(|(index, state)| async move {
                 let answers = self
-                    .ask_in_batch(&state, questions, timeouts_in_a_row, unreachable)
+                    .ask_in_batch(&state, questions, failures_in_a_row, unreachable)
                     .await;
                 (index, answers)
             })
@@ -138,7 +166,7 @@ impl Client {
         &self,
         state: &str,
         questions: &Questions,
-        timeouts_in_a_row: &AtomicUsize,
+        failures_in_a_row: &AtomicUsize,
         unreachable: &AtomicBool,
     ) -> Result<Answers> {
         anyhow::ensure!(
@@ -147,31 +175,85 @@ impl Client {
             self.endpoint
         );
         let answers = self.ask(state, questions).await;
-        let transport = answers
-            .as_ref()
-            .err()
-            .and_then(|error| error.downcast_ref::<reqwest::Error>());
-        match transport {
-            Some(error)
-                if error.is_connect()
-                    || error.status().is_some_and(|status| {
-                        [
-                            StatusCode::UNAUTHORIZED,
-                            StatusCode::FORBIDDEN,
-                            StatusCode::NOT_FOUND,
-                        ]
-                        .contains(&status)
-                    }) =>
-            {
-                unreachable.store(true, Ordering::Relaxed);
-            }
-            Some(error) if error.is_timeout() => {
-                if timeouts_in_a_row.fetch_add(1, Ordering::Relaxed) + 1 >= CONCURRENCY {
+        match answers.as_ref().err() {
+            Some(error) if cannot_reach(error) => unreachable.store(true, Ordering::Relaxed),
+            Some(error) if !rejects_only_this_item(error) => {
+                if failures_in_a_row.fetch_add(1, Ordering::Relaxed) + 1 >= CONCURRENCY {
                     unreachable.store(true, Ordering::Relaxed);
                 }
             }
-            _ => timeouts_in_a_row.store(0, Ordering::Relaxed),
+            _ => failures_in_a_row.store(0, Ordering::Relaxed),
         }
         answers
+    }
+}
+
+fn cannot_reach(error: &anyhow::Error) -> bool {
+    let refused = [
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+    ];
+    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+        error.is_connect()
+            || error
+                .status()
+                .is_some_and(|status| refused.contains(&status))
+    }) || error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn rejects_only_this_item(error: &anyhow::Error) -> bool {
+    let systemic = [StatusCode::REQUEST_TIMEOUT, StatusCode::TOO_MANY_REQUESTS];
+    error.is::<Refused>()
+        || error
+            .downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            .is_some_and(|status| status.is_client_error() && !systemic.contains(&status))
+}
+
+pub(crate) fn timed_out(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_timeout)
+        || error.is::<tokio::time::error::Elapsed>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Question;
+
+    #[test]
+    fn a_missing_program_stops_a_batch() {
+        let missing = Err::<(), _>(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("cannot run claude")
+            .unwrap_err();
+        assert!(cannot_reach(&missing));
+    }
+
+    #[test]
+    fn an_item_the_model_refuses_does_not_stop_a_batch() {
+        let refused = anyhow::Error::msg(Refused("apfel refused this item".into()));
+        assert!(rejects_only_this_item(&refused) && !cannot_reach(&refused));
+    }
+
+    #[tokio::test]
+    async fn adapters_refuse_screenshots() {
+        let client = Client::build(
+            Some(Adapter::AppleIntelligence),
+            DEFAULT_BASE_URL,
+            None,
+            "apple-intelligence".into(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let questions = Questions::from([("rain".into(), Question::yesno("It rains"))]);
+        let error = client
+            .ask_seeing("A page", &questions, Some("iVBORw0KGgo="))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unset IU2U_VISION"), "{error:#}");
     }
 }

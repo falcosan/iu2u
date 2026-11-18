@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde_json::{Value, json};
 
-use crate::model::{Client, setting};
+use crate::model::{ADAPTER_SESSION, Client, setting};
 
 const ITEM_CHARS: usize = 300;
 const KEPT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
@@ -28,6 +28,9 @@ pub enum Power {
 
 impl Power {
     pub fn enabled(self) -> bool {
+        if std::env::var_os(ADAPTER_SESSION).is_some() {
+            return false;
+        }
         let name = format!("{self:?}").to_uppercase();
         match setting(&name).as_deref() {
             Some("true") => true,

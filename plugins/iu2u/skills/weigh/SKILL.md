@@ -5,7 +5,7 @@ description: Use when a task needs many fast, cheap judgments over items, files 
 
 # Fast judgments with iu2u
 
-The iu2u tools send text to a decision model that answers typed questions with probabilities in milliseconds, without generating text.
+The iu2u tools send text to a decision model that answers typed questions with probabilities, without generating text.
 
 | Tool | Use it to |
 |---|---|
@@ -25,7 +25,7 @@ Do not use them for summaries, explanations, plans, code, or anything that needs
 
 - `yesno`: `text` is a statement ("The email asks for a refund.") or a yes-or-no question ("Does the email ask for a refund?"). The answer `yes` is the probability that it is true, or that the answer is yes.
 - `pick`: `options` maps each label to a one-line description, 2 to 255 options.
-- `scale`: `levels` lists 2 to 10 levels from lowest to highest. The answer `level` is the expected level.
+- `scale`: `levels` lists 2 to 10 distinct levels from lowest to highest. The answer `level` is the expected level.
 - One fact per question. Several small questions beat one compound question.
 
 ## How to read the answers

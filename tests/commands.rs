@@ -2,10 +2,10 @@ mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::pin::pin;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
-use common::{answer_always, answer_when, client, fail_always, yes};
+use common::{answer_always, answer_when, client, fail_always, iu2u, yes};
 use futures_util::{StreamExt, stream};
 use iu2u::commands;
 use serde_json::json;
@@ -52,7 +52,7 @@ async fn filter_passes_each_match_on_before_the_input_ends() {
 #[test]
 fn filter_exits_like_grep() {
     let exit_code = |timeout_ms: &str| {
-        Command::new(env!("CARGO_BIN_EXE_iu2u"))
+        iu2u()
             .args(["filter", "This line reports a problem"])
             .env("IU2U_MODEL", "model-x")
             .env("IU2U_TIMEOUT_MS", timeout_ms)
@@ -63,7 +63,7 @@ fn filter_exits_like_grep() {
     };
     assert_eq!(exit_code("1000"), Some(1));
     assert_eq!(exit_code("soon"), Some(2));
-    let with_vision = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+    let with_vision = iu2u()
         .args(["filter", "This line reports a problem"])
         .env("IU2U_MODEL", "model-x")
         .env("IU2U_VISION", "yes")
@@ -75,7 +75,7 @@ fn filter_exits_like_grep() {
 #[test]
 fn filter_rejects_a_threshold_that_is_not_a_probability() {
     for at in ["80", "-1", "NaN"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+        let output = iu2u()
             .args([
                 "filter",
                 "This line reports a problem",
@@ -92,7 +92,7 @@ fn filter_rejects_a_threshold_that_is_not_a_probability() {
 async fn filter_stops_on_an_error_while_its_input_stays_open() {
     let model = MockServer::start().await;
     fail_always(&model, 503).await;
-    let mut filter = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+    let mut filter = iu2u()
         .args(["filter", "This line reports a problem"])
         .env("IU2U_BASE_URL", model.uri())
         .env("IU2U_MODEL", "model-x")
@@ -121,7 +121,7 @@ async fn filter_stops_on_an_error_while_its_input_stays_open() {
 async fn filter_stops_quietly_when_its_reader_goes_away() {
     let model = MockServer::start().await;
     answer_always(&model, json!({ "holds": yes(0.95) })).await;
-    let mut filter = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+    let mut filter = iu2u()
         .args(["filter", "This line reports a problem"])
         .env("IU2U_BASE_URL", model.uri())
         .env("IU2U_MODEL", "model-x")
@@ -148,7 +148,7 @@ async fn filter_stops_quietly_when_its_reader_goes_away() {
 async fn filter_reads_past_lines_that_are_not_utf8() {
     let model = MockServer::start().await;
     answer_always(&model, json!({ "holds": yes(0.95) })).await;
-    let mut filter = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+    let mut filter = iu2u()
         .args(["filter", "This line reports a problem"])
         .env("IU2U_BASE_URL", model.uri())
         .env("IU2U_MODEL", "model-x")

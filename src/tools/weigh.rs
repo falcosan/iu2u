@@ -2,7 +2,7 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{MAX_ITEMS, MAX_QUESTIONS, bounded, something_judged};
+use super::{MAX_ITEMS, MAX_QUESTIONS, answerable, bounded, something_judged};
 use crate::model::{Client, Questions};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -20,6 +20,7 @@ pub struct WeighParams {
 pub async fn weigh(client: &Client, params: WeighParams) -> Result<Value, String> {
     bounded("items", params.items.len(), MAX_ITEMS)?;
     bounded("questions", params.questions.len(), MAX_QUESTIONS)?;
+    answerable(&params.questions)?;
     let results = client.ask_each(params.items, &params.questions).await;
     something_judged(&results)?;
     Ok(Value::from_iter(results.into_iter().enumerate().map(
