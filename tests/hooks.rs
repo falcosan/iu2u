@@ -402,6 +402,32 @@ fn compass_hook(model: &MockServer, env: &[(&str, &str)], cwd: &Path) -> String 
 }
 
 #[tokio::test]
+async fn hooks_stay_quiet_inside_an_adapter_session() {
+    let model = MockServer::start().await;
+    answer_always(
+        &model,
+        json!({ "finished": yes(0.95), "verified": yes(0.05) }),
+    )
+    .await;
+    let data = temp_path("proof-adapter-session");
+    let base_url = model.uri();
+    let env = [
+        ("CLAUDE_PLUGIN_DATA", data.to_str().unwrap()),
+        ("IU2U_BASE_URL", base_url.as_str()),
+        ("IU2U_MODEL", "model-x"),
+        ("IU2U_ADAPTER_SESSION", "1"),
+    ];
+    let handback = json!({
+        "hook_event_name": "PreToolUse",
+        "agent_id": "agent-1",
+        "tool_name": "SubagentHandback",
+        "tool_input": { "message": "All done!" }
+    });
+    assert_eq!(hook("proof", &env, &handback), "");
+    assert!(model.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn proof_sends_an_unverified_subagent_handback_back_once() {
     let model = MockServer::start().await;
     answer_always(

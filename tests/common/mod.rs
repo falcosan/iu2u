@@ -73,3 +73,15 @@ pub fn temp_path(name: &str) -> PathBuf {
     })
     .join(name)
 }
+
+pub fn iu2u() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_iu2u"));
+    without_model(&mut command);
+    command
+}
+
+pub fn without_model(command: &mut std::process::Command) -> &mut std::process::Command {
+    command
+        .env_remove("IU2U_MODEL")
+        .env_remove("CLAUDE_PLUGIN_OPTION_MODEL")
+}

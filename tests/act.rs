@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{answer_always, reply, temp_path, yes};
+use common::{answer_always, iu2u, reply, temp_path, without_model, yes};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_json, body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -164,11 +164,8 @@ fn edit_page(script: &Path, from: &str, to: &str) {
 }
 
 fn command(model: Option<&MockServer>) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_iu2u"));
-    command
-        .arg("act")
-        .env_remove("IU2U_MODEL")
-        .env_remove("CLAUDE_PLUGIN_OPTION_MODEL");
+    let mut command = iu2u();
+    command.arg("act");
     if let Some(model) = model {
         command
             .env("IU2U_BASE_URL", model.uri())
@@ -252,7 +249,7 @@ fn act_with_browser(name: &str, browser: &str, flag: Option<&str>) -> (Output, V
     std::fs::write(&path, browser).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     let script = script(name, "<!doctype html><p>Hi</p>", "open PAGE\nsee \"Hi\"\n");
-    let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+    let output = iu2u()
         .args(["act", "--json"])
         .args(flag)
         .arg(&script)
@@ -413,7 +410,7 @@ async fn a_claim_about_a_long_screen_says_how_much_the_model_saw() {
 
 #[test]
 fn a_closed_output_ends_act_with_its_own_exit_code() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+    let mut child = iu2u()
         .arg("act")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -439,7 +436,7 @@ fn a_closed_output_ends_act_with_its_own_exit_code() {
 #[test]
 fn a_report_that_cannot_be_written_exits_two() {
     for (redirect, reported) in [("> \"$1\"", true), ("> \"$1\" 2>&1", false)] {
-        let mut child = Command::new("sh")
+        let mut child = without_model(&mut Command::new("sh"))
             .arg("-c")
             .arg(format!(
                 "trap '' XFSZ; ulimit -f 0; exec \"$0\" act {redirect}"
@@ -470,7 +467,7 @@ fn an_empty_secret_stops_the_script_before_it_runs() {
         "<!doctype html><p>Hello</p>",
         "open PAGE\nwith password = $IU2U_EMPTY_SECRET\ndo sign in\n",
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+    let output = iu2u()
         .args(["act", "--json"])
         .arg(&script)
         .env("IU2U_EMPTY_SECRET", "")
@@ -4385,6 +4382,22 @@ async fn a_start_that_waits_goes_back_to_the_page() {
     runs(&script);
 }
 
+fn still_runs(pid: &str) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        let alive = Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive || started.elapsed() > Duration::from_secs(2) {
+            return alive;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[track_caller]
 fn stopped_by(signal: &str, code: i32, name: &str, steps: &str, pid_files: &[&Path]) {
     let script = temp_path(&format!("{name}.e2e"));
@@ -4415,17 +4428,7 @@ fn stopped_by(signal: &str, code: i32, name: &str, steps: &str, pid_files: &[&Pa
         .status()
         .unwrap();
     let status = running.wait().unwrap();
-    let alive: Vec<String> = pids
-        .into_iter()
-        .filter(|pid| {
-            Command::new("kill")
-                .args(["-0", pid])
-                .stderr(Stdio::null())
-                .status()
-                .unwrap()
-                .success()
-        })
-        .collect();
+    let alive: Vec<String> = pids.into_iter().filter(|pid| still_runs(pid)).collect();
     for pid in &alive {
         Command::new("kill").args(["-9", pid]).status().unwrap();
     }
@@ -4606,12 +4609,7 @@ fn a_service_whose_children_ignore_the_stop_is_killed_when_the_script_ends() {
     .unwrap();
     runs(&script);
     let pid = std::fs::read_to_string(&pid).unwrap().trim().to_owned();
-    let alive = Command::new("kill")
-        .args(["-0", &pid])
-        .stderr(Stdio::null())
-        .status()
-        .unwrap()
-        .success();
+    let alive = still_runs(&pid);
     if alive {
         Command::new("kill").args(["-9", &pid]).status().unwrap();
     }
@@ -4705,12 +4703,7 @@ fn a_command_leaves_nothing_running_behind_it() {
         "{report}"
     );
     let pid = std::fs::read_to_string(&pid).unwrap();
-    let alive = Command::new("kill")
-        .args(["-0", pid.trim()])
-        .status()
-        .unwrap()
-        .success();
-    assert!(!alive, "sleep {} still runs", pid.trim());
+    assert!(!still_runs(pid.trim()), "sleep {} still runs", pid.trim());
 }
 
 #[test]
@@ -5087,7 +5080,7 @@ fn several_scripts_exit_with_the_worst_result() {
     let page = "<!doctype html><p>Hello</p>";
     let failing = script("failing", page, "open PAGE\nsee \"Goodbye\"\n");
     let passing = script("passing", page, "open PAGE\nsee \"Hello\"\n");
-    let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+    let output = iu2u()
         .args(["act", "--json"])
         .arg(&failing)
         .arg(&passing)
@@ -5492,7 +5485,7 @@ async fn a_goal_may_take_exactly_the_most_actions() {
 
 #[test]
 fn locked_needs_script_files() {
-    let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+    let output = iu2u()
         .args(["act", "--locked"])
         .stdin(Stdio::null())
         .output()

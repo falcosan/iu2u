@@ -25,8 +25,14 @@
     "model": {
       "type": "string",
       "title": "Model",
-      "description": "Model name on that server",
+      "description": "Model name on that server, or an adapter: apple-intelligence, claude, or claude:<model> such as claude:sonnet",
       "required": true
+    },
+    "effort": {
+      "type": "string",
+      "title": "Effort",
+      "description": "Effort level for the claude adapter: low, medium, high, xhigh or max. Empty means medium",
+      "default": ""
     },
     "api_key": {
       "type": "string",
@@ -73,6 +79,7 @@
       "env": {
         "IU2U_BASE_URL": "${user_config.base_url}",
         "IU2U_MODEL": "${user_config.model}",
+        "IU2U_EFFORT": "${user_config.effort}",
         "IU2U_API_KEY": "${user_config.api_key}"
       }
     }

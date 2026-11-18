@@ -21,7 +21,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Ask a decision model the same typed questions about many items and get calibrated probabilities in milliseconds per item, without generated text. Use it to classify, route, triage, screen or filter many items; keep summaries, explanations and single high-stakes calls for yourself."
+        description = "Ask a decision model the same typed questions about many items and get a probability for every answer, without generated text. Use it to classify, route, triage, screen or filter many items; keep summaries, explanations and single high-stakes calls for yourself."
     )]
     async fn weigh(&self, Parameters(params): Parameters<WeighParams>) -> Result<String, String> {
         tools::weigh(&self.client, params)

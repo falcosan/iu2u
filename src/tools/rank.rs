@@ -2,7 +2,7 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{MAX_ITEMS, bounded, number, something_judged};
+use super::{MAX_ITEMS, answerable, bounded, number, something_judged};
 use crate::model::{Answer, Client, Question, Questions};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -29,6 +29,7 @@ pub async fn rank(client: &Client, params: RankParams) -> Result<Value, String> 
             levels,
         },
     )]);
+    answerable(&question)?;
     let results = client.ask_each(params.items, &question).await;
     something_judged(&results)?;
     let mut ranked: Vec<Value> = results

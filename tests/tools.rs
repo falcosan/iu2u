@@ -151,6 +151,26 @@ async fn batches_stop_once_the_model_stops_answering_midway() {
 }
 
 #[tokio::test]
+async fn batches_stop_once_every_answer_fails() {
+    for status in [500, 429, 408] {
+        let model = MockServer::start().await;
+        fail_always(&model, status).await;
+        assert!(
+            skipped_after_a_silent_model(&client(&model)).await >= 40 - 2 * CONCURRENCY,
+            "{status}"
+        );
+        assert!(model.received_requests().await.unwrap().len() <= 2 * CONCURRENCY);
+    }
+}
+
+#[tokio::test]
+async fn items_the_model_rejects_one_by_one_do_not_stop_a_batch() {
+    let model = MockServer::start().await;
+    fail_always(&model, 422).await;
+    assert_eq!(skipped_after_a_silent_model(&client(&model)).await, 0);
+}
+
+#[tokio::test]
 async fn slow_items_do_not_hold_up_the_items_after_them() {
     let model = MockServer::start().await;
     Mock::given(method("POST"))
@@ -203,6 +223,34 @@ async fn weigh_rejects_empty_batches() {
     let params: WeighParams =
         serde_json::from_value(json!({ "items": [], "questions": {} })).unwrap();
     assert!(tools::weigh(&client(&model), params).await.is_err());
+}
+
+#[tokio::test]
+async fn questions_with_unusable_choices_are_rejected_before_any_request() {
+    let model = MockServer::start().await;
+    let weigh: WeighParams = serde_json::from_value(json!({
+        "items": ["charged twice"],
+        "questions": { "team": { "kind": "pick", "text": "Which team?", "options": { "x": "X" } } }
+    }))
+    .unwrap();
+    let weighed = tools::weigh(&client(&model), weigh).await.unwrap_err();
+    assert!(
+        weighed.contains("team needs 2 to 255 options, got 1"),
+        "{weighed}"
+    );
+    for (levels, expected) in [
+        (vec![], "rank needs 2 to 10 levels, got 0"),
+        (vec!["low", "low", "high"], "rank needs distinct levels"),
+    ] {
+        let rank = RankParams {
+            items: vec!["charged twice".into()],
+            criterion: "How bad is it".into(),
+            levels: Some(levels.into_iter().map(String::from).collect()),
+        };
+        let ranked = tools::rank(&client(&model), rank).await.unwrap_err();
+        assert!(ranked.contains(expected), "{ranked}");
+    }
+    assert!(model.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

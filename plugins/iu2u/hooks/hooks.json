@@ -42,7 +42,7 @@
               "hook",
               "trim"
             ],
-            "timeout": 30
+            "timeout": 120
           }
         ]
       }
@@ -103,7 +103,7 @@
               "hook",
               "prune"
             ],
-            "timeout": 60
+            "timeout": 120
           }
         ]
       }
