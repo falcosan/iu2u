@@ -272,7 +272,7 @@ fn signal(group: u32, signal: libc::c_int) {
     }
 }
 
-fn tail(log: &Path) -> String {
+pub(crate) fn tail(log: &Path) -> String {
     let (bytes, _) = read_tail(log, 0);
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();

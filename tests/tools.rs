@@ -125,11 +125,16 @@ async fn batches_stop_once_the_model_cannot_be_reached() {
 }
 
 #[tokio::test]
-async fn batches_stop_once_the_model_rejects_the_client() {
-    let model = MockServer::start().await;
-    fail_always(&model, 401).await;
-    assert!(skipped_after_a_silent_model(&client(&model)).await >= 40 - CONCURRENCY);
-    assert!(model.received_requests().await.unwrap().len() <= CONCURRENCY);
+async fn batches_stop_once_the_model_rejects_the_client_or_is_no_decision_model() {
+    for status in [401, 501] {
+        let model = MockServer::start().await;
+        fail_always(&model, status).await;
+        assert!(
+            skipped_after_a_silent_model(&client(&model)).await >= 40 - CONCURRENCY,
+            "{status}"
+        );
+        assert!(model.received_requests().await.unwrap().len() <= CONCURRENCY);
+    }
 }
 
 #[tokio::test]

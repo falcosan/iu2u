@@ -2,6 +2,7 @@ mod common;
 
 use std::process::{Output, Stdio};
 
+#[cfg(unix)]
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;

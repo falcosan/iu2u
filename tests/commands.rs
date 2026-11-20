@@ -2,10 +2,13 @@ mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::pin::pin;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use common::{answer_always, answer_when, client, fail_always, iu2u, yes};
+use common::{
+    answer_always, answer_when, client, config, config_home, fail_always, iu2u, temp_path, text,
+    yes,
+};
 use futures_util::{StreamExt, stream};
 use iu2u::commands;
 use serde_json::json;
@@ -167,5 +170,243 @@ async fn filter_reads_past_lines_that_are_not_utf8() {
     assert_eq!(
         String::from_utf8(finished.stdout).unwrap(),
         "caf\u{fffd} latin1\nthird ok\n"
+    );
+}
+
+#[test]
+fn a_zero_timeout_in_the_environment_is_refused() {
+    let output = iu2u()
+        .args(["filter", "This line reports a problem"])
+        .env("IU2U_MODEL", "model-x")
+        .env("IU2U_TIMEOUT_MS", "0")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        text(&output.stderr).contains("IU2U_TIMEOUT_MS must be a positive number of milliseconds")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_set_keeps_a_symlinked_file_and_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = temp_path("config-symlink");
+    let (linked, real) = (
+        home.join("iu2u/config.toml"),
+        home.join("dotfiles/iu2u.toml"),
+    );
+    std::fs::create_dir_all(home.join("iu2u")).unwrap();
+    std::fs::create_dir_all(home.join("dotfiles")).unwrap();
+    std::fs::write(&real, "model = \"claude\"\n").unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    assert!(
+        config(&home, &[], &["set", "guard", "false"])
+            .status
+            .success()
+    );
+    assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(real.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "model = \"claude\"\nguard = false\n"
+    );
+}
+
+#[test]
+fn config_shows_each_value_and_where_it_comes_from() {
+    let home = config_home(
+        "config-origins",
+        "model = \"decision\"\ntimeout_ms = 5000\n",
+    );
+    let file = home.join("iu2u/config.toml");
+    let env = [("IU2U_MODEL", "claude"), ("IU2U_API_KEY", "secret-key")];
+    assert_eq!(
+        text(&config(&home, &env, &["get", "model"]).stdout),
+        "claude\n"
+    );
+    let list = text(&config(&home, &env, &[]).stdout);
+    for (key, line) in [
+        (
+            "model",
+            format!(
+                "claude  IU2U_MODEL, overriding decision in {}",
+                file.display()
+            ),
+        ),
+        ("timeout_ms", format!("5000    {}", file.display())),
+        ("effort", "medium  default".into()),
+        ("browser", "(none)  default".into()),
+        ("api_key", "set     IU2U_API_KEY".into()),
+    ] {
+        let expected = format!("{key} {line}")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            list.lines()
+                .any(|row| row.split_whitespace().collect::<Vec<_>>().join(" ") == expected),
+            "{key}: {list}"
+        );
+    }
+    assert!(!list.contains("secret-key"));
+    let browser = config(&home, &env, &["get", "browser"]);
+    assert_eq!((browser.status.code(), browser.stdout.len()), (Some(1), 0));
+    assert_eq!(
+        text(&config(&home, &[], &["path"]).stdout),
+        format!("{}\n", file.display())
+    );
+}
+
+#[test]
+fn config_set_and_unset_keep_what_was_written_by_hand() {
+    let home = config_home(
+        "config-edits",
+        "# mine\nmodel = \"x\"  # the server's name\n\n# the guard\nguard = true\n",
+    );
+    for args in [
+        ["set", "guard", "false"],
+        ["set", "model", "y"],
+        ["set", "trim", "true"],
+    ] {
+        assert!(config(&home, &[], &args).status.success(), "{args:?}");
+    }
+    let file = home.join("iu2u/config.toml");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "# mine\nmodel = \"y\"  # the server's name\n\n# the guard\nguard = false\ntrim = true\n"
+    );
+    assert!(config(&home, &[], &["unset", "guard"]).status.success());
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "# mine\nmodel = \"y\"  # the server's name\ntrim = true\n"
+    );
+    let fresh = temp_path("config-fresh");
+    assert!(
+        config(&fresh, &[], &["set", "effort", "high"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read_to_string(fresh.join("iu2u/config.toml")).unwrap(),
+        "effort = \"high\"\n"
+    );
+}
+
+#[test]
+fn config_refuses_bad_values_unknown_keys_and_the_api_key() {
+    let home = temp_path("config-refusals");
+    for (args, says) in [
+        (
+            ["set", "guard", "yes"].as_slice(),
+            "`guard` must be true or false",
+        ),
+        (
+            &["set", "timeout_ms", "-1"],
+            "`timeout_ms` must be a positive whole number",
+        ),
+        (
+            &["set", "timeout_ms", "0"],
+            "`timeout_ms` must be a positive whole number",
+        ),
+        (
+            &["set", "effort", "huge"],
+            "`effort` must be one of low, medium",
+        ),
+        (
+            &["set", "base_url", "ftp://host"],
+            "`base_url` must be an http or https URL",
+        ),
+        (
+            &["set", "colour", "red"],
+            "unknown key `colour`; the keys are model, effort",
+        ),
+        (&["set", "api_key", "k"], "/plugin configure iu2u@iu2u"),
+        (&["get", "api_key"], "IU2U_API_KEY"),
+    ] {
+        let output = config(&home, &[], args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            text(&output.stderr).contains(says),
+            "{args:?}: {}",
+            text(&output.stderr)
+        );
+    }
+    assert!(!home.exists());
+}
+
+#[test]
+fn a_bad_config_file_is_named_with_its_key_or_line_and_left_alone() {
+    for (name, written, says) in [
+        (
+            "config-unknown",
+            "colour = \"red\"\n",
+            "unknown key `colour`",
+        ),
+        (
+            "config-type",
+            "guard = \"yes\"\n",
+            "`guard` must be true or false",
+        ),
+        ("config-syntax", "model = \"x\"\nguard =\n", "line 2"),
+    ] {
+        let home = config_home(name, written);
+        let file = home.join("iu2u/config.toml");
+        for args in [
+            [].as_slice(),
+            &["set", "guard", "false"],
+            &["unset", "guard"],
+        ] {
+            let output = config(&home, &[], args);
+            let stderr = text(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{name} {args:?}");
+            assert!(
+                stderr.contains(&file.display().to_string()) && stderr.contains(says),
+                "{name}: {stderr}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+    }
+}
+
+#[test]
+fn without_a_home_only_the_environment_is_read() {
+    let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+        .args(["config", "path"])
+        .env_clear()
+        .env("XDG_CONFIG_HOME", "relative/dir")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("XDG_CONFIG_HOME"));
+    let effort = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+        .args(["config", "get", "effort"])
+        .env_clear()
+        .env("IU2U_EFFORT", "high")
+        .output()
+        .unwrap();
+    assert_eq!(text(&effort.stdout), "high\n");
+}
+
+#[cfg(local_model)]
+#[test]
+fn config_set_stores_a_hugging_face_link_in_short_form_and_names_init() {
+    let home = temp_path("config-link");
+    let output = config(
+        &home,
+        &[],
+        &[
+            "set",
+            "model",
+            "https://huggingface.co/o/r/blob/main/m-Q8_0.gguf",
+        ],
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert!(text(&output.stderr).contains("is not installed yet: run iu2u init"));
+    assert_eq!(
+        std::fs::read_to_string(home.join("iu2u/config.toml")).unwrap(),
+        "model = \"decision:o/r:m-Q8_0.gguf\"\n"
     );
 }

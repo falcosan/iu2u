@@ -88,6 +88,86 @@ async fn tool_errors_come_back_as_tool_errors() {
     assert_eq!(result.is_error, Some(true));
 }
 
+fn exchange(
+    input: &mut std::process::ChildStdin,
+    output: &mut BufReader<std::process::ChildStdout>,
+    message: Value,
+) -> Value {
+    writeln!(input, "{message}").unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[tokio::test]
+async fn the_server_starts_without_a_model_and_reads_the_config_file_at_each_call() {
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(reply(json!({ "refund": yes(0.9) })))
+        .mount(&model)
+        .await;
+    let home = temp_path("mcp-config");
+    std::fs::create_dir_all(home.join("iu2u")).unwrap();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+        .arg("mcp")
+        .env_clear()
+        .env("XDG_CONFIG_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = server.stdin.take().unwrap();
+    let mut output = BufReader::new(server.stdout.take().unwrap());
+    exchange(
+        &mut input,
+        &mut output,
+        json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "test", "version": "0" }
+        }}),
+    );
+    writeln!(
+        input,
+        "{}",
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+    )
+    .unwrap();
+    let mut weigh = |id: u32| {
+        let reply = exchange(
+            &mut input,
+            &mut output,
+            json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+                "name": "weigh", "arguments": {
+                    "items": ["charged twice"],
+                    "questions": { "refund": { "kind": "yesno", "text": "Asks for a refund." } }
+                }
+            }}),
+        );
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(weigh(1).contains("no decision model is set"));
+    for (id, name) in [(2, "model-a"), (3, "model-b")] {
+        std::fs::write(
+            home.join("iu2u/config.toml"),
+            format!("model = \"{name}\"\nbase_url = \"{}\"\n", model.uri()),
+        )
+        .unwrap();
+        weigh(id);
+    }
+    server.kill().unwrap();
+    server.wait().unwrap();
+    let asked: Vec<Value> = model
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap()["model"].clone())
+        .collect();
+    assert_eq!(asked, [json!("model-a"), json!("model-b")]);
+}
+
 #[test]
 fn file_tools_resolve_relative_paths_from_the_project_folder() {
     let project = temp_path("mcp-project");

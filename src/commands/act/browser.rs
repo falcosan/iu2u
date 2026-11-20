@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 use super::decide::{self, Grid};
 use super::screen::{Element, Kind, Node, words};
 use super::surface::{self, Action, Probe};
-use crate::model::setting;
+use crate::config::Config;
 
 const APPLICATIONS: [&str; 4] = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -2041,13 +2041,13 @@ fn cors(request: &Value, url: &str) -> Vec<Value> {
 }
 
 fn find() -> Result<PathBuf> {
-    if let Some(path) = setting("BROWSER") {
+    if let Some(path) = Config::load()?.get("browser") {
         return Ok(path.into());
     }
     candidates(std::env::var_os("HOME"), std::env::var_os("PATH"))
         .into_iter()
         .find(|path| path.is_file())
-        .context("no Chrome, Chromium, Edge or Brave found; set IU2U_BROWSER to the browser's executable")
+        .context("no Chrome, Chromium, Edge or Brave found; set browser, or IU2U_BROWSER, to the browser's executable")
 }
 
 fn candidates(home: Option<OsString>, path: Option<OsString>) -> Vec<PathBuf> {

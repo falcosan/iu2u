@@ -22,8 +22,11 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::future::join_all;
 use serde_json::{Value, json};
 
-use crate::clip;
-use crate::model::{Answers, Client, Questions, setting, timed_out};
+pub(crate) use shell::tail;
+
+use crate::config::Config;
+use crate::model::{Answers, Client, Questions, timed_out};
+use crate::{clip, write_atomically};
 use browser::{Browser, Handling, file_names};
 use decide::{Decision, Input, Verdict};
 use lock::{Lock, Move, Recorded, Replay};
@@ -71,7 +74,7 @@ pub struct Suite {
 
 impl Suite {
     pub fn new(locked: bool, headful: bool) -> Result<Self> {
-        let vision = match setting("VISION").as_deref() {
+        let vision = match Config::load()?.get("vision").as_deref() {
             None | Some("false" | "0") => false,
             Some("true" | "1") => true,
             Some(_) => bail!("IU2U_VISION must be true or false"),
@@ -329,13 +332,8 @@ pub async fn act(
     if let ("passed", false, Some(path)) = (status, run.suite.locked, lock)
         && run.new != run.old
     {
-        let mut partial = path.as_os_str().to_owned();
-        partial.push(format!(".{}.tmp", std::process::id()));
         let recorded = format!("{}\n", serde_json::to_string_pretty(&run.new)?);
-        if let Err(failure) =
-            std::fs::write(&partial, recorded).and_then(|()| std::fs::rename(&partial, path))
-        {
-            std::fs::remove_file(&partial).ok();
+        if let Err(failure) = write_atomically(path, recorded.as_bytes()) {
             status = "error";
             error = Some(format!("cannot write {}: {failure}", path.display()));
         }
@@ -1325,7 +1323,7 @@ impl Run<'_> {
         }
         let sees = self.suite.vision;
         if sight && !sees {
-            detail.push_str("; this claim needs to see the page, but the model only read its text: set IU2U_VISION=true with a model that sees");
+            detail.push_str("; this claim needs to see the page, but the model only read its text: set vision to true, or IU2U_VISION=true, with a model that sees");
         } else if sight && self.shows_secret {
             detail.push_str("; this claim needs to see the page, but the model only read its text: no screenshot is sent while a secret shows on the screen");
         } else if sight

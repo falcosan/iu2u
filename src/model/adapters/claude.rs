@@ -7,9 +7,7 @@ use tokio::process::Command;
 use super::{ADAPTER_SESSION, SYSTEM, printed, run};
 
 pub(super) const PROGRAM: &str = "claude";
-pub(super) const MODEL: &str = "haiku";
-pub(super) const EFFORT: &str = "medium";
-pub(super) const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+pub(crate) const MODEL: &str = "haiku";
 
 pub(super) async fn reply(
     model: &str,

@@ -9,7 +9,7 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures_util::{StreamExt, stream};
-use iu2u::{commands, hooks::Power, mcp::Server, model::Client};
+use iu2u::{commands, config, hooks::Power, mcp::Server, model::Client};
 use rmcp::{ServiceExt, transport::stdio};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 #[cfg(unix)]
@@ -42,6 +42,33 @@ enum Command {
         at: f64,
     },
     #[cfg(unix)]
+    #[command(hide = true)]
+    Serve { sha256: String, identity: String },
+    #[cfg(unix)]
+    #[command(
+        about = "Choose the decision model and the hooks, install what the choice needs, and test it"
+    )]
+    Init {
+        #[arg(
+            long,
+            help = "Ask nothing: keep the configured values, take the defaults, install and test"
+        )]
+        yes: bool,
+    },
+    #[cfg(unix)]
+    #[command(
+        about = "Show the configured model and, for a local one, what is installed and running"
+    )]
+    Status,
+    #[cfg(unix)]
+    #[command(about = "Stop every local decision model server of this user")]
+    Stop,
+    #[command(about = "Show every setting with its value and where it comes from")]
+    Config {
+        #[command(subcommand)]
+        action: Option<Setting>,
+    },
+    #[cfg(unix)]
     #[command(
         about = "Run scripts that drive the screen toward goals and check what it shows; each file is a script, or stdin is"
     )]
@@ -67,6 +94,22 @@ enum Command {
         )]
         before: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum Setting {
+    #[command(about = "Print the value of a setting")]
+    Get { key: String },
+    #[command(about = "Write a setting to the config file")]
+    Set {
+        key: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    #[command(about = "Remove a setting from the config file")]
+    Unset { key: String },
+    #[command(about = "Print the path of the config file")]
+    Path,
 }
 
 fn probability(text: &str) -> Result<f64, String> {
@@ -101,7 +144,7 @@ fn main() -> Result<ExitCode> {
 async fn run(command: Command) -> Result<ExitCode> {
     match command {
         Command::Mcp => {
-            Server::new(Client::from_env()?)
+            Server::from_config()
                 .serve(stdio())
                 .await?
                 .waiting()
@@ -122,6 +165,23 @@ async fn run(command: Command) -> Result<ExitCode> {
             });
         }
         #[cfg(unix)]
+        Command::Serve { sha256, identity } => iu2u::model::serve(&sha256, &identity).await?,
+        #[cfg(unix)]
+        Command::Status => print!("{}", iu2u::model::status().await?),
+        #[cfg(unix)]
+        Command::Stop => match iu2u::model::stop_all().await? {
+            0 => {}
+            1 => println!("Stopped 1 local server."),
+            stopped => println!("Stopped {stopped} local servers."),
+        },
+        #[cfg(unix)]
+        Command::Init { yes } => {
+            return Ok(init(yes).await.unwrap_or_else(|error| failed(&error)));
+        }
+        Command::Config { action } => {
+            return Ok(settings(action).unwrap_or_else(|error| failed(&error)));
+        }
+        #[cfg(unix)]
         Command::Act {
             scripts,
             locked,
@@ -140,6 +200,31 @@ async fn run(command: Command) -> Result<ExitCode> {
 fn failed(error: &anyhow::Error) -> ExitCode {
     writeln!(std::io::stderr(), "Error: {error:#}").ok();
     ExitCode::from(2)
+}
+
+#[cfg(unix)]
+async fn init(yes: bool) -> Result<ExitCode> {
+    use std::io::IsTerminal;
+    anyhow::ensure!(
+        yes || std::io::stdin().is_terminal(),
+        "iu2u init asks its questions on a terminal; run iu2u init --yes to keep the configured values and take the defaults"
+    );
+    commands::init(&mut std::io::stdin().lock(), yes).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn settings(action: Option<Setting>) -> Result<ExitCode> {
+    match action {
+        None => print!("{}", config::list()?),
+        Some(Setting::Get { key }) => match config::get(&key)? {
+            Some(value) => println!("{value}"),
+            None => return Ok(ExitCode::from(1)),
+        },
+        Some(Setting::Set { key, value }) => config::set(&key, &value)?,
+        Some(Setting::Unset { key }) => config::unset(&key)?,
+        Some(Setting::Path) => println!("{}", config::location()?.display()),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn filter(statement: &str, at: f64) -> Result<bool> {

@@ -8,6 +8,7 @@ const MAX_COMMAND_CHARS: usize = 4000;
 const BLOCK_AT: f64 = 0.85;
 const ESCALATE_AT: f64 = 0.5;
 const UNATTENDED_MODES: [&str; 3] = ["auto", "dontAsk", "bypassPermissions"];
+pub(crate) const IRREVERSIBLE: &str = "Running this command would delete, overwrite or corrupt files, data, git history or system state in a way that is hard to recover.";
 
 #[derive(Debug, PartialEq)]
 enum Verdict {
@@ -44,12 +45,7 @@ pub(super) async fn run(input: &Value, client: Result<Client>) -> String {
 
 fn questions() -> Questions {
     Questions::from([
-        (
-            "irreversible".into(),
-            Question::yesno(
-                "Running this command would delete, overwrite or corrupt files, data, git history or system state in a way that is hard to recover.",
-            ),
-        ),
+        ("irreversible".into(), Question::yesno(IRREVERSIBLE)),
         (
             "leaves_machine".into(),
             Question::yesno(

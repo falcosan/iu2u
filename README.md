@@ -28,6 +28,7 @@
   <a href="#tools">Tools</a> ·
   <a href="#command-line">Command line</a> ·
   <a href="#settings">Settings</a> ·
+  <a href="#local-decision-model">Local model</a> ·
   <a href="#how-the-guard-decides">Guard behavior</a>
 </p>
 
@@ -45,7 +46,7 @@ _iu2u. It's up to you._
 
 ## Install
 
-You need **Rust 1.88+**, **Claude Code**, and a **decision-model server**. The server can run locally or be hosted; it must implement `POST /v1/systemone`. Bring its base URL and model name, or use the [adapter](#adapters) for Claude Code. iu2u does not bundle a model.
+You need **Rust 1.89+** and **Claude Code**. iu2u can download and run a decision model on your machine by itself, or use one you bring: a server that implements `POST /v1/systemone`, local or hosted, or the [adapter](#adapters) for Claude Code.
 
 **1. Install the binary.**
 
@@ -55,24 +56,26 @@ cargo install --locked iu2u
 
 Make sure `iu2u` is on the `PATH` Claude Code sees.
 
-**2. Add the plugin.**
+**2. Choose the model.**
 
-Replace `YOUR_MODEL` with the model name on your server. Change the URL if the server runs elsewhere.
+```sh
+iu2u init
+```
+
+`init` asks which model to use and which hooks to turn on, shows what it will write and download, and, once you confirm, writes `~/.config/iu2u/config.toml`, installs what the choice needs, and asks the model one test question. The default on a Mac with Apple silicon is the [local decision model](#local-decision-model). Run it again at any time; `iu2u config` changes one setting later.
+
+**3. Add the plugin.**
 
 ```sh
 claude plugin marketplace add falcosan/iu2u
-claude plugin install iu2u@iu2u \
-  --config model="YOUR_MODEL" \
-  --config base_url="http://127.0.0.1:11435"
+claude plugin install iu2u@iu2u
 ```
 
-**3. Configure it inside Claude Code.**
+For a hosted server that needs an API key, set it inside Claude Code, so it stays out of your shell history and the config file:
 
 ```text
 /plugin configure iu2u@iu2u
 ```
-
-Use this to set a hosted server's API key without putting it in shell history, or to change the model, URL, and hook switches later. You can also set switches during installation with options such as `--config trim=true`.
 
 **`guard` and `proof` start on.** The other hooks are opt-in. All four MCP tools are available to the agent.
 
@@ -94,6 +97,8 @@ The agent does not have to remember to call these.
 
 When enabling `trim`, avoid combining it with another hook that redacts command output: only one rewrite is kept.
 
+With the [local decision model](#local-decision-model), the plugin also runs `iu2u hook warm` when a session starts and on each prompt, so the model loads before the first shell command.
+
 ## Tools
 
 One question, a whole pile of things to ask it about. Available over MCP.
@@ -107,14 +112,7 @@ One question, a whole pile of things to ask it about. Available over MCP.
 
 ## Command line
 
-The same judgment works in a pipe. Configure the server for your shell first:
-
-```sh
-export IU2U_MODEL="YOUR_MODEL"
-export IU2U_BASE_URL="http://127.0.0.1:11435"
-```
-
-Set `IU2U_API_KEY` if your server requires authentication.
+The same judgment works in a pipe, with the model `iu2u init` configured. Set `IU2U_API_KEY` if your server requires authentication.
 
 ### Find the failure, however it was worded
 
@@ -225,11 +223,11 @@ Model calls  3
 - `--before <script>` runs one script before the others, such as one that starts the servers.
 - `--headful` opens the browser in a window.
 - `--json` prints a JSON report for each script.
-- `IU2U_VISION=true` adds a screenshot to every question about a page, for a model and server that take images.
+- `vision = true` in the config file, or `IU2U_VISION=true`, adds a screenshot to every question about a page, for a model and server that take images.
 
 A failed script saves what the page showed as `<script>.failed.png`. Exit codes: **0** passed, **1** a step failed, **2** a script could not run.
 
-`act` needs macOS or Linux. Set `IU2U_BROWSER` to use another browser. Mac apps run in the background, so `act` never takes over your keyboard or mouse; allow the app that runs `iu2u`, such as your terminal, in **System Settings › Privacy & Security › Accessibility**. A request carries the screen text and can pass 10,000 tokens, so the model server needs that much room.
+`act` needs macOS or Linux. Set `browser` to use another browser. Mac apps run in the background, so `act` never takes over your keyboard or mouse; allow the app that runs `iu2u`, such as your terminal, in **System Settings › Privacy & Security › Accessibility**. A request carries the screen text and can pass 10,000 tokens, so the model server needs that much room.
 
 ## How it works
 
@@ -259,7 +257,7 @@ The guard never returns `allow`. A misleading command can fool the model into st
 
 ### If the model cannot judge
 
-An unreachable or unconfigured model, an unusable response, or a command longer than **4,000 characters** takes the fallback path:
+An unreachable or unconfigured model, a local model that is not installed or still starting, an unusable response, or a command longer than **4,000 characters** takes the fallback path:
 
 | Claude Code mode       | Fallback                                                  |
 | ---------------------- | --------------------------------------------------------- |
@@ -271,40 +269,57 @@ If the **hook itself cannot run**—for example, the binary is missing from Clau
 
 ## Settings
 
-Inside Claude Code, plugin options take precedence. For standalone commands and Codex, set environment variables.
+Settings live in one file, `~/.config/iu2u/config.toml` (`$XDG_CONFIG_HOME/iu2u/config.toml` when that variable is set), on macOS and Linux alike. On Windows, `~` is `%USERPROFILE%` when `HOME` is unset, and `iu2u config set` takes the place of `init`. An `IU2U_*` variable overrides the file for one shell or one command. Hooks and the MCP tools read the settings at each call, so a change reaches open sessions at once. iu2u never reads a config file from a repository.
 
-| Plugin option | Environment variable | Default                                      |
-| ------------- | -------------------- | -------------------------------------------- |
-| `base_url`    | `IU2U_BASE_URL`      | `http://127.0.0.1:11435`                     |
-| `model`       | `IU2U_MODEL`         | Required; or an [adapter](#adapters)         |
-| `effort`      | `IU2U_EFFORT`        | `medium`, for the `claude` adapter           |
-| `api_key`     | `IU2U_API_KEY`       | None                                         |
-| —             | `IU2U_TIMEOUT_MS`    | `10000` milliseconds per request             |
-| `guard`       | `IU2U_GUARD`         | `true`                                       |
-| `proof`       | `IU2U_PROOF`         | `true`                                       |
-| `trim`        | `IU2U_TRIM`          | `false`                                      |
-| `compass`     | `IU2U_COMPASS`       | `false`                                      |
-| `prune`       | `IU2U_PRUNE`         | `false`                                      |
-| —             | `IU2U_BROWSER`       | The first browser found                      |
-| —             | `IU2U_VISION`        | `false`; `true` for a model that sees images |
+| Config key   | Environment variable | Default                                                                 |
+| ------------ | -------------------- | ----------------------------------------------------------------------- |
+| `model`      | `IU2U_MODEL`         | None; `decision`, a [local model](#local-decision-model), or an [adapter](#adapters) |
+| `effort`     | `IU2U_EFFORT`        | `medium`, for the `claude` adapter                                      |
+| `base_url`   | `IU2U_BASE_URL`      | `http://127.0.0.1:11435`                                                |
+| `timeout_ms` | `IU2U_TIMEOUT_MS`    | `10000` milliseconds per request                                        |
+| `guard`      | `IU2U_GUARD`         | `true`                                                                  |
+| `proof`      | `IU2U_PROOF`         | `true`                                                                  |
+| `trim`       | `IU2U_TRIM`          | `false`                                                                 |
+| `compass`    | `IU2U_COMPASS`       | `false`                                                                 |
+| `prune`      | `IU2U_PRUNE`         | `false`                                                                 |
+| `vision`     | `IU2U_VISION`        | `false`; `true` for a model that sees images                            |
+| `browser`    | `IU2U_BROWSER`       | The first browser found                                                 |
 
-Use the server's base URL: iu2u appends `/v1/systemone`. The API key is sent as a bearer token. Hook switches accept `true` or `false`.
+```sh
+iu2u config                    # every setting, its value and where it comes from
+iu2u config set trim true      # keeps the comments and order of the file
+iu2u config unset trim
+iu2u config get model
+```
+
+Use the server's base URL: iu2u appends `/v1/systemone`. Hook switches accept `true` or `false`. The API key is not in the file: set it with `/plugin configure iu2u@iu2u` in Claude Code, or with `IU2U_API_KEY`; it is sent as a bearer token. A file with an unknown key or a wrong value is an error that names the file and the key; hooks then take the fallback path.
+
+## Local decision model
+
+With `model = "decision"`, iu2u runs [Fastino GLiDE-9B](https://huggingface.co/fastino/GLiDE-9B) on your machine with the official [llama.cpp](https://github.com/ggml-org/llama.cpp) server. Nothing the model judges leaves the machine.
+
+- **What is downloaded.** `iu2u init` downloads `fastino_GLiDE-9B-Q4_K_M.gguf`, 5.8 GB, from [bartowski/fastino_GLiDE-9B-GGUF](https://huggingface.co/bartowski/fastino_GLiDE-9B-GGUF) at a pinned revision, and the llama.cpp build `b12359`, about 20 MB, from its [GitHub release](https://github.com/ggml-org/llama.cpp/releases/tag/b12359). Every byte is checked against a SHA-256 that iu2u knows before it downloads; an interrupted download continues where it stopped. Only `init` downloads a model; after an iu2u upgrade that changes the llama.cpp pin, the runtime installs itself on the next request.
+- **Licenses.** llama.cpp is MIT. GLiDE-9B is under the [Fastino Community License](https://huggingface.co/fastino/GLiDE-9B/blob/main/LICENSE), which binds you: commercial use must display "Built with Fastino GLiDE", and an organisation with more than 10 million US dollars of yearly revenue needs an agreement with Fastino.
+- **Other models.** Any GGUF decision model on Hugging Face works: run `iu2u init` and give its link, or set `model` to `decision:<owner>/<repo>[:<file>]`. Without a file, iu2u takes the `Q4_K_M` file. `HF_TOKEN` is sent to huggingface.co for gated repositories.
+- **How it runs.** The first request starts the server in the background and waits for it; it stays loaded while requests keep coming and exits five minutes after the last one, freeing its memory. It listens on a Unix socket in a private directory and opens no port. `iu2u status` shows what is installed and running; `iu2u stop` stops it now.
+- **Where files live.** `~/.local/share/iu2u` (`$XDG_DATA_HOME/iu2u` when set): `runtime/`, `models/` and `run/`. To remove everything, run `iu2u stop`, then delete that directory and the config file.
+- **Memory and platforms.** The model needs about its file size plus 1.5 GB while loaded: 6.8 GB on an Apple M5 Pro, where a guard decision takes under a second. It runs on macOS with Apple silicon, and on Linux x86-64 and arm64 with glibc 2.35 or later (2.38 on arm64), the GNU OpenMP runtime (`libgomp1`) and OpenSSL 3. On Linux the bundled runtime uses the CPU only, which takes over 10 seconds per question, so hooks time out; point `base_url` at a server with a GPU instead. Other systems use a server or the adapter.
 
 ## Adapters
 
-An adapter lets iu2u ask a model that has no `/v1/systemone` endpoint. Set `IU2U_MODEL`, or the `model` plugin option, to `claude` or `claude:<model>`; any other name is a model on a System One server, as above. An adapter asks the model, in one request, for the probability of every answer, option or level as JSON. The model states these probabilities itself, so they are not calibrated the way a decision model's are. Adapters take no screenshots and ignore `IU2U_BASE_URL` and `IU2U_API_KEY`.
+An adapter lets iu2u ask a model that has no `/v1/systemone` endpoint. Set `model` to `claude` or `claude:<model>`; `decision` and `decision:…` name a [local model](#local-decision-model), and any other name is a model on a System One server, as above. An adapter asks the model, in one request, for the probability of every answer, option or level as JSON. The model states these probabilities itself, so they are not calibrated the way a decision model's are. Adapters take no screenshots and ignore `base_url` and the API key.
 
 ### Claude Code
 
 ```sh
-export IU2U_MODEL="claude"
+iu2u config set model claude
 ```
 
-Each request runs `claude --print` with your Claude Code login, or with `ANTHROPIC_API_KEY` or your provider's variables set in the environment: an `apiKeyHelper` or `env` in `settings.json` does not apply. It runs on `haiku` at `medium` effort: set `IU2U_MODEL` to `claude:<model>`, such as `claude:sonnet`, for another model, and `IU2U_EFFORT` for another effort. The session loads no user, project or local settings, no plugins, MCP servers, auto memory, `CLAUDE.md` or tools, and iu2u's own hooks stay off inside it even when managed settings load them. Every request takes a few seconds and counts against your Claude plan, or is billed to your API key. The guard makes one for every shell command, proof one per turn and per subagent, and compass one per prompt; `weigh` and `rank` make one per item, up to 500, and `seek` and `lint` one per excerpt, up to 2,000 per call; `filter` makes one per non-empty line, with no limit; `trim` one per 40 lines, up to 200, and `prune` one per step, up to 150, within the two-minute hook limit, so output or a session they cannot finish in time stays as it was; and `act` several per step, trying one that times out up to 3 times.
+Each request runs `claude --print` with your Claude Code login, or with `ANTHROPIC_API_KEY` or your provider's variables set in the environment: an `apiKeyHelper` or `env` in `settings.json` does not apply. It runs on `haiku` at `medium` effort: set `model` to `claude:<model>`, such as `claude:sonnet`, for another model, and `effort` for another effort. The session loads no user, project or local settings, no plugins, MCP servers, auto memory, `CLAUDE.md` or tools, and iu2u's own hooks stay off inside it even when managed settings load them. Every request takes a few seconds and counts against your Claude plan, or is billed to your API key. The guard makes one for every shell command, proof one per turn and per subagent, and compass one per prompt; `weigh` and `rank` make one per item, up to 500, and `seek` and `lint` one per excerpt, up to 2,000 per call; `filter` makes one per non-empty line, with no limit; `trim` one per 40 lines, up to 200, and `prune` one per step, up to 150, within the two-minute hook limit, so output or a session they cannot finish in time stays as it was; and `act` several per step, trying one that times out up to 3 times.
 
 ## Codex
 
-Add `iu2u mcp` as an MCP server in `~/.codex/config.toml`, with `IU2U_MODEL` and the other server settings available to the process. For the guard, register `iu2u hook guard` as a `PreToolUse` command hook with matcher `Bash`.
+Add `iu2u mcp` as an MCP server in `~/.codex/config.toml`; it reads the model and the other settings from iu2u's config file. For the guard, register `iu2u hook guard` as a `PreToolUse` command hook with matcher `Bash`.
 
 The Codex adapter cannot request approval from a hook: it **blocks** commands it would ask about in Claude Code. If the model cannot judge, it makes **no permission decision**, leaving Codex's own rules in charge.
 

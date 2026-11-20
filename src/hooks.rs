@@ -4,6 +4,9 @@ mod proof;
 mod prune;
 mod trim;
 
+#[cfg(unix)]
+pub(crate) use guard::IRREVERSIBLE;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,7 +14,8 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde_json::{Value, json};
 
-use crate::model::{ADAPTER_SESSION, Client, setting};
+use crate::config::{self, Config};
+use crate::model::{ADAPTER_SESSION, Client};
 
 const ITEM_CHARS: usize = 300;
 const KEPT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
@@ -20,6 +24,7 @@ const JUDGE_WITHIN: Duration = Duration::from_secs(12);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Power {
     Guard,
+    Warm,
     Trim,
     Proof,
     Compass,
@@ -31,17 +36,26 @@ impl Power {
         if std::env::var_os(ADAPTER_SESSION).is_some() {
             return false;
         }
-        let name = format!("{self:?}").to_uppercase();
-        match setting(&name).as_deref() {
+        if self == Self::Warm {
+            return true;
+        }
+        let name = format!("{self:?}").to_lowercase();
+        match Config::load().unwrap_or_default().get(&name).as_deref() {
             Some("true") => true,
             Some("false") => false,
-            _ => matches!(self, Self::Guard | Self::Proof),
+            _ => config::default(&name) == Some("true"),
         }
     }
 
     pub async fn run(self, input: &Value, client: Result<Client>) -> Result<String> {
         let output = match (self, client) {
             (Self::Guard, client) => return Ok(guard::run(input, client).await),
+            #[cfg(unix)]
+            (Self::Warm, Ok(client)) => {
+                client.warm();
+                return Ok(String::new());
+            }
+            (Self::Warm, _) => return Ok(String::new()),
             (_, Err(error)) => return Err(error),
             (Self::Trim, Ok(client)) => trim::run(input, &client).await,
             (Self::Proof, Ok(client)) => within_hook_timeout(proof::run(input, &client)).await,

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -54,7 +55,12 @@ pub fn yes(probability: f64) -> Value {
 pub fn temp_path(name: &str) -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let root = std::env::temp_dir().join("iu2u-tests");
+        let root = if cfg!(unix) {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        }
+        .join("iu2u-tests");
         for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {
             let stale = entry
                 .metadata()
@@ -81,7 +87,31 @@ pub fn iu2u() -> std::process::Command {
 }
 
 pub fn without_model(command: &mut std::process::Command) -> &mut std::process::Command {
+    let empty = temp_path("empty-home");
     command
         .env_remove("IU2U_MODEL")
-        .env_remove("CLAUDE_PLUGIN_OPTION_MODEL")
+        .env("XDG_CONFIG_HOME", &empty)
+        .env("XDG_DATA_HOME", &empty)
+}
+
+pub fn config(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_iu2u"))
+        .arg("config")
+        .args(args)
+        .env_clear()
+        .env("XDG_CONFIG_HOME", home)
+        .envs(env.iter().copied())
+        .output()
+        .unwrap()
+}
+
+pub fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+pub fn config_home(name: &str, config: &str) -> PathBuf {
+    let home = temp_path(name);
+    std::fs::create_dir_all(home.join("iu2u")).unwrap();
+    std::fs::write(home.join("iu2u/config.toml"), config).unwrap();
+    home
 }

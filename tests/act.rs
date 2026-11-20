@@ -4152,7 +4152,7 @@ async fn a_claim_that_needs_sight_warns_without_vision_and_on_replay() {
     let report = passes(&script, &model);
     assert_eq!(
         report["steps"][1]["detail"],
-        "the model is 95% sure it holds; this claim needs to see the page, but the model only read its text: set IU2U_VISION=true with a model that sees"
+        "the model is 95% sure it holds; this claim needs to see the page, but the model only read its text: set vision to true, or IU2U_VISION=true, with a model that sees"
     );
     let report = replays(&script);
     assert_eq!(

@@ -1,11 +1,15 @@
 mod claude;
+#[cfg(unix)]
+pub(crate) use claude::MODEL as DEFAULT_CLAUDE_MODEL;
+#[cfg(unix)]
+pub(crate) mod decision;
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -13,8 +17,93 @@ use tokio::process::Command;
 use super::client::ERROR_BODY_CHARS;
 use super::protocol::{Answer, Answers, DATA_ONLY, Question, Questions};
 use crate::clip;
+use crate::config::EFFORTS;
 
 pub(crate) const ADAPTER_SESSION: &str = "IU2U_ADAPTER_SESSION";
+
+pub(crate) fn is_claude(model: &str) -> bool {
+    model == "claude" || model.starts_with("claude:")
+}
+
+pub(crate) const UNSUPPORTED: &str = "the local decision model runs on macOS with Apple silicon and on Linux (x86-64 or arm64, glibc) only; on this system point base_url at a System One server, or set model to claude";
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Reference {
+    BuiltIn,
+    Linked {
+        repository: String,
+        revision: Option<String>,
+        selector: Option<String>,
+    },
+}
+
+impl Reference {
+    pub(crate) fn parse(model: &str) -> Result<Option<Self>> {
+        if model == "decision" {
+            return Ok(Some(Self::BuiltIn));
+        }
+        if let Some(rest) = model.strip_prefix("decision:") {
+            let (repository, selector) = match rest.split_once(':') {
+                Some((repository, selector)) => (repository, Some(selector)),
+                None => (rest, None),
+            };
+            return Self::linked(repository, None, selector).map(Some);
+        }
+        let Some(path) = model
+            .strip_prefix("https://huggingface.co/")
+            .or_else(|| model.strip_prefix("https://hf.co/"))
+            .map(|path| path.split(['?', '#']).next().unwrap_or_default())
+        else {
+            return Ok(None);
+        };
+        let parts: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+        match parts.as_slice() {
+            [owner, repo] => Self::linked(&format!("{owner}/{repo}"), None, None),
+            [owner, repo, "blob" | "resolve", revision, file] => {
+                Self::linked(&format!("{owner}/{repo}"), Some(revision), Some(file))
+            }
+            _ => bail!(
+                "{model} is not a Hugging Face model link: use https://huggingface.co/<owner>/<repo>, or a link to one of its .gguf files"
+            ),
+        }
+        .map(Some)
+    }
+
+    fn linked(repository: &str, revision: Option<&str>, selector: Option<&str>) -> Result<Self> {
+        let valid = |name: &str| {
+            !name.is_empty()
+                && !name.starts_with('.')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
+        ensure!(
+            repository
+                .split_once('/')
+                .is_some_and(|(owner, repo)| valid(owner) && valid(repo)),
+            "decision:{repository} must name a Hugging Face repository as decision:<owner>/<repo>[:<file>]"
+        );
+        Ok(Self::Linked {
+            repository: repository.into(),
+            revision: revision.map(str::to_owned),
+            selector: selector.filter(|s| !s.is_empty()).map(str::to_owned),
+        })
+    }
+
+    pub(crate) fn stored(&self, file: Option<&str>) -> String {
+        match self {
+            Self::BuiltIn => "decision".into(),
+            Self::Linked {
+                repository,
+                selector,
+                ..
+            } => match file.or(selector.as_deref()) {
+                Some(file) => format!("decision:{repository}:{file}"),
+                None => format!("decision:{repository}"),
+            },
+        }
+    }
+}
 
 const SYSTEM: &str =
     "Judge the state the user sends and answer every question in the requested JSON.";
@@ -26,27 +115,23 @@ pub(super) struct Adapter {
 }
 
 impl Adapter {
-    pub(super) fn from_model(model: &str, effort: Option<String>) -> Result<Option<Self>> {
-        let model = match model {
-            "claude" => claude::MODEL,
-            _ => match model.strip_prefix("claude:") {
-                Some(model) => model,
-                None => return Ok(None),
-            },
-        };
+    pub(super) fn from_model(model: &str, effort: &str) -> Result<Option<Self>> {
+        if !is_claude(model) {
+            return Ok(None);
+        }
+        let model = model.strip_prefix("claude:").unwrap_or(claude::MODEL);
         ensure!(
             !model.is_empty(),
-            "IU2U_MODEL claude: needs a Claude model, such as claude:sonnet"
+            "claude: names no Claude model: set model, or IU2U_MODEL, to claude or to one such as claude:sonnet"
         );
-        let effort = effort.unwrap_or_else(|| claude::EFFORT.into());
         ensure!(
-            claude::EFFORTS.contains(&effort.as_str()),
+            EFFORTS.contains(&effort),
             "IU2U_EFFORT must be one of {}, not {effort}",
-            claude::EFFORTS.join(", ")
+            EFFORTS.join(", ")
         );
         Ok(Some(Self {
             model: model.into(),
-            effort,
+            effort: effort.into(),
         }))
     }
 
@@ -274,8 +359,51 @@ mod tests {
     }
 
     #[test]
+    fn model_values_name_the_built_in_model_a_repository_or_nothing_local() {
+        let linked = |repository: &str, revision: Option<&str>, selector: Option<&str>| {
+            Some(Reference::Linked {
+                repository: repository.into(),
+                revision: revision.map(str::to_owned),
+                selector: selector.map(str::to_owned),
+            })
+        };
+        for (model, expected) in [
+            ("decision", Some(Reference::BuiltIn)),
+            ("decision:o/r", linked("o/r", None, None)),
+            ("decision:o/r:Q8_0", linked("o/r", None, Some("Q8_0"))),
+            ("https://huggingface.co/o/r", linked("o/r", None, None)),
+            ("https://huggingface.co/o/r/", linked("o/r", None, None)),
+            (
+                "https://huggingface.co/o/r/blob/main/m-Q8_0.gguf",
+                linked("o/r", Some("main"), Some("m-Q8_0.gguf")),
+            ),
+            ("https://hf.co/o/r", linked("o/r", None, None)),
+            (
+                "https://huggingface.co/o/r/resolve/abc/m.gguf?download=true",
+                linked("o/r", Some("abc"), Some("m.gguf")),
+            ),
+            ("claude", None),
+            ("glide", None),
+            ("decisions", None),
+        ] {
+            assert_eq!(Reference::parse(model).unwrap(), expected, "{model}");
+        }
+        for wrong in [
+            "decision:o",
+            "decision:o/../r",
+            "decision:../r",
+            "https://huggingface.co/o",
+            "https://huggingface.co/o/r/tree/main",
+        ] {
+            assert!(Reference::parse(wrong).is_err(), "{wrong}");
+        }
+        let link = Reference::parse("https://huggingface.co/o/r/blob/main/m.gguf").unwrap();
+        assert_eq!(link.unwrap().stored(None), "decision:o/r:m.gguf");
+    }
+
+    #[test]
     fn the_model_name_picks_the_adapter() {
-        let adapter = |model: &str| Adapter::from_model(model, Some("high".into()));
+        let adapter = |model: &str| Adapter::from_model(model, "high");
         assert!(matches!(
             adapter("claude"),
             Ok(Some(Adapter { model, effort })) if model == "haiku" && effort == "high"
@@ -284,10 +412,11 @@ mod tests {
             adapter("claude:sonnet"),
             Ok(Some(Adapter { model, .. })) if model == "sonnet"
         ));
-        assert!(adapter("claude:").is_err());
+        let error = adapter("claude:").unwrap_err().to_string();
+        assert!(error.contains("set model, or IU2U_MODEL"), "{error}");
         for model in ["model-x", "llama3:8b", "claudette"] {
             assert!(
-                matches!(Adapter::from_model(model, Some("hi".into())), Ok(None)),
+                matches!(Adapter::from_model(model, "hi"), Ok(None)),
                 "{model}"
             );
         }

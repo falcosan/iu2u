@@ -2,11 +2,12 @@ mod common;
 
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
 
 use common::{
-    answer_always, answer_when, client, client_with_timeout, fail_always, reply, temp_path, yes,
+    answer_always, answer_when, client, client_with_timeout, config, config_home, fail_always,
+    reply, temp_path, yes,
 };
 use iu2u::{
     hooks::Power,
@@ -32,14 +33,14 @@ fn irreversible() -> Value {
     })
 }
 
-fn hook(power: &str, env: &[(&str, &str)], input: &Value) -> String {
+fn hook_output(power: &str, env: &[(&str, &str)], input: &Value) -> Output {
     let mut hook = Command::new(env!("CARGO_BIN_EXE_iu2u"))
         .args(["hook", power])
         .env_clear()
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     hook.stdin
@@ -47,15 +48,19 @@ fn hook(power: &str, env: &[(&str, &str)], input: &Value) -> String {
         .unwrap()
         .write_all(input.to_string().as_bytes())
         .unwrap();
-    String::from_utf8(hook.wait_with_output().unwrap().stdout).unwrap()
+    hook.wait_with_output().unwrap()
+}
+
+fn hook(power: &str, env: &[(&str, &str)], input: &Value) -> String {
+    String::from_utf8(hook_output(power, env, input).stdout).unwrap()
+}
+
+fn guard_input() -> Value {
+    json!({ "permission_mode": "auto", "tool_input": { "command": "rm -rf ~" } })
 }
 
 fn guard_hook(env: &[(&str, &str)]) -> String {
-    hook(
-        "guard",
-        env,
-        &json!({ "permission_mode": "auto", "tool_input": { "command": "rm -rf ~" } }),
-    )
+    hook("guard", env, &guard_input())
 }
 
 #[tokio::test]
@@ -85,21 +90,78 @@ async fn guard_blocks_what_the_model_judges_irreversible() {
 }
 
 #[tokio::test]
-async fn guard_hook_reads_the_plugin_options() {
+async fn guard_hook_reads_the_config_file_and_no_plugin_option_but_the_key() {
     let model = MockServer::start().await;
     answer_always(&model, irreversible()).await;
-    let base_url = model.uri();
-    let options = [
-        ("CLAUDE_PLUGIN_OPTION_BASE_URL", base_url.as_str()),
-        ("CLAUDE_PLUGIN_OPTION_MODEL", "model-x"),
+    let home = config_home(
+        "guard-config",
+        &format!(
+            "# written by hand\nmodel = \"model-x\"\nbase_url = \"{}\"\n",
+            model.uri()
+        ),
+    );
+    let home = home.to_str().unwrap();
+    let env = [
+        ("XDG_CONFIG_HOME", home),
+        ("CLAUDE_PLUGIN_OPTION_BASE_URL", "http://127.0.0.1:9"),
+        ("CLAUDE_PLUGIN_OPTION_GUARD", "false"),
     ];
-    assert_eq!(permission(&guard_hook(&options)), "deny");
-    let switched_off = [
-        options.as_slice(),
-        &[("CLAUDE_PLUGIN_OPTION_GUARD", "false")],
-    ]
-    .concat();
-    assert_eq!(guard_hook(&switched_off), "");
+    assert_eq!(permission(&guard_hook(&env)), "deny");
+    assert!(
+        config(Path::new(home), &[], &["set", "guard", "false"])
+            .status
+            .success()
+    );
+    let file = std::fs::read_to_string(Path::new(home).join("iu2u/config.toml")).unwrap();
+    assert!(file.starts_with("# written by hand\n") && file.ends_with("guard = false\n"));
+    assert_eq!(guard_hook(&env), "");
+}
+
+#[tokio::test]
+async fn environment_variables_win_over_the_config_file() {
+    let model = MockServer::start().await;
+    answer_always(&model, irreversible()).await;
+    let home = config_home(
+        "guard-env-wins",
+        "model = \"model-y\"\nbase_url = \"http://127.0.0.1:9\"\nguard = false\n",
+    );
+    let base_url = model.uri();
+    let env = [
+        ("XDG_CONFIG_HOME", home.to_str().unwrap()),
+        ("IU2U_BASE_URL", base_url.as_str()),
+        ("IU2U_MODEL", "model-x"),
+        ("IU2U_GUARD", "true"),
+    ];
+    assert_eq!(permission(&guard_hook(&env)), "deny");
+    let requests = model.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].body_json::<Value>().unwrap()["model"],
+        "model-x"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_config_file_takes_the_cannot_judge_path_and_says_why() {
+    let model = MockServer::start().await;
+    answer_always(&model, irreversible()).await;
+    let home = config_home("guard-bad-config", "colour = \"red\"\n");
+    let base_url = model.uri();
+    let env = [
+        ("XDG_CONFIG_HOME", home.to_str().unwrap()),
+        ("IU2U_BASE_URL", base_url.as_str()),
+        ("IU2U_MODEL", "model-x"),
+    ];
+    let output = hook_output("guard", &env, &guard_input());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(permission(&String::from_utf8_lossy(&output.stdout)), "ask");
+    assert!(
+        stderr.contains("unknown key `colour`") && stderr.contains("iu2u/config.toml"),
+        "{stderr}"
+    );
+    assert_eq!(
+        guard_hook(&[env.as_slice(), &[("IU2U_GUARD", "false")]].concat()),
+        ""
+    );
 }
 
 #[tokio::test]
@@ -108,24 +170,11 @@ async fn unknown_switch_values_keep_the_default() {
     answer_always(&model, irreversible()).await;
     let base_url = model.uri();
     let options = [
-        ("CLAUDE_PLUGIN_OPTION_BASE_URL", base_url.as_str()),
-        ("CLAUDE_PLUGIN_OPTION_MODEL", "model-x"),
-        ("CLAUDE_PLUGIN_OPTION_GUARD", "1"),
+        ("IU2U_BASE_URL", base_url.as_str()),
+        ("IU2U_MODEL", "model-x"),
+        ("IU2U_GUARD", "1"),
     ];
     assert_eq!(permission(&guard_hook(&options)), "deny");
-}
-
-#[tokio::test]
-async fn plugin_options_win_over_environment_variables() {
-    let model = MockServer::start().await;
-    answer_always(&model, irreversible()).await;
-    let base_url = model.uri();
-    let env = [
-        ("CLAUDE_PLUGIN_OPTION_BASE_URL", base_url.as_str()),
-        ("CLAUDE_PLUGIN_OPTION_MODEL", "model-x"),
-        ("IU2U_BASE_URL", "http://127.0.0.1:9"),
-    ];
-    assert_eq!(permission(&guard_hook(&env)), "deny");
 }
 
 #[tokio::test]
@@ -134,8 +183,8 @@ async fn an_empty_plugin_api_key_is_not_replaced_by_the_shell_one() {
     answer_always(&model, irreversible()).await;
     let base_url = model.uri();
     let env = [
-        ("CLAUDE_PLUGIN_OPTION_BASE_URL", base_url.as_str()),
-        ("CLAUDE_PLUGIN_OPTION_MODEL", "model-x"),
+        ("IU2U_BASE_URL", base_url.as_str()),
+        ("IU2U_MODEL", "model-x"),
         ("CLAUDE_PLUGIN_OPTION_API_KEY", ""),
         ("IU2U_API_KEY", "shell-secret"),
     ];
