@@ -76,7 +76,7 @@ const LINK: &str =
 
 fn install_linked(base: &Path) {
     let record = json!({ "repository": "o/r", "revision": "c".repeat(40), "file": "m.gguf",
-        "size": 7, "sha256": "d".repeat(64), "license": "apache-2.0, https://huggingface.co/o/r" });
+        "size": 7, "sha256": "d".repeat(64) });
     std::fs::create_dir_all(data(base).join("models/o/r")).unwrap();
     std::fs::write(
         data(base).join("models/o/r/m.gguf.json"),
@@ -595,7 +595,6 @@ fn init_yes_keeps_the_configured_model_and_tests_it() {
     assert!(text(&output.stdout).starts_with("The model answered in "));
     for expected in [
         "use fastino_GLiDE-9B-Q4_K_M.gguf, already installed",
-        "Built with Fastino GLiDE",
         "claude plugin install iu2u@iu2u",
     ] {
         assert!(stderr.contains(expected), "{expected}\n{stderr}");

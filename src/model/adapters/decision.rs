@@ -101,7 +101,6 @@ pub(crate) struct Record {
     pub(crate) file: String,
     pub(crate) size: u64,
     pub(crate) sha256: String,
-    pub(crate) license: String,
 }
 
 pub(crate) fn built_in() -> Record {
@@ -111,9 +110,6 @@ pub(crate) fn built_in() -> Record {
         file: "fastino_GLiDE-9B-Q4_K_M.gguf".into(),
         size: 5_841_055_424,
         sha256: "371adada0c5b4d0193aa3212b831fdf04cf8f5889a51a9fc1012a9ecc08eb4be".into(),
-        license:
-            "Fastino Community License, https://huggingface.co/fastino/GLiDE-9B/blob/main/LICENSE"
-                .into(),
     }
 }
 
@@ -662,7 +658,6 @@ fn available(dir: &Path) -> Result<u128> {
 pub(crate) struct Repository {
     pub(crate) name: String,
     pub(crate) revision: String,
-    pub(crate) license: String,
     pub(crate) files: Vec<(String, u64, String)>,
 }
 
@@ -679,7 +674,6 @@ impl Repository {
             file: name.clone(),
             size: *size,
             sha256: sha256.clone(),
-            license: self.license.clone(),
         })
     }
 
@@ -688,14 +682,6 @@ impl Repository {
             .as_str()
             .filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
             .context("it gives no revision")?;
-        let card = &info["cardData"];
-        let license = match (card["license"].as_str(), card["license_name"].as_str()) {
-            (Some("other") | None, Some(name)) | (Some(name), _) => name,
-            (None, None) => "no license stated",
-        };
-        let link = card["license_link"]
-            .as_str()
-            .map_or_else(|| format!("{HUGGING_FACE}/{name}"), str::to_owned);
         let files = info["siblings"]
             .as_array()
             .into_iter()
@@ -713,7 +699,6 @@ impl Repository {
         Ok(Self {
             name: name.into(),
             revision: revision.into(),
-            license: format!("{license}, {link}"),
             files,
         })
     }
@@ -1099,15 +1084,10 @@ mod tests {
     }
 
     #[test]
-    fn a_hugging_face_answer_gives_the_revision_the_license_and_the_gguf_files() {
+    fn a_hugging_face_answer_gives_the_revision_and_the_gguf_files() {
         let sha256 = "a".repeat(64);
         let info = json!({
             "sha": "88e7a44e35b3bf38ee716042d61deaa923c92359",
-            "cardData": {
-                "license": "other",
-                "license_name": "fastino-community",
-                "license_link": "https://huggingface.co/fastino/GLiDE-9B/blob/main/LICENSE"
-            },
             "siblings": [
                 { "rfilename": "README.md", "size": 9 },
                 { "rfilename": "m-Q4_K_M.gguf", "size": 7, "lfs": { "sha256": sha256 } },
@@ -1120,19 +1100,7 @@ mod tests {
             repository.revision,
             "88e7a44e35b3bf38ee716042d61deaa923c92359"
         );
-        assert_eq!(
-            repository.license,
-            "fastino-community, https://huggingface.co/fastino/GLiDE-9B/blob/main/LICENSE"
-        );
         assert_eq!(repository.files, [("m-Q4_K_M.gguf".to_owned(), 7, sha256)]);
-        let revision = "b".repeat(40);
-        let licensed = json!({ "sha": revision, "cardData": { "license": "apache-2.0" } });
-        let license = |info| Repository::from_api("o/r", &info).unwrap().license;
-        assert_eq!(license(licensed), "apache-2.0, https://huggingface.co/o/r");
-        assert_eq!(
-            license(json!({ "sha": revision })),
-            "no license stated, https://huggingface.co/o/r"
-        );
         assert!(Repository::from_api("o/r", &json!({ "sha": "main" })).is_err());
     }
 
@@ -1168,7 +1136,6 @@ mod tests {
             file: file.into(),
             size: 7,
             sha256: "a".repeat(64),
-            license: "apache-2.0".into(),
         }
     }
 

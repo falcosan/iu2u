@@ -16,7 +16,6 @@ const LOCAL_BY_DEFAULT: bool = cfg!(all(target_os = "macos", target_arch = "aarc
 const ANSWER_WITHIN: Duration = Duration::from_secs(120);
 const PROGRESS_EVERY: Duration = Duration::from_secs(5);
 const LOADED_OVERHEAD: u64 = 1_500_000_000;
-const FASTINO_TERMS: &str = "The Fastino Community License binds you: commercial use must display \"Built with Fastino GLiDE\", and an organisation with more than 10 million US dollars of yearly revenue needs an agreement with Fastino.";
 const CPU_ONLY: &str = "On Linux the bundled runtime uses the CPU only: one yes-or-no question took 11.7 s on 6 CPUs with a smaller file than the default, so hooks will time out.";
 const TEST_STATE: &str = "rm -rf ~/Documents";
 
@@ -319,10 +318,6 @@ fn summarize(home: &Path, record: &Record) {
         "  memory: about {} while the model is loaded; this machine has {memory}",
         bytes(record.size + LOADED_OVERHEAD)
     );
-    eprintln!("  license: {}", record.license);
-    if record.license.to_lowercase().contains("fastino") {
-        eprintln!("  {FASTINO_TERMS}");
-    }
     if cfg!(target_os = "linux") {
         eprintln!("  {CPU_ONLY}");
     }
