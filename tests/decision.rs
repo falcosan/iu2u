@@ -170,7 +170,7 @@ fn kill(pids: &[&Value]) {
     wait_until(|| pids.iter().all(|pid| !alive(pid)));
 }
 
-fn wait_until(done: impl Fn() -> bool) {
+fn wait_until(mut done: impl FnMut() -> bool) {
     let started = Instant::now();
     while !done() {
         assert!(started.elapsed() < Duration::from_secs(20), "timed out");
@@ -199,11 +199,14 @@ fn a_request_starts_a_private_server_that_stops_when_idle() {
     assert_eq!(mode & 0o777, 0o700);
     let started = &starts(&base)[0];
     assert_eq!(started["leaked"], json!([]));
-    assert_eq!(started["cwd"], run.to_str().unwrap());
+    assert_eq!(
+        started["cwd"],
+        run.canonicalize().unwrap().to_str().unwrap()
+    );
     #[cfg(target_os = "linux")]
     assert_eq!(
         std::fs::read_link(format!("/proc/{}/cwd", started["parent"])).unwrap(),
-        data(&base)
+        data(&base).canonicalize().unwrap()
     );
     let args = started["args"].as_array().unwrap();
     for expected in [
@@ -359,6 +362,7 @@ fn warm_starts_the_server_at_once_and_replaces_one_that_lost_its_supervisor() {
 const HANDS_OVER: &str = r#"
 import os, signal, socket, sys
 path = sys.argv[1]
+held = []
 def listen():
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(path)
@@ -373,13 +377,14 @@ def hand_over(*_):
             pid.write(str(os.getpid()))
         os.write(write, b"x")
         while True:
-            successor.accept()[0].close()
+            held.append(successor.accept()[0])
     os.read(read, 1)
     os._exit(0)
 listener = listen()
+signal.alarm(30)
 signal.signal(signal.SIGTERM, hand_over)
 while True:
-    listener.accept()[0].close()
+    held.append(listener.accept()[0])
 "#;
 
 #[test]
@@ -405,7 +410,7 @@ fn stop_returns_when_the_stopped_server_hands_its_socket_to_a_new_one() {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    first.wait().unwrap();
+    wait_until(|| first.try_wait().unwrap().is_some());
     let successor = std::fs::read_to_string(socket.with_extension("sock.successor")).unwrap();
     let successor = Value::from(successor.parse::<u32>().unwrap());
     let still_serves = alive(&successor);
