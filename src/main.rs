@@ -9,7 +9,8 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures_util::{StreamExt, stream};
-use iu2u::{commands, config, hooks::Power, mcp::Server, model::Client};
+use iu2u::commands::{self, EXIT_ERROR, EXIT_FAILED};
+use iu2u::{config, hooks::Power, mcp::Server, model::Client};
 use rmcp::{ServiceExt, transport::stdio};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 #[cfg(unix)]
@@ -160,7 +161,7 @@ async fn run(command: Command) -> Result<ExitCode> {
         Command::Filter { statement, at } => {
             return Ok(match filter(&statement, at).await {
                 Ok(true) => ExitCode::SUCCESS,
-                Ok(false) => ExitCode::from(1),
+                Ok(false) => ExitCode::from(EXIT_FAILED),
                 Err(error) => failed(&error),
             });
         }
@@ -199,7 +200,7 @@ async fn run(command: Command) -> Result<ExitCode> {
 
 fn failed(error: &anyhow::Error) -> ExitCode {
     writeln!(std::io::stderr(), "Error: {error:#}").ok();
-    ExitCode::from(2)
+    ExitCode::from(EXIT_ERROR)
 }
 
 #[cfg(unix)]
@@ -218,7 +219,7 @@ fn settings(action: Option<Setting>) -> Result<ExitCode> {
         None => print!("{}", config::list()?),
         Some(Setting::Get { key }) => match config::get(&key)? {
             Some(value) => println!("{value}"),
-            None => return Ok(ExitCode::from(1)),
+            None => return Ok(ExitCode::from(EXIT_FAILED)),
         },
         Some(Setting::Set { key, value }) => config::set(&key, &value)?,
         Some(Setting::Unset { key }) => config::unset(&key)?,
@@ -319,7 +320,7 @@ async fn act(
                     (Some(text), outcome.report)
                 }
                 Err(error) => {
-                    exit_code = 2;
+                    exit_code = EXIT_ERROR;
                     let report =
                         serde_json::json!({ "status": "error", "error": format!("{error:#}") });
                     (None, report)
@@ -329,7 +330,7 @@ async fn act(
             reporter.finish(&report, text.as_deref());
             running = None;
             if first && exit_code != 0 {
-                exit_code = 2;
+                exit_code = EXIT_ERROR;
                 break;
             }
             if reporter.broken() {

@@ -13,7 +13,7 @@ mod zip;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -22,17 +22,16 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::future::join_all;
 use serde_json::{Value, json};
 
-pub(crate) use shell::tail;
-
+use super::{EXIT_ERROR, EXIT_FAILED};
 use crate::config::Config;
-use crate::model::{Answers, Client, Questions, timed_out};
+use crate::model::{Answers, Client, Question, Questions};
 use crate::{clip, write_atomically};
 use browser::{Browser, Handling, file_names};
 use decide::{Decision, Input, Verdict};
 use lock::{Lock, Move, Recorded, Replay};
 pub use reporter::Reporter;
 use screen::{Candidate, MAX_ELEMENTS, Node, Origin, Screen};
-use script::{Body, Files, Part, Reply, Request, Route, Start, Step};
+use script::{Body, Files, Part, Reply, Request, Route, Start, Step, With};
 use surface::{Action, Surface};
 
 const MAX_ACTIONS: usize = 15;
@@ -40,19 +39,20 @@ const MAX_DECISIONS: usize = 30;
 const SEE_WITHIN: Duration = Duration::from_secs(5);
 const SEE_EVERY: Duration = Duration::from_millis(200);
 const REMOVE_WITHIN: Duration = Duration::from_secs(2);
+const FIT_PERCENT: usize = 90;
+const START_BYTES_PER_TOKEN: usize = 8;
 const REPORT_SCREEN_CHARS: usize = 3000;
-const FLOAT_SLACK: f64 = 1e-9;
 const TEXT_ONLY: &str =
     "The screen is given as text only: it does not show colours, positions, sizes or pictures.";
 const CHANGED: &str = "the screen does not match the lock file; run without --locked to update it";
 const RUN_WITHIN: Duration = Duration::from_secs(120);
+const PLAIN_TEXT: &str = "text/plain; charset=utf-8";
+const SAFE_METHODS: [&str; 3] = ["GET", "HEAD", "OPTIONS"];
 const AGAIN_EVERY: Duration = Duration::from_millis(500);
 const MAX_RECENT: usize = 30;
 const LASTING_ASKS: usize = 2;
 const ASK_PAUSE: Duration = Duration::from_secs(1);
 const MAX_ASK_PAUSE: Duration = Duration::from_secs(8);
-const MODEL_TRIES: u32 = 3;
-const RETRY_AFTER: Duration = Duration::from_secs(1);
 
 const NOT_LOCKED: &str = "this step is not in the lock file; run without --locked to record it";
 
@@ -66,7 +66,9 @@ pub struct Suite {
     headful: bool,
     vision: bool,
     services: Vec<shell::Service>,
+    browsers: Vec<u32>,
     values: Vec<Input>,
+    secrets: Vec<Input>,
     files: Vec<script::Files>,
     dir: std::path::PathBuf,
     http: reqwest::Client,
@@ -74,11 +76,7 @@ pub struct Suite {
 
 impl Suite {
     pub fn new(locked: bool, headful: bool) -> Result<Self> {
-        let vision = match Config::load()?.get("vision").as_deref() {
-            None | Some("false" | "0") => false,
-            Some("true" | "1") => true,
-            Some(_) => bail!("IU2U_VISION must be true or false"),
-        };
+        let vision = Config::load()?.get("vision")?.as_deref() == Some("true");
         browser::sweep(&std::env::temp_dir());
         let dir =
             std::env::temp_dir().join(format!("{}{}", browser::SUITE_PREFIX, std::process::id()));
@@ -88,7 +86,9 @@ impl Suite {
             headful,
             vision,
             services: Vec::new(),
+            browsers: Vec::new(),
             values: Vec::new(),
+            secrets: Vec::new(),
             files: Vec::new(),
             dir,
             http: http::client()?,
@@ -97,6 +97,7 @@ impl Suite {
 
     pub async fn stop(self) {
         join_all(self.services.into_iter().map(shell::stop)).await;
+        shell::gone(&self.browsers, REMOVE_WITHIN).await;
         let started = Instant::now();
         while std::fs::remove_dir_all(&self.dir).is_err()
             && self.dir.exists()
@@ -127,7 +128,7 @@ enum Replayed {
 #[derive(Clone)]
 enum Again {
     Request(Request),
-    Run(String, Duration),
+    Ran,
     Logs(String),
 }
 
@@ -150,7 +151,8 @@ struct Run<'a> {
     new: Lock,
     screen: String,
     omitted: usize,
-    cut: bool,
+    cut: Option<String>,
+    fitted: Option<(String, Option<usize>)>,
     shows_secret: bool,
     shot: Option<String>,
     done: Vec<String>,
@@ -171,28 +173,71 @@ pub async fn act(
         before || !script.steps.is_empty(),
         "the script has no steps"
     );
-    let shared: Vec<Input> = suite
+    let mut inputs: Vec<Input> = suite
         .values
         .iter()
         .filter(|value| !script::taken(&script, &value.key))
         .cloned()
         .collect();
-    let shared_files: Vec<script::Files> = suite
+    let mut files: Vec<Files> = suite
         .files
         .iter()
         .filter(|files| !script::taken(&script, &files.key))
         .cloned()
         .collect();
-    script.files.extend(shared_files);
-    script.inputs.extend(shared);
-    for (key, command) in std::mem::take(&mut script.commands) {
-        let ran = shell::run(&command, &environment(&script.inputs), RUN_WITHIN)
+    let old: Lock = match lock.map(|path| (path, std::fs::read_to_string(path))) {
+        Some((path, Ok(saved))) => serde_json::from_str(&saved)
+            .with_context(|| format!("{} is not valid; delete it to start over", path.display()))?,
+        Some((path, Err(error))) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(
+                anyhow::Error::new(error).context(format!("cannot read {}", path.display()))
+            );
+        }
+        _ => Lock::new(),
+    };
+    let mut env = suite.secrets.clone();
+    for with in std::mem::take(&mut script.withs) {
+        let (key, command, within) = match with {
+            With::Value { key, text } => {
+                let (text, secret) = script::resolved(&text, &inputs, &mut env)
+                    .with_context(|| format!("with {key}"))?;
+                inputs.push(Input { key, text, secret });
+                continue;
+            }
+            With::Files {
+                key,
+                paths,
+                zip,
+                base,
+            } => {
+                let paths = paths
+                    .iter()
+                    .map(|path| script::located_path(&base, path, &inputs, &mut env))
+                    .collect::<Result<_>>()
+                    .with_context(|| format!("with {key}"))?;
+                files.push(Files { key, paths, zip });
+                continue;
+            }
+            With::Run {
+                key,
+                command,
+                within,
+            } => (key, command, within),
+        };
+        let within = within.unwrap_or(RUN_WITHIN);
+        let ran = shell::run(&command, &environment(&inputs), within)
             .await
-            .with_context(|| format!("with {key}"))?;
-        let said = ran.lines[ran.stdout.lines().count()..].last().map(|line| {
+            .with_context(|| format!("with {key}"))?
+            .with_context(|| {
+                format!(
+                    "with {key}: the command did not finish within {}s",
+                    within.as_secs_f64()
+                )
+            })?;
+        let said = ran.stderr.lines().last().map(|line| {
             format!(
                 ": {}",
-                screen::Hider::new(&secrets(&script.inputs)).hide(line)
+                screen::Hider::new(&secrets(inputs.iter().chain(&env))).hide(line)
             )
         });
         anyhow::ensure!(
@@ -204,26 +249,17 @@ pub async fn act(
         anyhow::ensure!(
             !ran.cut,
             "with {key}: the command printed more than {} bytes, too much for a value",
-            shell::KEPT_BYTES
+            crate::tail::KEPT_BYTES
         );
         let text = ran.stdout.trim().to_owned();
         anyhow::ensure!(!text.is_empty(), "with {key}: the command printed nothing");
-        script.inputs.push(Input {
+        inputs.push(Input {
             key,
             text,
             secret: true,
         });
     }
-    let old: Lock = match lock.map(|path| (path, std::fs::read_to_string(path))) {
-        Some((path, Ok(saved))) => serde_json::from_str(&saved)
-            .with_context(|| format!("{} is not valid; delete it to start over", path.display()))?,
-        Some((path, Err(error))) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(
-                anyhow::Error::new(error).context(format!("cannot read {}", path.display()))
-            );
-        }
-        _ => Lock::new(),
-    };
+    script::read_ahead(&script.steps, &inputs, &mut env);
     let started = Instant::now();
     let inherited_services = suite.services.len();
     suite
@@ -239,9 +275,9 @@ pub async fn act(
         json: None,
         again: None,
         recent: Vec::new(),
-        inputs: script.inputs,
-        env: Vec::new(),
-        files: script.files,
+        inputs,
+        env,
+        files,
         chosen: Vec::new(),
         numbers: Vec::new(),
         named: Vec::new(),
@@ -249,7 +285,8 @@ pub async fn act(
         new: Lock::new(),
         screen: String::new(),
         omitted: 0,
-        cut: false,
+        cut: None,
+        fitted: None,
         shows_secret: false,
         shot: None,
         done: Vec::new(),
@@ -281,7 +318,10 @@ pub async fn act(
             }
         };
         let detail = detail.map(|detail| run.hidden(&detail));
-        let actions = std::mem::take(&mut run.done);
+        let actions: Vec<String> = std::mem::take(&mut run.done)
+            .iter()
+            .map(|action| run.hidden(action))
+            .collect();
         let reported = json!({
             "line": line,
             "step": text,
@@ -306,18 +346,19 @@ pub async fn act(
     if let Some(path) = lock.map(|path| path.with_extension("failed.png")) {
         std::fs::remove_file(&path).ok();
         if status != "passed"
-            && matches!(run.surface, Some(Surface::Browser(_)))
-            && !run.page_shows_secret().await
             && let Ok(Some(png)) = run.fresh_shot().await
             && let Ok(png) = STANDARD.decode(png)
-            && std::fs::write(&path, png).is_ok()
         {
-            screenshot = Some(path.display().to_string());
+            match std::fs::write(&path, png) {
+                Ok(()) => screenshot = Some(path.display().to_string()),
+                Err(failure) => eprintln!("warning: cannot write {}: {failure}", path.display()),
+            }
         }
     }
     run.close().await;
     if before {
         run.suite.values = std::mem::take(&mut run.inputs);
+        run.suite.secrets = std::mem::take(&mut run.env);
         run.suite.files = std::mem::take(&mut run.files);
     } else {
         join_all(
@@ -354,8 +395,8 @@ pub async fn act(
     Ok(Outcome {
         code: match status {
             "passed" => 0,
-            "failed" => 1,
-            _ => 2,
+            "failed" => EXIT_FAILED,
+            _ => EXIT_ERROR,
         },
         report,
     })
@@ -391,8 +432,49 @@ fn text_nodes(lines: &[String], http: bool) -> Vec<Node> {
     nodes
 }
 
+async fn fitting(client: &Client, screen: &Screen) -> Option<usize> {
+    let context = client.context().await?;
+    let options: String = screen
+        .elements
+        .iter()
+        .map(|element| element.describe() + "\n")
+        .collect();
+    let options = match client.tokens(&options).await {
+        Ok(tokens) => tokens,
+        Err(_) => options.len(),
+    };
+    let tokens = (context / decide::SCREEN_SHARE)
+        .min(context.saturating_sub(decide::RESERVED_TOKENS + options));
+    if tokens == 0 {
+        return None;
+    }
+    let total = screen.text.chars().count();
+    if screen.text.len() <= tokens {
+        return Some(total);
+    }
+    let mut chars = decide::within_bytes(
+        &screen.text,
+        tokens.saturating_mul(START_BYTES_PER_TOKEN),
+        screen.tail,
+    );
+    loop {
+        let part: String = if screen.tail {
+            screen.text.chars().skip(total - chars).collect()
+        } else {
+            screen.text.chars().take(chars).collect()
+        };
+        let Ok(counted) = client.tokens(&part).await else {
+            return Some(decide::within_bytes(&screen.text, tokens, screen.tail));
+        };
+        if counted <= tokens {
+            return Some(chars);
+        }
+        chars = chars * tokens / counted * FIT_PERCENT / 100;
+    }
+}
+
 fn percent(probability: f64) -> u32 {
-    (probability * 100.0 + FLOAT_SLACK).floor() as u32
+    (probability * 100.0 + decide::FLOAT_SLACK).floor() as u32
 }
 
 fn same_place<'a>(
@@ -425,16 +507,6 @@ fn keeps_response(step: &Step) -> bool {
     )
 }
 
-fn transient(error: &anyhow::Error) -> bool {
-    timed_out(error)
-        || error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
-            error.is_connect()
-                || error.status().is_some_and(|status| {
-                    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-                })
-        })
-}
-
 fn seconds(since: Instant) -> f64 {
     (since.elapsed().as_secs_f64() * 10.0).round() / 10.0
 }
@@ -455,6 +527,14 @@ impl Report {
             detail: Some(detail),
         }
     }
+
+    fn inconclusive(via: &'static str, detail: String) -> Self {
+        Self {
+            status: "inconclusive",
+            via,
+            detail: Some(detail),
+        }
+    }
 }
 
 impl Run<'_> {
@@ -470,7 +550,7 @@ impl Run<'_> {
         }
         match step {
             Step::Open(url) => {
-                let url = self.expanded(url)?;
+                let url = self.expanded_url(url)?;
                 self.browser().await?.open(&url).await?;
                 Ok(Report::passed("browser", None))
             }
@@ -483,12 +563,14 @@ impl Run<'_> {
             #[cfg(not(target_os = "macos"))]
             Step::App(name) => Err(anyhow!("driving the app {name:?} needs macOS")),
             Step::Do(goal) => {
-                self.chosen = given(script::named(goal, &self.files), &self.suite.dir)?;
+                self.chosen = given(script::named(goal, &self.files), &self.suite.dir).await?;
                 if let Some(Surface::Browser(browser)) = &self.surface {
                     browser.forget_given();
                 }
-                let inputs = script::inputs(goal, &self.inputs);
-                let mut report = self.reach(key, goal, &inputs).await?;
+                let inputs = script::inputs(goal, &self.inputs, &self.files, &mut self.env)?;
+                let (goal, _) = script::filled(goal, &self.inputs, &self.files, &mut self.env)?;
+                self.cut = None;
+                let mut report = self.reach(key, &goal, &inputs).await?;
                 let mut notes = Vec::new();
                 if self.omitted > 0 {
                     notes.push(format!(
@@ -496,8 +578,8 @@ impl Run<'_> {
                         self.omitted
                     ));
                 }
-                if self.cut {
-                    notes.push(decide::cut_note(false));
+                if let Some(cut) = self.cut.take() {
+                    notes.push(cut);
                 }
                 if report.status == "failed" && !notes.is_empty() {
                     report.detail = Some(
@@ -522,7 +604,10 @@ impl Run<'_> {
                 self.observe().await?;
                 Ok(Report::passed("shell", None))
             }
-            Step::Extract(name, what) => self.extract(key, name, what).await,
+            Step::Extract(name, what) => {
+                let (what, _) = script::filled(what, &self.inputs, &self.files, &mut self.env)?;
+                self.extract(key, name, &what).await
+            }
             Step::Wait(duration) => {
                 tokio::time::sleep(*duration).await;
                 Ok(Report::passed("wait", None))
@@ -552,7 +637,7 @@ impl Run<'_> {
                 Ok(Report::passed("browser", None))
             }
             Step::Release(pattern) => {
-                let pattern = self.expanded(pattern)?;
+                let pattern = self.expanded_url(pattern)?;
                 let released = self.browser().await?.release(&pattern).await?;
                 Ok(Report::passed(
                     "browser",
@@ -568,9 +653,9 @@ impl Run<'_> {
     async fn browser(&mut self) -> Result<&mut Browser> {
         if !matches!(self.surface, Some(Surface::Browser(_))) {
             self.close().await;
-            self.surface = Some(Surface::Browser(
-                Browser::launch(self.suite.headful, &self.suite.dir).await?,
-            ));
+            let browser = Browser::launch(self.suite.headful, &self.suite.dir).await?;
+            self.suite.browsers.extend(browser.group());
+            self.surface = Some(Surface::Browser(browser));
         }
         let Some(Surface::Browser(browser)) = &mut self.surface else {
             unreachable!()
@@ -579,16 +664,25 @@ impl Run<'_> {
     }
 
     async fn route(&mut self, route: &Route) -> Result<Report> {
-        let pattern = self.expanded(&route.pattern)?;
+        let pattern = self.expanded_url(&route.pattern)?;
         let handling = match &route.reply {
-            Reply::To(_) if pattern.contains('*') => {
-                bail!("route ... to needs an address without *, whose start it replaces")
+            Reply::To(_) if pattern.contains(['*', '?']) => {
+                bail!("route ... to needs an address without * or ?, whose start it replaces")
             }
-            Reply::To(url) => Handling::To(self.expanded(url)?),
+            Reply::To(url) => {
+                let target = self.expanded_url(url)?;
+                reqwest::Url::parse(&target)
+                    .ok()
+                    .filter(|url| matches!(url.scheme(), "http" | "https"))
+                    .with_context(|| {
+                        format!("route ... to needs a whole http or https address, such as http://127.0.0.1:4000, not {target:?}")
+                    })?;
+                Handling::To(target)
+            }
             Reply::Hold => Handling::Hold,
             Reply::Answer(status, body) => {
                 let (body, content_type) = match body {
-                    None => (Vec::new(), "text/plain; charset=utf-8".to_owned()),
+                    None => (Vec::new(), PLAIN_TEXT.to_owned()),
                     Some(Part::Text(text)) => {
                         let text = if text.trim_start().starts_with(['{', '[']) {
                             self.expanded_json(text)?
@@ -600,12 +694,12 @@ impl Run<'_> {
                         } else if text.trim_start().starts_with('<') {
                             "text/html; charset=utf-8"
                         } else {
-                            "text/plain; charset=utf-8"
+                            PLAIN_TEXT
                         };
                         (text.into_bytes(), kind.to_owned())
                     }
-                    Some(Part::File(path)) => {
-                        let path = self.expanded(path)?;
+                    Some(Part::File(base, path)) => {
+                        let path = self.file_path(base, path)?;
                         let body =
                             std::fs::read(&path).with_context(|| format!("cannot read {path}"))?;
                         (body, browser::content_type(&path))
@@ -626,9 +720,12 @@ impl Run<'_> {
     }
 
     async fn request(&mut self, request: &Request) -> Result<Report> {
-        let address = self.expanded(&request.url)?;
+        let address = self.expanded_url(&request.url)?;
         let url = match reqwest::Url::parse(&address) {
             Ok(url) => url,
+            Err(error) if address.contains("://") => {
+                return Err(error).with_context(|| format!("{address:?} is not a valid address"));
+            }
             Err(_) => {
                 let page = match &mut self.surface {
                     Some(Surface::Browser(browser)) => browser.url().await?,
@@ -654,8 +751,8 @@ impl Run<'_> {
             Some(Body::Json(Part::Text(text))) => {
                 Some(Body::Json(Part::Text(self.expanded_json(text)?)))
             }
-            Some(Body::Json(Part::File(path))) => {
-                let path = self.expanded(path)?;
+            Some(Body::Json(Part::File(base, path))) => {
+                let path = self.file_path(base, path)?;
                 let text = std::fs::read_to_string(&path)
                     .with_context(|| format!("cannot read {path}"))?;
                 Some(Body::Json(Part::Text(text)))
@@ -667,7 +764,9 @@ impl Run<'_> {
                         name.clone(),
                         match part {
                             Part::Text(text) => Part::Text(self.expanded(text)?),
-                            Part::File(path) => Part::File(self.expanded(path)?),
+                            Part::File(base, path) => {
+                                Part::File(PathBuf::new(), self.file_path(base, path)?)
+                            }
                         },
                     ));
                 }
@@ -679,7 +778,7 @@ impl Run<'_> {
         let status = lines.first().cloned();
         self.response = Some(lines);
         self.json = json;
-        self.again = ["GET", "HEAD", "OPTIONS"]
+        self.again = SAFE_METHODS
             .iter()
             .any(|safe| expanded.method.eq_ignore_ascii_case(safe))
             .then_some(Again::Request(expanded));
@@ -695,7 +794,6 @@ impl Run<'_> {
             .find(|service| service.name == name)
             .with_context(|| format!("no service named {name} was started"))?;
         self.response = Some(shell::logs(service));
-        self.json = None;
         Ok(())
     }
 
@@ -706,30 +804,28 @@ impl Run<'_> {
         let again = async {
             match self.again.clone() {
                 Some(Again::Request(request)) => {
-                    (self.response, self.json) = match http::send(&self.suite.http, &request).await
-                    {
-                        Ok((lines, json)) => (Some(lines), json),
-                        Err(error) => (Some(vec![format!("{error:#}")]), None),
-                    };
-                }
-                Some(Again::Run(command, within)) => {
-                    let ran = shell::run(&command, &environment(&self.inputs), within).await;
-                    self.response = Some(match ran {
-                        Ok(ran) => ran.shown(),
-                        Err(error) => vec![format!("{error:#}")],
-                    });
-                    self.json = None;
+                    if let Ok((lines, json)) = http::send(&self.suite.http, &request).await {
+                        (self.response, self.json) = (Some(lines), json);
+                    }
                 }
                 Some(Again::Logs(name)) => self.logs(&name)?,
-                None => {}
+                Some(Again::Ran) | None => {}
             }
             Ok(())
         };
         tokio::time::timeout(left, again).await.unwrap_or(Ok(()))
     }
 
+    fn file_path(&mut self, base: &Path, path: &str) -> Result<String> {
+        script::located_path(base, path, &self.inputs, &mut self.env)
+    }
+
     fn expanded(&mut self, text: &str) -> Result<String> {
         script::expand(text, &self.inputs, &mut self.env)
+    }
+
+    fn expanded_url(&mut self, text: &str) -> Result<String> {
+        script::expand_url(text, &self.inputs, &mut self.env)
     }
 
     fn expanded_json(&mut self, text: &str) -> Result<String> {
@@ -740,6 +836,16 @@ impl Run<'_> {
         self.surface
             .as_mut()
             .context("start the script with open or app")
+    }
+
+    async fn fit(&mut self, screen: &mut Screen) {
+        screen.fits = match (&self.client, &self.fitted) {
+            (_, Some((text, fits))) if *text == screen.text => *fits,
+            (Ok(client), _) => fitting(client, screen).await,
+            (Err(_), _) => None,
+        };
+        self.fitted = Some((screen.text.clone(), screen.fits));
+        self.cut = decide::cut(screen).then(|| decide::cut_note(screen));
     }
 
     async fn observe(&mut self) -> Result<Screen> {
@@ -777,7 +883,6 @@ impl Run<'_> {
             }
         }
         self.omitted = screen.omitted;
-        self.cut = decide::cut(&screen);
         self.shows_secret = screen.shows_secret;
         screen.spots = screen.hovers && self.suite.vision && !screen.shows_secret;
         self.shot = None;
@@ -859,9 +964,17 @@ impl Run<'_> {
             return Ok(());
         }
         if let Some(chooser) = chooser {
-            let given = browser.choose(chooser, &paths).await?;
-            self.done
-                .push(format!("gave the file chooser {}", gave(&given)));
+            match browser.choose(chooser, &paths).await {
+                Ok(given) => self
+                    .done
+                    .push(format!("gave the file chooser {}", gave(&given))),
+                Err(error) => {
+                    if let Some(picker) = &picker {
+                        browser.refuse(picker).await?;
+                    }
+                    return Err(error);
+                }
+            }
         }
         if let Some(picker) = picker {
             match browser.pick(&picker, &paths).await {
@@ -937,7 +1050,15 @@ impl Run<'_> {
         questions: &Questions,
         screenshot: Option<String>,
     ) -> Result<Answers> {
+        let hidden = self.hidden(state);
+        let state = hidden.as_str();
         let client = self.client.as_ref().map_err(|error| anyhow!("{error:#}"))?;
+        let sent = state.chars().count() + questions.values().map(Question::chars).sum::<usize>();
+        let scale = u32::try_from(sent.div_ceil(decide::SCREEN_CHARS_WITHOUT_CONTEXT).max(1))
+            .unwrap_or(u32::MAX);
+        let client = client
+            .clone()
+            .with_timeout(client.timeout().saturating_mul(scale));
         let text_only;
         let state = if screenshot.is_none() {
             text_only = format!("{state}\n\n{TEXT_ONLY}");
@@ -945,20 +1066,10 @@ impl Run<'_> {
         } else {
             state
         };
-        let mut tried = 0;
-        loop {
-            tried += 1;
-            self.model_calls += 1;
-            match client
-                .ask_seeing(state, questions, screenshot.as_deref())
-                .await
-            {
-                Err(error) if tried < MODEL_TRIES && transient(&error) => {
-                    tokio::time::sleep(RETRY_AFTER * tried).await;
-                }
-                answers => return answers,
-            }
-        }
+        self.model_calls += 1;
+        client
+            .ask_seeing(state, questions, screenshot.as_deref())
+            .await
     }
 
     async fn reach(&mut self, key: &str, goal: &str, inputs: &[Input]) -> Result<Report> {
@@ -1031,6 +1142,7 @@ impl Run<'_> {
                 }
                 Replay::Changed => return afresh(moves, via, last),
                 Replay::Missing(control) => {
+                    self.fit(&mut screen).await;
                     let state =
                         decide::Step::new(goal, &screen, inputs).state(&self.done, &self.chosen);
                     let recognized = decide::recognize(&control, &screen, async |questions| {
@@ -1131,7 +1243,8 @@ impl Run<'_> {
         let mut blocked = HashMap::new();
         let mut unsure_before = false;
         for _ in 0..MAX_DECISIONS {
-            let screen = self.observe().await?;
+            let mut screen = self.observe().await?;
+            self.fit(&mut screen).await;
             let unfocused = screen.unfocused();
             if shown != unfocused {
                 seen.clear();
@@ -1163,7 +1276,7 @@ impl Run<'_> {
                     ));
                 }
                 Decision::Unsure(reason) if unsure_before => {
-                    return Ok(Report::failed(
+                    return Ok(Report::inconclusive(
                         via,
                         format!("the model was unsure {reason}"),
                     ));
@@ -1267,7 +1380,7 @@ impl Run<'_> {
             return Ok(Report::failed("cache", self.not_replayed(key)));
         }
         let mut screen = self.observe().await?;
-        let (mut verdict, mut holds, mut sight) = self.judge(&screen, claim).await?;
+        let (mut verdict, mut holds, mut sight) = self.judge(&mut screen, claim).await?;
         let mut judged = self.shot.clone();
         let (mut asked, mut pause) = (Instant::now(), Duration::ZERO);
         while verdict != Verdict::Holds && started.elapsed() < patience {
@@ -1281,13 +1394,13 @@ impl Run<'_> {
                 self.again(patience.saturating_sub(started.elapsed()))
                     .await?;
             }
-            let now = self.observe().await?;
+            let mut now = self.observe().await?;
             if asked.elapsed() < pause && started.elapsed() < patience {
                 continue;
             }
             let looks = sight && self.suite.vision && self.response.is_none();
             if now.text != screen.text || (looks && self.fresh_shot().await? != judged) {
-                (verdict, holds, sight) = self.judge(&now, claim).await?;
+                (verdict, holds, sight) = self.judge(&mut now, claim).await?;
                 judged = self.shot.clone();
                 screen = now;
                 asked = Instant::now();
@@ -1296,11 +1409,11 @@ impl Run<'_> {
         }
         if verdict == Verdict::Holds {
             for _ in 0..LASTING_ASKS {
-                let now = self.observe().await?;
+                let mut now = self.observe().await?;
                 if now.signature() == screen.signature() {
                     break;
                 }
-                let (again, again_holds, again_sight) = self.judge(&now, claim).await?;
+                let (again, again_holds, again_sight) = self.judge(&mut now, claim).await?;
                 if again != Verdict::Holds {
                     break;
                 }
@@ -1319,7 +1432,7 @@ impl Run<'_> {
             ),
         };
         if decide::cut(&screen) {
-            write!(detail, "; {}", decide::cut_note(screen.tail)).ok();
+            write!(detail, "; {}", decide::cut_note(&screen)).ok();
         }
         let sees = self.suite.vision;
         if sight && !sees {
@@ -1337,15 +1450,12 @@ impl Run<'_> {
                 Report::passed("model", Some(detail))
             }
             Verdict::Contradicted => Report::failed("model", detail),
-            Verdict::Inconclusive => Report {
-                status: "inconclusive",
-                via: "model",
-                detail: Some(detail),
-            },
+            Verdict::Inconclusive => Report::inconclusive("model", detail),
         })
     }
 
-    async fn judge(&mut self, screen: &Screen, claim: &str) -> Result<(Verdict, f64, bool)> {
+    async fn judge(&mut self, screen: &mut Screen, claim: &str) -> Result<(Verdict, f64, bool)> {
+        self.fit(screen).await;
         let state = decide::screen_state(screen);
         let answers = self.ask(&state, &decide::claim(claim)).await?;
         let (verdict, holds) = decide::verdict(&answers)?;
@@ -1380,7 +1490,7 @@ impl Run<'_> {
 
     fn patience(&self, within: Option<Duration>) -> Duration {
         match (&self.response, &self.again) {
-            (Some(_), None) => Duration::ZERO,
+            (Some(_), None | Some(Again::Ran)) => Duration::ZERO,
             (Some(_), Some(_)) => within.unwrap_or_default(),
             (None, _) => within.unwrap_or(SEE_WITHIN),
         }
@@ -1483,7 +1593,7 @@ impl Run<'_> {
     }
 
     fn shell(&self) -> bool {
-        matches!(self.again, Some(Again::Run(..) | Again::Logs(_)))
+        matches!(self.again, Some(Again::Ran | Again::Logs(_)))
     }
 
     async fn extract(&mut self, key: &str, name: &str, what: &str) -> Result<Report> {
@@ -1533,6 +1643,7 @@ impl Run<'_> {
                     .take(MAX_ELEMENTS)
                     .map(|candidate| candidate.shown.clone())
                     .collect();
+                self.fit(&mut screen).await;
                 let state = decide::screen_state(&screen);
                 let picked = decide::pick(what, &offered, async |questions| {
                     self.ask(&state, &questions).await
@@ -1584,9 +1695,14 @@ impl Run<'_> {
     }
 
     async fn close(&mut self) {
+        let group = match &self.surface {
+            Some(Surface::Browser(browser)) => browser.group(),
+            _ => None,
+        };
         if let Some(surface) = self.surface.take() {
             surface.close().await;
         }
+        self.suite.browsers.retain(|kept| Some(*kept) != group);
     }
 
     async fn fresh_shot(&mut self) -> Result<Option<String>> {
@@ -1602,11 +1718,11 @@ impl Run<'_> {
     }
 
     async fn page_shows_secret(&mut self) -> bool {
-        let screen = std::mem::take(&mut self.screen);
-        self.response = None;
-        let shows = self.observe().await.map_or(true, |page| page.shows_secret);
-        self.screen = screen;
-        shows
+        let secrets = secrets(self.inputs.iter().chain(&self.env));
+        match &mut self.surface {
+            Some(Surface::Browser(browser)) => browser.shows(&secrets).await,
+            _ => true,
+        }
     }
 
     fn hidden(&self, text: &str) -> String {
@@ -1619,12 +1735,19 @@ impl Run<'_> {
 
     async fn run(&mut self, command: &str, within: Duration) -> Result<Report> {
         let command = &format!("exec 2>&1; {command}");
-        let ran = shell::run(command, &environment(&self.inputs), within).await?;
+        self.again = Some(Again::Ran);
+        let Some(ran) = shell::run(command, &environment(&self.inputs), within).await? else {
+            return Ok(Report::failed(
+                "shell",
+                format!(
+                    "the command did not finish within {}s",
+                    within.as_secs_f64()
+                ),
+            ));
+        };
         let (exit, code) = (ran.exit(), ran.code);
-        let last = ran.lines.last().cloned().unwrap_or_default();
+        let last = ran.stdout.lines().last().unwrap_or_default().to_owned();
         self.response = Some(ran.shown());
-        self.json = None;
-        self.again = Some(Again::Run(command.to_owned(), within));
         self.observe().await?;
         Ok(if code == Some(0) {
             Report::passed("shell", Some(exit))
@@ -1652,7 +1775,7 @@ impl Run<'_> {
             at: start
                 .at
                 .as_deref()
-                .map(|at| self.expanded(at))
+                .map(|at| self.expanded_url(at))
                 .transpose()?,
             ..start.clone()
         };
@@ -1681,36 +1804,33 @@ fn tried(screen: &Screen, unfocused: String, action: &Action) -> (String, String
     )
 }
 
-fn given(named: Vec<&Files>, dir: &Path) -> Result<Vec<Files>> {
-    named
-        .into_iter()
-        .map(|files| {
-            let paths = if files.zip {
-                let folder = Path::new(&files.paths[0]);
-                anyhow::ensure!(
-                    folder.is_dir(),
-                    "with {} = zip takes one folder, and {} is not one",
-                    files.key,
-                    folder.display()
-                );
-                vec![
-                    zip::zip(folder, &dir.join("zips").join(&files.key))?
-                        .to_string_lossy()
-                        .into_owned(),
-                ]
-            } else {
-                for path in &files.paths {
-                    anyhow::ensure!(Path::new(path).exists(), "{path} does not exist");
-                }
-                files.paths.clone()
-            };
-            Ok(Files {
-                key: files.key.clone(),
-                paths,
-                zip: false,
-            })
-        })
-        .collect()
+async fn given(named: Vec<&Files>, dir: &Path) -> Result<Vec<Files>> {
+    let mut given = Vec::new();
+    for files in named {
+        let paths = if files.zip {
+            let folder = Path::new(&files.paths[0]).to_owned();
+            anyhow::ensure!(
+                folder.is_dir(),
+                "with {} = zip takes one folder, and {} is not one",
+                files.key,
+                folder.display()
+            );
+            let into = dir.join("zips").join(&files.key);
+            let archive = tokio::task::spawn_blocking(move || zip::zip(&folder, &into)).await??;
+            vec![archive.to_string_lossy().into_owned()]
+        } else {
+            for path in &files.paths {
+                anyhow::ensure!(Path::new(path).exists(), "{path} does not exist");
+            }
+            files.paths.clone()
+        };
+        given.push(Files {
+            key: files.key.clone(),
+            paths,
+            zip: false,
+        });
+    }
+    Ok(given)
 }
 
 fn secrets<'a>(inputs: impl IntoIterator<Item = &'a Input>) -> Vec<(&'a str, String)> {
@@ -1739,14 +1859,5 @@ mod tests {
         assert_eq!(percent(0.58), 58);
         assert_eq!(percent(0.74996), 74);
         assert_eq!(percent(decide::HOLDS_AT), 75);
-    }
-
-    #[tokio::test]
-    async fn a_model_that_answers_too_late_is_retried_whatever_runs_it() {
-        let late = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
-            .await
-            .context("claude did not answer")
-            .unwrap_err();
-        assert!(transient(&late));
     }
 }

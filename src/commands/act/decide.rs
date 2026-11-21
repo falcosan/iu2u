@@ -11,13 +11,16 @@ use super::surface::Action;
 use crate::clip;
 use crate::model::{Answer, Answers, Question, Questions};
 
-pub(super) const SCREEN_CHARS: usize = 6000;
+pub(super) const SCREEN_CHARS_WITHOUT_CONTEXT: usize = 6000;
+pub(super) const SCREEN_SHARE: usize = 2;
+pub(super) const RESERVED_TOKENS: usize = 10_000;
 pub(super) const HOLDS_AT: f64 = 0.75;
 const SIGHT_AT: f64 = 0.5;
 const OPERATION_AT: f64 = 0.5;
 const TARGET_AT: f64 = 0.3;
 const RECOGNIZED_AT: f64 = 0.6;
 const MARGIN: f64 = 0.1;
+pub(super) const FLOAT_SLACK: f64 = 1e-9;
 const NONE: &str = "none";
 const NONE_FITS: &str = "none of the options fits";
 const REVERSED: &str = "_reversed";
@@ -221,13 +224,13 @@ impl<'a> Step<'a> {
                 None,
             )
             .await?;
-            let chosen = match ranked(answers.get("operation")) {
+            let (chosen, sure) = match ranked(answers.get("operation")) {
                 Some((pick, top, margin))
-                    if top >= OPERATION_AT
-                        && margin >= MARGIN
-                        && (pick != "stuck" || top >= HOLDS_AT) =>
+                    if reaches(top, OPERATION_AT)
+                        && reaches(margin, MARGIN)
+                        && (pick != "stuck" || reaches(top, HOLDS_AT)) =>
                 {
-                    pick
+                    (pick, top)
                 }
                 ranking => {
                     return Ok(Decision::Unsure(format!(
@@ -248,7 +251,7 @@ impl<'a> Step<'a> {
             };
             let name = operation.name;
             match name {
-                "done" if acted => return Ok(Decision::Done),
+                "done" if acted && reaches(sure, HOLDS_AT) => return Ok(Decision::Done),
                 "done" => {
                     let reached = ask(
                         Questions::from([(
@@ -352,31 +355,48 @@ impl<'a> Step<'a> {
 }
 
 pub(super) fn screen_state(screen: &Screen) -> String {
+    let shown = screen.shown();
     if screen.tail && cut(screen) {
-        let skip = screen.text.chars().count() - SCREEN_CHARS;
+        let skip = screen.text.chars().count() - shown;
         return format!(
-            "Screen, of which only the last {SCREEN_CHARS} characters are shown here:\n{}",
+            "Screen, of which only the last {shown} characters are shown here:\n{}",
             screen.text.chars().skip(skip).collect::<String>()
         );
     }
-    let mut state = format!("Screen:\n{}", clip(&screen.text, SCREEN_CHARS));
+    let mut state = format!("Screen:\n{}", clip(&screen.text, shown));
     if cut(screen) {
         write!(
             state,
-            "\n(The screen goes on: only its first {SCREEN_CHARS} characters are shown here. Scrolling does not show the rest here, but its controls can still be used by name.)"
+            "\n(The screen goes on: only its first {shown} characters are shown here. Scrolling does not show the rest here, but its controls can still be used by name.)"
         )
         .ok();
     }
     state
 }
 
-pub(super) fn cut(screen: &Screen) -> bool {
-    screen.text.chars().nth(SCREEN_CHARS).is_some()
+pub(super) fn within_bytes(text: &str, bytes: usize, tail: bool) -> usize {
+    let mut used = 0;
+    let fits = |letter: &char| {
+        used += letter.len_utf8();
+        used <= bytes
+    };
+    if tail {
+        text.chars().rev().take_while(fits).count()
+    } else {
+        text.chars().take_while(fits).count()
+    }
 }
 
-pub(super) fn cut_note(tail: bool) -> String {
-    let part = if tail { "last" } else { "first" };
-    format!("the model saw only the {part} {SCREEN_CHARS} characters of the screen")
+pub(super) fn cut(screen: &Screen) -> bool {
+    screen.text.chars().nth(screen.shown()).is_some()
+}
+
+pub(super) fn cut_note(screen: &Screen) -> String {
+    let part = if screen.tail { "last" } else { "first" };
+    format!(
+        "the model saw only the {part} {} characters of the screen",
+        screen.shown()
+    )
 }
 
 pub(super) async fn recognize(
@@ -430,7 +450,7 @@ pub(super) fn needs_sight(answers: &Answers) -> bool {
     answers
         .get("sight")
         .and_then(Answer::yes)
-        .is_some_and(|sight| sight >= SIGHT_AT)
+        .is_some_and(|sight| reaches(sight, SIGHT_AT))
 }
 
 pub(super) fn verdict(answers: &Answers) -> Result<(Verdict, f64)> {
@@ -438,9 +458,9 @@ pub(super) fn verdict(answers: &Answers) -> Result<(Verdict, f64)> {
         .get("holds")
         .and_then(Answer::yes)
         .context("the decision model did not answer the claim with yes or no")?;
-    let verdict = if holds < 1.0 - HOLDS_AT {
+    let verdict = if reaches(1.0 - holds, HOLDS_AT) {
         Verdict::Contradicted
-    } else if holds >= HOLDS_AT {
+    } else if reaches(holds, HOLDS_AT) {
         Verdict::Holds
     } else {
         Verdict::Inconclusive
@@ -490,7 +510,7 @@ async fn zone(
         };
         let cell = |slot: usize| position(order, chances[slot].0, count);
         let strong: Vec<(usize, usize)> = (0..chances.len())
-            .filter(|&slot| chances[slot].1 >= MARGIN)
+            .filter(|&slot| reaches(chances[slot].1, MARGIN))
             .filter_map(|slot| Some((slot, cell(slot)?)))
             .collect();
         let mut zones: Vec<Vec<usize>> = (0..chances.len()).map(|slot| vec![slot]).collect();
@@ -513,11 +533,11 @@ async fn zone(
         };
         let Some(chosen) = zones.iter().find(|zone| {
             zone.iter().all(|&slot| cell(slot).is_some())
-                && mass(zone) >= at
-                && lead(zone) >= MARGIN
+                && reaches(mass(zone), at)
+                && reaches(lead(zone), MARGIN)
         }) else {
             let ((label, top), ahead) = (chances[0], lead(&[0]));
-            let sure = top >= at && ahead >= MARGIN;
+            let sure = reaches(top, at) && reaches(ahead, MARGIN);
             if order == 0 && label == NONE && sure {
                 return Ok(Err(NONE_FITS.into()));
             }
@@ -602,6 +622,10 @@ fn chances_in(answer: Option<&Answer>) -> Option<Vec<(&str, f64)>> {
     };
     chances.sort_by(|a, b| b.1.total_cmp(&a.1));
     Some(chances)
+}
+
+fn reaches(probability: f64, threshold: f64) -> bool {
+    probability + FLOAT_SLACK >= threshold
 }
 
 fn ranked(answer: Option<&Answer>) -> Option<(String, f64, f64)> {
@@ -997,6 +1021,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lead_of_exactly_the_margin_is_enough() {
+        let screen = screen();
+        let step = Step::new("pay", &screen, &[]);
+        let answers = Answers::from([
+            (
+                "operation".into(),
+                pick("press", &[("press", 0.5), ("type", 0.4)]),
+            ),
+            ("press".into(), pick("002", &[("002", 0.9)])),
+            ("press_reversed".into(), pick("001", &[("001", 0.9)])),
+        ]);
+        assert!(matches!(decide(&step, &answers).await.0, Decision::Act(_)));
+    }
+
+    #[tokio::test]
     async fn orderings_that_disagree_or_a_close_call_leave_the_step_unsure() {
         let screen = screen();
         let step = Step::new("pay", &screen, &[]);
@@ -1033,17 +1072,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_goal_done_without_acting_is_done_only_when_the_screen_shows_it_reached() {
+    async fn a_goal_is_done_only_when_the_model_is_sure_or_the_screen_shows_it_reached() {
         let screen = screen();
         let step = Step::new("pay", &screen, &[]);
-        let reached = async |acted: bool, holds: f64| {
+        let reached = async |acted: bool, sure: f64, holds: f64| {
             let mut asked = Vec::new();
             let decision = step
                 .decide(acted, async |questions: Questions, _| {
                     let (id, question) = questions.into_iter().next().unwrap();
                     let answer = match &question {
                         Question::Pick { options, .. } if options.contains_key("done") => {
-                            pick("done", &[("done", 0.9)])
+                            pick("done", &[("done", sure)])
                         }
                         Question::Pick { .. } => pick("stuck", &[("stuck", 0.9)]),
                         _ => Answer::Yesno { yes: holds },
@@ -1056,18 +1095,22 @@ mod tests {
             (decision, asked)
         };
         assert_eq!(
-            reached(true, 0.1).await,
+            reached(true, HOLDS_AT, 0.1).await,
             (Decision::Done, vec!["operation".into()])
         );
         assert_eq!(
-            reached(false, HOLDS_AT).await,
+            reached(true, 0.6, HOLDS_AT).await,
+            (Decision::Done, vec!["operation".into(), "holds".into()])
+        );
+        assert_eq!(
+            reached(false, 0.9, HOLDS_AT).await,
             (Decision::Done, vec!["operation".into(), "holds".into()])
         );
         assert!(
-            matches!(reached(false, 0.5).await.0, Decision::Unsure(reason) if reason == "whether the goal is reached (at 0.50)")
+            matches!(reached(false, 0.9, 0.5).await.0, Decision::Unsure(reason) if reason == "whether the goal is reached (at 0.50)")
         );
         assert_eq!(
-            reached(false, 0.1).await,
+            reached(false, 0.9, 0.1).await,
             (
                 Decision::Stuck,
                 vec!["operation".into(), "holds".into(), "operation".into()]
@@ -1245,8 +1288,8 @@ mod tests {
         };
         assert_eq!(band(0.75), Verdict::Holds);
         assert_eq!(band(0.74), Verdict::Inconclusive);
-        assert_eq!(band(0.25), Verdict::Inconclusive);
-        assert_eq!(band(0.24), Verdict::Contradicted);
+        assert_eq!(band(0.26), Verdict::Inconclusive);
+        assert_eq!(band(0.25), Verdict::Contradicted);
     }
 
     #[test]
@@ -1258,14 +1301,23 @@ mod tests {
     #[test]
     fn the_model_sees_at_most_a_clipped_screen() {
         let long = Screen {
-            text: "x".repeat(SCREEN_CHARS * 2),
+            text: "x".repeat(SCREEN_CHARS_WITHOUT_CONTEXT * 2),
             ..Screen::default()
         };
         let state = screen_state(&long);
-        assert!(state.contains(&format!("{}…", "x".repeat(SCREEN_CHARS))));
+        assert!(state.contains(&format!("{}…", "x".repeat(SCREEN_CHARS_WITHOUT_CONTEXT))));
         assert!(
-            !state.contains(&"x".repeat(SCREEN_CHARS + 1)) && state.contains("The screen goes on")
+            !state.contains(&"x".repeat(SCREEN_CHARS_WITHOUT_CONTEXT + 1))
+                && state.contains("The screen goes on")
         );
+    }
+
+    #[test]
+    fn a_screen_without_a_token_count_is_cut_by_bytes_from_the_side_it_keeps() {
+        assert_eq!(within_bytes("abcdef", 4, false), 4);
+        assert_eq!(within_bytes("ééé", 5, false), 2);
+        assert_eq!(within_bytes("aéé", 4, true), 2);
+        assert_eq!(within_bytes("abc", 9, true), 3);
     }
 
     #[tokio::test]

@@ -14,15 +14,24 @@ use serde_json::{Map, Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use super::client::ERROR_BODY_CHARS;
-use super::protocol::{Answer, Answers, DATA_ONLY, Question, Questions};
+use super::client::{ERROR_BODY_CHARS, unexpected_answers};
+use super::protocol::{Answer, Answers, DATA_ONLY, Question, Questions, chance};
 use crate::clip;
-use crate::config::EFFORTS;
 
 pub(crate) const ADAPTER_SESSION: &str = "IU2U_ADAPTER_SESSION";
 
 pub(crate) fn is_claude(model: &str) -> bool {
     model == "claude" || model.starts_with("claude:")
+}
+
+const HUGGING_FACE: &str = "https://huggingface.co";
+const REVISION_CHARS: usize = 40;
+
+fn is_hex(text: &str, chars: usize) -> bool {
+    text.len() == chars
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub(crate) const UNSUPPORTED: &str = "the local decision model runs on macOS with Apple silicon and on Linux (x86-64 or arm64, glibc) only; on this system point base_url at a System One server, or set model to claude";
@@ -50,7 +59,8 @@ impl Reference {
             return Self::linked(repository, None, selector).map(Some);
         }
         let Some(path) = model
-            .strip_prefix("https://huggingface.co/")
+            .strip_prefix(HUGGING_FACE)
+            .and_then(|rest| rest.strip_prefix('/'))
             .or_else(|| model.strip_prefix("https://hf.co/"))
             .map(|path| path.split(['?', '#']).next().unwrap_or_default())
         else {
@@ -97,10 +107,23 @@ impl Reference {
                 repository,
                 selector,
                 ..
-            } => match file.or(selector.as_deref()) {
-                Some(file) => format!("decision:{repository}:{file}"),
-                None => format!("decision:{repository}"),
+            } => match (file.or(selector.as_deref()), self.pinned()) {
+                (Some(file), Some(commit)) => {
+                    format!("{HUGGING_FACE}/{repository}/blob/{commit}/{file}")
+                }
+                (Some(file), None) => format!("decision:{repository}:{file}"),
+                (None, _) => format!("decision:{repository}"),
             },
+        }
+    }
+
+    pub(crate) fn pinned(&self) -> Option<&str> {
+        match self {
+            Self::Linked {
+                revision: Some(revision),
+                ..
+            } => Some(revision.as_str()).filter(|revision| is_hex(revision, REVISION_CHARS)),
+            _ => None,
         }
     }
 }
@@ -124,11 +147,6 @@ impl Adapter {
             !model.is_empty(),
             "claude: names no Claude model: set model, or IU2U_MODEL, to claude or to one such as claude:sonnet"
         );
-        ensure!(
-            EFFORTS.contains(&effort),
-            "IU2U_EFFORT must be one of {}, not {effort}",
-            EFFORTS.join(", ")
-        );
         Ok(Some(Self {
             model: model.into(),
             effort: effort.into(),
@@ -136,6 +154,7 @@ impl Adapter {
     }
 
     pub(super) const PROGRAM: &str = claude::PROGRAM;
+    pub(super) const CONTEXT: usize = claude::CONTEXT;
 
     pub(super) async fn ask(
         &self,
@@ -145,12 +164,7 @@ impl Adapter {
     ) -> Result<Answers> {
         let (prompt, schema) = (prompt(state, questions), schema(questions));
         let reply = claude::reply(&self.model, &self.effort, timeout, &prompt, &schema).await?;
-        answers(questions, &reply).with_context(|| {
-            format!(
-                "decision model returned unexpected answers: {}",
-                clip(&reply.to_string(), ERROR_BODY_CHARS)
-            )
-        })
+        answers(questions, &reply).with_context(|| unexpected_answers(&reply.to_string()))
     }
 }
 
@@ -264,7 +278,7 @@ fn answers(questions: &Questions, reply: &Value) -> Option<Answers> {
             let reply = reply.get(key(index))?;
             let answer = match question {
                 Question::Yesno { .. } => Answer::Yesno {
-                    yes: probability(reply)?,
+                    yes: chance(reply)?,
                 },
                 Question::Pick { options, .. } => {
                     let probabilities: BTreeMap<String, f64> = options
@@ -304,17 +318,13 @@ fn answers(questions: &Questions, reply: &Value) -> Option<Answers> {
         .collect()
 }
 
-fn probability(value: &Value) -> Option<f64> {
-    value.as_f64().filter(|p| (0.0..=1.0).contains(p))
-}
-
 fn distribution<'a>(
     reply: &Value,
     choices: impl IntoIterator<Item = &'a String>,
 ) -> Option<Vec<f64>> {
     let chances: Vec<f64> = choices
         .into_iter()
-        .map(|choice| probability(reply.get(choice)?))
+        .map(|choice| chance(reply.get(choice)?))
         .collect::<Option<_>>()?;
     let total: f64 = chances.iter().sum();
     let spread = (1.0 - total).max(0.0) / chances.len() as f64;
@@ -399,6 +409,12 @@ mod tests {
         }
         let link = Reference::parse("https://huggingface.co/o/r/blob/main/m.gguf").unwrap();
         assert_eq!(link.unwrap().stored(None), "decision:o/r:m.gguf");
+        let pinned = format!("https://huggingface.co/o/r/blob/{}/m.gguf", "c".repeat(40));
+        let link = Reference::parse(&pinned).unwrap().unwrap();
+        assert_eq!(
+            (link.stored(None), link.pinned()),
+            (pinned.clone(), Some("c".repeat(40).as_str()))
+        );
     }
 
     #[test]

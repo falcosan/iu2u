@@ -87,7 +87,7 @@ impl Reporter {
             } else {
                 look(status).1
             };
-            writeln!(text, "    {style}→ {}{style:#}", escaped(detail)).ok();
+            writeln!(text, "    {style}→ {}{style:#}", lines(detail, "      ")).ok();
         }
         self.emit(&text);
     }
@@ -109,7 +109,7 @@ impl Reporter {
         let failing = steps.iter().find(|step| step["status"] != "passed");
         let mut text = String::new();
         if let (None, Some(error)) = (failing, report["error"].as_str()) {
-            writeln!(text, "  {FAILED}→ {}{FAILED:#}", escaped(error)).ok();
+            writeln!(text, "  {FAILED}→ {}{FAILED:#}", lines(error, "    ")).ok();
         }
         let calls = match calls {
             0 => String::new(),
@@ -234,7 +234,7 @@ fn failure(name: &str, report: &Value, failing: Option<&Value>, script: Option<&
         field(&step["step"])
     );
     if let Some(detail) = step["detail"].as_str() {
-        writeln!(text, "{FAILED}{}{FAILED:#}", escaped(detail)).ok();
+        writeln!(text, "{FAILED}{}{FAILED:#}", lines(detail, "")).ok();
     }
     if let Some(screenshot) = report["screenshot"].as_str() {
         writeln!(text, "{DIM}Screenshot: {}{DIM:#}", escaped(screenshot)).ok();
@@ -269,6 +269,13 @@ fn field(value: &Value) -> String {
     escaped(value.as_str().unwrap_or_default())
 }
 
+fn lines(text: &str, indent: &str) -> String {
+    text.lines()
+        .map(escaped)
+        .collect::<Vec<_>>()
+        .join(&format!("\n{indent}"))
+}
+
 fn escaped(text: &str) -> String {
     let mut shown = String::with_capacity(text.len());
     for character in text.chars() {
@@ -279,4 +286,17 @@ fn escaped(text: &str) -> String {
         }
     }
     shown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_message_of_several_lines_keeps_them_indented_and_escapes_the_rest() {
+        assert_eq!(
+            lines("api said:\nready\u{1b}[2J", "    "),
+            "api said:\n    ready\\u{1b}[2J"
+        );
+    }
 }

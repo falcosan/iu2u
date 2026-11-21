@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::future::try_join_all;
+use percent_encoding::{percent_decode_str, percent_encode};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::pipe;
@@ -20,7 +21,12 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
 use super::decide::{self, Grid};
-use super::screen::{Element, Kind, Node, words};
+use super::screen::{
+    Element, Hider, Kind, Node, Screen, contents, name_by_contents, named_by_contents, squeeze,
+    words,
+};
+use super::script::QUERY_VALUE;
+use super::shell::{self, Group};
 use super::surface::{self, Action, Probe};
 use crate::config::Config;
 
@@ -39,43 +45,48 @@ const COMMANDS: [&str; 6] = [
     "brave-browser",
 ];
 const REPLY_WITHIN: Duration = Duration::from_secs(30);
+const PIPE_READ_FD: i32 = 3;
+const PIPE_WRITE_FD: i32 = 4;
 const CLOSE_WITHIN: Duration = Duration::from_secs(5);
 const SCROLL_PIXELS: u32 = 600;
+const ENTER_KEY_CODE: u32 = 13;
+const ESCAPE_KEY_CODE: u32 = 27;
 const MAX_DIALOGS: usize = 10;
 const LONG_REQUEST: Duration = Duration::from_secs(2);
 const STDERR_CHARS: usize = 500;
 pub(super) const SUITE_PREFIX: &str = "iu2u-act-";
 const BUSY_REQUESTS: [&str; 5] = ["Document", "Stylesheet", "Script", "XHR", "Fetch"];
 const WATCH: &str = "window.__iu2u ?? (new MutationObserver(() => window.__iu2u++).observe(document, { subtree: true, childList: true, attributes: true, characterData: true }), window.__iu2u = 0)";
-const STABLE: &str = "function(within, still) { return new Promise(done => { const chain = new Set(); for (let node = this; node; node = node.parentNode ?? node.host) chain.add(node); let last = null; const frame = () => { const box = this.getBoundingClientRect(); const at = [box.x + box.width / 2, box.y + box.height / 2]; if (last !== null) { done(Math.hypot(at[0] - last[0], at[1] - last[1]) < still && !document.getAnimations().some(animation => animation.pending && animation.timeline?.currentTime != null && chain.has(animation.effect?.target))); return; } last = at; requestAnimationFrame(frame); }; requestAnimationFrame(frame); setTimeout(() => done(null), within); }); }";
+const STABLE: &str = include_str!("browser/stable.js");
 const FRAMES_WITHIN: Duration = Duration::from_millis(500);
 const STILL_PIXELS: f64 = 1.0;
+const FRAMES_APART: Duration = Duration::from_millis(15);
 const ACTIONABLE_WITHIN: Duration = Duration::from_secs(5);
 const ALIGN: &str =
     "function(at) { this.scrollIntoView({ block: at, inline: at, behavior: 'instant' }); }";
 const ALIGNMENTS: [Option<&str>; 4] = [None, Some("end"), Some("center"), Some("start")];
 const HIT: &str = "function(x, y) { const hit = this.getRootNode().elementFromPoint(x, y); return !!hit && (hit === this || this.contains(hit) || hit.closest('label')?.control === this); }";
 const FOCUS_AND_SELECT: &str = "function() { this.focus(); if (this.select) { this.select(); } else { getSelection().selectAllChildren(this); } const active = this.getRootNode().activeElement; return active === this || this.contains(active); }";
-const PICKERS: &str = "(() => { const picks = window.__iu2uPicks = {}; let last = 0; const ask = (kind, options) => new Promise((resolve, reject) => { const id = ++last; picks[id] = { resolve, reject }; __iu2uPick(JSON.stringify({ id, kind, multiple: !!(options && options.multiple) })); }); window.showOpenFilePicker = options => ask('file', options); window.showDirectoryPicker = options => ask('directory', options); })()";
-const PICKED: &str = "(id, tree, many) => { const pick = window.__iu2uPicks[id]; delete window.__iu2uPicks[id]; if (!tree) { pick.reject(new DOMException('The user aborted a request.', 'AbortError')); return; } const bytes = text => Uint8Array.from(atob(text), c => c.charCodeAt(0)); const like = (handle, kind) => { const type = globalThis[kind]; if (type) Object.setPrototypeOf(handle, type.prototype); return handle; }; const common = { queryPermission: async () => 'granted', requestPermission: async () => 'granted' }; const file = node => { const blob = new File([bytes(node.data)], node.name, { type: node.type }); const handle = { ...common, kind: 'file', name: node.name, getFile: async () => blob, isSameEntry: async other => other === handle }; return like(handle, 'FileSystemFileHandle'); }; const directory = node => { const children = new Map(node.children.map(child => [child.name, child.children ? directory(child) : file(child)])); const get = kind => async name => { const child = children.get(name); if (!child || child.kind !== kind) throw new DOMException(name + ' was not found', child ? 'TypeMismatchError' : 'NotFoundError'); return child; }; const handle = { ...common, kind: 'directory', name: node.name, entries: async function* () { yield* children.entries(); }, keys: async function* () { yield* children.keys(); }, values: async function* () { yield* children.values(); }, [Symbol.asyncIterator]() { return this.entries(); }, getFileHandle: get('file'), getDirectoryHandle: get('directory'), isSameEntry: async other => other === handle }; return like(handle, 'FileSystemDirectoryHandle'); }; pick.resolve(tree.children ? directory(tree) : many ? tree.files.map(file) : [file(tree.files[0])]); }";
+const PICKERS: &str = include_str!("browser/pickers.js");
+const PICKED: &str = include_str!("browser/picked.js");
 const NEW_TABS: &str = "[...document.links].filter(a => a.target && !['_self', '_parent', '_top'].includes(a.target.toLowerCase())).map(a => a.href)";
-const MAX_PICKED_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PICKED_BYTES: u64 = 32 << 20;
 const MAX_FRAMES: usize = 10;
 const MAX_FAILURES: usize = 20;
 const SCREENSHOT_SIDE: f64 = 1568.0;
 const MAX_ZOOM: f64 = 4.0;
 const VIEWPORT: (u32, u32) = (1280, 900);
-const GRID: &str = "({ left, top, width, height, columns, rows, labels, scale }) => { document.getElementById('__iu2u_grid')?.remove(); const host = document.createElement('div'); host.id = '__iu2u_grid'; host.popover = 'manual'; host.style.cssText = `all: initial; position: fixed; left: ${left}px; top: ${top}px; width: ${width}px; height: ${height}px; z-index: 2147483647; pointer-events: none`; const root = host.attachShadow({ mode: 'closed' }); const [wide, high] = [width / columns, height / rows]; const size = Math.min(18, Math.max(11, Math.min(wide, high) * scale * 0.16)) / scale; const drawing = 'http://www.w3.org/2000/svg'; const svg = document.createElementNS(drawing, 'svg'); svg.setAttribute('width', width); svg.setAttribute('height', height); svg.style.cssText = 'position: absolute; left: 0; top: 0'; const lines = document.createElementNS(drawing, 'path'); lines.setAttribute('d', [...Array(columns + 1).keys()].map(column => `M${column * wide} 0V${height}`).concat([...Array(rows + 1).keys()].map(row => `M0 ${row * high}H${width}`)).join('')); lines.setAttribute('stroke', 'rgba(255, 0, 255, 0.75)'); lines.setAttribute('stroke-width', 1 / scale); lines.setAttribute('fill', 'none'); svg.append(lines); root.append(svg); labels.forEach((label, cell) => { const tag = document.createElement('span'); tag.textContent = label; tag.style.cssText = `position: absolute; left: ${(cell % columns) * wide}px; top: ${Math.floor(cell / columns) * high}px; font: bold ${size}px/1 sans-serif; color: #fff; background: rgba(0, 0, 0, 0.55); padding: ${1 / scale}px ${3 / scale}px`; root.append(tag); }); document.documentElement.append(host); host.showPopover?.(); return true; }";
+const GRID: &str = include_str!("browser/grid.js");
 const GRID_GONE: &str = "document.getElementById('__iu2u_grid')?.remove()";
 const IMAGES_SHOWN: &str = "[...document.images].every(image => { const box = image.getBoundingClientRect(); return image.complete || box.bottom <= 0 || box.right <= 0 || box.top >= innerHeight || box.left >= innerWidth; })";
 const IMAGES_WITHIN: Duration = Duration::from_secs(5);
 const SHOT_WITHIN: Duration = Duration::from_secs(3);
 const SHOT_TRIES: usize = 3;
-const CLOCK: &str = "(() => { if (globalThis.__iu2uClock) return; const RealDate = Date, realSet = setTimeout, realClear = clearTimeout, realNow = Date.now, realPerformance = performance.now.bind(performance), timers = new Map(); let offset = 0, last = 0, pump, running = false, frozen, read = false; const now = () => realNow() + offset, date = () => frozen === undefined ? now() : (read = true, frozen), tick = () => { if (read) { frozen += 1; read = false; } }; const first = until => { let found; for (const timer of timers.values()) if (timer.at <= until && (!found || timer.at < found.at)) found = timer; return found; }; const fire = timer => { if (timer.every) timer.at += timer.every; else timers.delete(timer.id); try { typeof timer.run === 'function' ? Reflect.apply(timer.run, globalThis, timer.args) : (0, eval)(String(timer.run)); } catch (error) { realSet(() => { throw error; }); } }; const schedule = () => { realClear(pump); const next = first(Infinity); if (next) pump = realSet(() => { const due = first(now()); if (due) fire(due); schedule(); }, next.at - now()); }; const add = (run, ms, args, repeat) => { const delay = Math.max(running ? 1 : 0, Number(ms) || 0); timers.set(++last, { id: last, run, args, at: now() + delay, every: repeat && Math.max(1, delay) }); schedule(); return last; }; const clear = id => { if (timers.delete(id)) schedule(); }; const turn = () => new Promise(resolve => { const channel = new MessageChannel(); channel.port1.onmessage = resolve; channel.port2.postMessage(0); }); const run = async ms => { const end = now() + ms; await Promise.all(Array.from(frames, frame => { try { return frame.__iu2uClock?.run(ms); } catch {} })); running = true; for (let due; (due = first(end)); await turn()) { offset += Math.max(0, due.at - now()); fire(due); } running = false; offset += Math.max(0, end - now()); schedule(); }; function FakeDate(...args) { return new.target ? Reflect.construct(RealDate, args.length ? args : [date()], new.target) : new RealDate(date()).toString(); } FakeDate.prototype = RealDate.prototype; FakeDate.now = date; Object.setPrototypeOf(FakeDate, RealDate); performance.now = () => realPerformance() + offset; const stamp = Object.getOwnPropertyDescriptor(Event.prototype, 'timeStamp').get; Object.defineProperty(Event.prototype, 'timeStamp', { get() { return stamp.call(this) + offset; }, configurable: true }); Object.assign(globalThis, { Date: FakeDate, setTimeout: (run, ms, ...args) => add(run, ms, args, false), setInterval: (run, ms, ...args) => add(run, ms, args, true), clearTimeout: clear, clearInterval: clear }); Object.defineProperty(globalThis, '__iu2uClock', { value: { run, freeze: at => { frozen = at; for (const key in globalThis) if (key.startsWith('on')) addEventListener(key.slice(2), tick, true); } } }); })()";
-const SCROLL_POINT: &str = "(() => { const shown = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth; }; const scrolls = [...document.querySelectorAll('*')].filter(e => e.scrollHeight - e.scrollTop - e.clientHeight > 1 && ['auto', 'scroll', 'overlay'].includes(getComputedStyle(e).overflowY) && shown(e)); const layered = scrolls.filter(e => e.closest('dialog[open], [role=dialog], [role=alertdialog], [role=listbox], [role=menu], [popover]')); const area = e => e.clientWidth * e.clientHeight; const center = e => { const r = e.getBoundingClientRect(); const left = Math.max(0, r.left), top = Math.max(0, r.top); return [(left + Math.min(innerWidth, r.right)) / 2, (top + Math.min(innerHeight, r.bottom)) / 2]; }; const open = layered.pop(); if (open) return [...center(open), true]; const page = document.scrollingElement; const locked = [document.documentElement, document.body].some(e => e && ['hidden', 'clip'].includes(getComputedStyle(e).overflowY)); if (page && !locked && page.scrollHeight - scrollY - innerHeight > 1) return [innerWidth / 2, innerHeight / 2, true]; const pick = scrolls.sort((a, b) => area(b) - area(a))[0]; if (pick) return [...center(pick), true]; const frame = [...document.querySelectorAll('iframe')].filter(f => { const inner = f.contentDocument?.scrollingElement; return shown(f) && (!inner || inner.scrollHeight - inner.scrollTop - inner.clientHeight > 1); }).sort((a, b) => area(b) - area(a))[0]; return frame ? [...center(frame), Boolean(frame.contentDocument)] : null; })()";
+const CLOCK: &str = include_str!("browser/clock.js");
+const SCROLL_POINT: &str = include_str!("browser/scroll_point.js");
 const TOOK: &str =
     "function(text) { return typeof this.value === 'string' ? this.value === text : null; }";
-const CHOOSE: &str = "function(label) { const words = text => text.trim().split(/\\s+/).join(' '); const option = [...this.options].find(o => !o.disabled && (words(o.label) === label || words(o.text) === label)); if (!option) return false; option.selected = true; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); return true; }";
+const CHOOSE: &str = include_str!("browser/choose.js");
 const PRESSABLE: [&str; 11] = [
     "button",
     "checkbox",
@@ -110,11 +121,12 @@ struct PageState {
     session: String,
     owners: HashMap<String, String>,
     requests: HashMap<String, Instant>,
-    loading: bool,
+    loading: HashMap<String, Instant>,
     dialogs: Vec<(String, bool)>,
     routes: Vec<Routed>,
-    held: Vec<(String, String, String, Option<String>)>,
+    held: Vec<Held>,
     held_network: HashSet<String>,
+    leaving: HashSet<String>,
     opened: Option<String>,
     blank: HashSet<String>,
     chooser: Option<Chooser>,
@@ -125,8 +137,27 @@ struct PageState {
     addresses: HashMap<String, String>,
     failures: Vec<(String, String)>,
     injected: Vec<String>,
+    ready: HashSet<String>,
     prepared: HashMap<String, String>,
     closed: bool,
+}
+
+struct Held {
+    pattern: String,
+    request: String,
+    network: String,
+    session: Option<String>,
+}
+
+impl PageState {
+    fn holds(&self) -> bool {
+        self.held.iter().any(|held| {
+            held.session
+                .as_deref()
+                .and_then(|from| self.owners.get(from))
+                == Some(&self.session)
+        })
+    }
 }
 
 struct Download {
@@ -176,6 +207,7 @@ struct Connection {
 pub(super) struct Browser {
     connection: Arc<Connection>,
     session: String,
+    group: Group,
     child: Child,
     profile: PathBuf,
     frames: Vec<Frame>,
@@ -193,13 +225,20 @@ struct Frame {
 impl Browser {
     pub(super) async fn launch(headful: bool, dir: &Path) -> Result<Self> {
         let executable = find()?;
+        match Self::launch_once(&executable, headful, dir).await {
+            Err(_) => Self::launch_once(&executable, headful, dir).await,
+            started => started,
+        }
+    }
+
+    async fn launch_once(executable: &Path, headful: bool, dir: &Path) -> Result<Self> {
         let profile = dir.join(format!(
             "browser-{}",
             LAUNCHED.fetch_add(1, Ordering::Relaxed)
         ));
         private_dir(&profile)
             .with_context(|| format!("cannot create the browser profile {}", profile.display()))?;
-        let started = Self::start(&executable, profile.clone(), headful).await;
+        let started = Self::start(executable, profile.clone(), headful).await;
         if started.is_err() {
             let said = std::fs::read_to_string(profile.join("stderr.log")).unwrap_or_default();
             std::fs::remove_dir_all(&profile).ok();
@@ -231,6 +270,8 @@ impl Browser {
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-backgrounding-occluded-windows",
+                "--use-mock-keychain",
+                "--password-store=basic",
             ])
             .arg(format!("--window-size={},{}", VIEWPORT.0, VIEWPORT.1))
             .args(
@@ -242,10 +283,12 @@ impl Browser {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(profile.join("stderr.log"))?)
+            .process_group(0)
             .kill_on_drop(true);
         unsafe {
             command.as_std_mut().pre_exec(move || {
-                if libc::dup2(read_fd, 3) < 0 || libc::dup2(write_fd, 4) < 0 {
+                if libc::dup2(read_fd, PIPE_READ_FD) < 0 || libc::dup2(write_fd, PIPE_WRITE_FD) < 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -254,6 +297,7 @@ impl Browser {
         let child = command
             .spawn()
             .with_context(|| format!("cannot start {}", executable.display()))?;
+        let group = Group(child.id());
         drop((child_reads, child_writes));
         let connection = Arc::new(Connection {
             writer: tokio::sync::Mutex::new(pipe::Sender::from_owned_fd(we_write.into())?),
@@ -300,6 +344,7 @@ impl Browser {
         let browser = Self {
             session: session.into(),
             connection,
+            group,
             child,
             profile,
             frames: Vec::new(),
@@ -312,11 +357,7 @@ impl Browser {
         browser.focus().await?;
         browser
             .connection
-            .send(
-                None,
-                "Target.setAutoAttach",
-                json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
-            )
+            .send(None, "Target.setAutoAttach", auto_attach())
             .await?;
         Ok(browser)
     }
@@ -388,27 +429,32 @@ impl Browser {
 
     pub(super) async fn inject(&self, source: String) -> Result<()> {
         let script = json!({ "source": source });
-        self.call("Page.addScriptToEvaluateOnNewDocument", script.clone())
-            .await?;
-        let behind = self.behind.iter().map(|(session, _)| session.clone());
-        for session in self.frame_sessions().into_iter().chain(behind) {
-            self.connection
+        let ready: Vec<String> = {
+            let mut page = self.connection.page.lock().unwrap();
+            page.injected.push(source);
+            page.ready.iter().cloned().collect()
+        };
+        for session in ready {
+            let sent = self
+                .connection
                 .send(
                     Some(&session),
                     "Page.addScriptToEvaluateOnNewDocument",
                     script.clone(),
                 )
-                .await
-                .ok();
+                .await;
+            if session == self.session {
+                sent?;
+            }
         }
-        self.connection.page.lock().unwrap().injected.push(source);
         Ok(())
     }
 
     async fn intercept(&self) -> Result<()> {
         self.connection.intercept(&self.session).await?;
-        for frame in self.frame_sessions() {
-            self.connection.intercept(&frame).await.ok();
+        let behind = self.behind.iter().map(|(session, _)| session.clone());
+        for session in self.frame_sessions().into_iter().chain(behind) {
+            self.connection.intercept(&session).await.ok();
         }
         Ok(())
     }
@@ -465,9 +511,9 @@ impl Browser {
                 .value(IMAGES_SHOWN)
                 .await
                 .is_ok_and(|shown| shown == false)
-            && self.connection.page.lock().unwrap().held.is_empty()
+            && !self.connection.page.lock().unwrap().holds()
         {
-            tokio::time::sleep(surface::POLL).await;
+            tokio::time::sleep(surface::POLL_EVERY).await;
         }
         let mut tried = 0;
         loop {
@@ -516,28 +562,25 @@ impl Browser {
             "the page would not let act draw the grid to find a spot"
         );
         let shot = self
-            .call(
-                "Page.captureScreenshot",
-                json!({ "format": "png", "clip": { "x": scroll_x + left, "y": scroll_y + top, "width": wide, "height": high, "scale": scale } }),
-            )
+            .clip(json!({ "x": scroll_x + left, "y": scroll_y + top, "width": wide, "height": high, "scale": scale }))
             .await;
         self.value(GRID_GONE).await.ok();
-        shot?["data"]
-            .as_str()
-            .map(str::to_owned)
-            .context("the browser returned no screenshot")
+        shot
     }
 
     async fn capture(&self) -> Result<String> {
         let [width, height, ratio, scroll_x, scroll_y] = self.view().await?;
         let scale = (SCREENSHOT_SIDE / (width.max(height) * ratio.max(1.0))).min(1.0);
-        let shot = self
-            .call(
-                "Page.captureScreenshot",
-                json!({ "format": "png", "clip": { "x": scroll_x, "y": scroll_y, "width": width, "height": height, "scale": scale } }),
-            )
-            .await?;
-        shot["data"]
+        self.clip(json!({ "x": scroll_x, "y": scroll_y, "width": width, "height": height, "scale": scale }))
+            .await
+    }
+
+    async fn clip(&self, clip: Value) -> Result<String> {
+        self.call(
+            "Page.captureScreenshot",
+            json!({ "format": "png", "clip": clip }),
+        )
+        .await?["data"]
             .as_str()
             .map(str::to_owned)
             .context("the browser took no screenshot")
@@ -561,13 +604,7 @@ impl Browser {
                 json!({ "backendNodeId": chooser.node }),
             )
             .await?;
-        let attributes: Vec<&str> = described["node"]["attributes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        let has = |name: &str| attributes.chunks(2).any(|pair| pair[0] == name);
+        let has = |name: &str| attribute(&described["node"], name).is_some();
         let (folder, many) = (has("webkitdirectory"), has("multiple"));
         let given = fitting(paths, folder, many)?;
         let before = self.revision().await;
@@ -589,8 +626,8 @@ impl Browser {
             let mut page = self.connection.page.lock().unwrap();
             (page.opened.take(), std::mem::take(&mut page.closed))
         };
-        if closed && let Some((session, target)) = self.behind.pop() {
-            self.switch(session, target).await?;
+        if closed && !self.behind.is_empty() {
+            self.back().await?;
         }
         let Some(target) = opened else {
             return Ok(());
@@ -619,16 +656,23 @@ impl Browser {
                 started.elapsed() < REPLY_WITHIN,
                 "the new tab did not start"
             );
-            tokio::time::sleep(surface::POLL).await;
+            tokio::time::sleep(surface::POLL_EVERY).await;
         };
         let main_frame = self.connection.page.lock().unwrap().main_frame.clone();
         self.behind.push((self.session.clone(), main_frame));
-        if self.switch(session, target).await.is_err()
-            && let Some((session, target)) = self.behind.pop()
-        {
-            self.switch(session, target).await?;
+        if self.switch(session, target).await.is_err() {
+            self.back().await?;
         }
         Ok(())
+    }
+
+    async fn back(&mut self) -> Result<()> {
+        while let Some((session, target)) = self.behind.pop() {
+            if self.switch(session, target).await.is_ok() {
+                return Ok(());
+            }
+        }
+        bail!("every tab behind this one is closed")
     }
 
     async fn switch(&mut self, session: String, target: String) -> Result<()> {
@@ -640,7 +684,14 @@ impl Browser {
             page.requests.clear();
             page.addresses.clear();
             page.failures.clear();
-            page.loading = false;
+            page.loading.insert(target.clone(), Instant::now());
+        }
+        if self
+            .value("document.readyState")
+            .await
+            .is_ok_and(|state| state == "complete")
+        {
+            self.connection.page.lock().unwrap().loading.remove(&target);
         }
         self.intercept().await?;
         self.focus().await?;
@@ -706,16 +757,18 @@ impl Browser {
             }
             let (go, stay) = std::mem::take(&mut page.held)
                 .into_iter()
-                .partition::<Vec<_>, _>(|(held, _, _, _)| held == pattern);
+                .partition::<Vec<_>, _>(|held| held.pattern == pattern);
             page.held = stay;
-            for (_, _, network, _) in &go {
-                page.held_network.remove(network);
-                page.requests.insert(network.clone(), started);
+            for held in &go {
+                page.held_network.remove(&held.network);
+                page.requests.insert(held.network.clone(), started);
             }
             go
         };
-        self.intercept().await?;
-        for (_, request, _, session) in &held {
+        for Held {
+            request, session, ..
+        } in &held
+        {
             self.connection
                 .send(
                     session.as_deref(),
@@ -725,22 +778,18 @@ impl Browser {
                 .await
                 .ok();
         }
+        self.intercept().await?;
         self.settle(None, started).await;
         Ok(held.len())
     }
 
     pub(super) async fn go(&mut self, delta: i64) -> Result<()> {
-        let history = self.call("Page.getNavigationHistory", json!({})).await?;
-        let entry = history["currentIndex"]
-            .as_i64()
-            .map(|index| index + delta)
-            .and_then(|index| history["entries"].get(usize::try_from(index).ok()?))
-            .with_context(|| {
-                format!(
-                    "there is no page to go {} to",
-                    if delta < 0 { "back" } else { "forward" }
-                )
-            })?;
+        let entry = self.entry(delta).await?.with_context(|| {
+            format!(
+                "there is no page to go {} to",
+                if delta < 0 { "back" } else { "forward" }
+            )
+        })?;
         let started = Instant::now();
         self.call(
             "Page.navigateToHistoryEntry",
@@ -759,13 +808,19 @@ impl Browser {
     }
 
     pub(super) async fn url(&self) -> Result<String> {
-        let history = self.call("Page.getNavigationHistory", json!({})).await?;
-        history["currentIndex"]
-            .as_u64()
-            .and_then(|index| history["entries"].get(usize::try_from(index).ok()?))
-            .and_then(|entry| entry["url"].as_str())
-            .map(str::to_owned)
+        self.entry(0)
+            .await?
+            .and_then(|entry| entry["url"].as_str().map(str::to_owned))
             .context("the browser did not say which page is open")
+    }
+
+    async fn entry(&self, delta: i64) -> Result<Option<Value>> {
+        let history = self.call("Page.getNavigationHistory", json!({})).await?;
+        Ok(history["currentIndex"]
+            .as_i64()
+            .map(|index| index + delta)
+            .and_then(|index| history["entries"].get(usize::try_from(index).ok()?))
+            .cloned())
     }
 
     pub(super) async fn observe(&mut self) -> Result<Vec<Node>> {
@@ -779,6 +834,25 @@ impl Browser {
         }
     }
 
+    pub(super) async fn shows(&mut self, secrets: &[(&str, String)]) -> bool {
+        if secrets.is_empty() {
+            return false;
+        }
+        let frames = std::mem::take(&mut self.frames);
+        let shows = match self.read().await {
+            Ok(nodes) => {
+                let screen = Screen::new(&nodes, secrets);
+                screen.shows_secret
+                    || secrets
+                        .iter()
+                        .any(|(secret, _)| self.paints(secret) || screen.reveals(secret))
+            }
+            Err(_) => true,
+        };
+        self.frames = frames;
+        shows
+    }
+
     async fn read(&mut self) -> Result<Vec<Node>> {
         self.frames = vec![Frame {
             session: self.session.clone(),
@@ -788,7 +862,7 @@ impl Browser {
         let tree = self.call("Accessibility.getFullAXTree", json!({})).await?;
         let (clickable, mut painted) = self.snapshot(&self.session).await?;
         let mut arena = arena(&tree, 0, &clickable)?;
-        let tabs = self.value(NEW_TABS).await?;
+        let tabs = self.value(NEW_TABS).await.unwrap_or_default();
         let tabs: HashSet<&str> = tabs
             .as_array()
             .into_iter()
@@ -838,6 +912,23 @@ impl Browser {
             }
             next += 1;
         }
+        let unseen: Vec<String> = {
+            let page = self.connection.page.lock().unwrap();
+            page.isolated
+                .values()
+                .filter(|session| {
+                    page.owners.get(*session) == Some(&self.session)
+                        && self.frames.iter().all(|frame| frame.session != **session)
+                })
+                .cloned()
+                .collect()
+        };
+        for session in unseen {
+            match self.snapshot(&session).await {
+                Ok((_, text)) => painted.push_str(&text),
+                Err(_) => unread = true,
+            }
+        }
         self.painted = painted;
         self.unread = unread;
         let mut guard = self.connection.page.lock().unwrap();
@@ -860,7 +951,7 @@ impl Browser {
                 let held = page
                     .held
                     .iter()
-                    .filter(|(pattern, ..)| *pattern == route.pattern)
+                    .filter(|held| held.pattern == route.pattern)
                     .count();
                 if held > 0 {
                     value.push_str(&format!(", {held} held until release"));
@@ -907,8 +998,10 @@ impl Browser {
     }
 
     pub(super) fn paints(&self, secret: &str) -> bool {
-        let secret: String = secret.split_whitespace().collect();
-        !secret.is_empty() && (self.unread || self.painted.contains(&secret.to_lowercase()))
+        let secret = squeeze(secret).to_lowercase();
+        let secrets = [(secret.as_str(), String::new())];
+        !secret.is_empty()
+            && (self.unread || Hider::new(&secrets).hide(&self.painted) != self.painted)
     }
 
     async fn snapshot(&self, session: &str) -> Result<(HashSet<usize>, String)> {
@@ -972,7 +1065,7 @@ impl Browser {
                 .filter(|(at, _)| laid.contains(at) && !password(at))
                 .map(|(_, text)| text);
             for text in layout["text"].as_array().into_iter().flatten().chain(shown) {
-                painted.extend(string(text).to_lowercase().split_whitespace());
+                painted.push_str(&squeeze(&string(text).to_lowercase()));
             }
         }
         Ok((clickable, painted))
@@ -992,15 +1085,7 @@ impl Browser {
             .as_str()
             .context("the iframe has no document")?
             .to_owned();
-        let sandbox = described["node"]["attributes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .chunks(2)
-            .find(|pair| pair[0] == "sandbox")
-            .and_then(|pair| pair.get(1)?.as_str())
-            .map(str::to_owned);
+        let sandbox = attribute(&described["node"], "sandbox").map(str::to_owned);
         let isolated = self
             .connection
             .page
@@ -1109,13 +1194,14 @@ impl Browser {
                 if !self.took(element, &input.text, &before).await? {
                     self.on(element, FOCUS_AND_SELECT, json!([])).await?;
                     for character in input.text.chars() {
-                        let code = if character.is_ascii_alphanumeric() {
-                            u32::from(character.to_ascii_uppercase())
-                        } else {
-                            0
+                        let upper = character.to_ascii_uppercase();
+                        let (code, number) = match character {
+                            'a'..='z' | 'A'..='Z' => (format!("Key{upper}"), u32::from(upper)),
+                            '0'..='9' => (format!("Digit{character}"), u32::from(character)),
+                            _ => (String::new(), 0),
                         };
-                        self.key(&character.to_string(), code, &character.to_string())
-                            .await?;
+                        let text = character.to_string();
+                        self.key(&text, &code, number, &text).await?;
                     }
                     if !self.took(element, &input.text, &before).await? {
                         bail!("{} did not take the text", element.describe());
@@ -1136,8 +1222,8 @@ impl Browser {
                     bail!("{} has no option {option:?}", element.describe());
                 }
             }
-            Action::Enter => self.key("Enter", 13, "\r").await?,
-            Action::Escape => self.key("Escape", 27, "").await?,
+            Action::Enter => self.key("Enter", "Enter", ENTER_KEY_CODE, "\r").await?,
+            Action::Escape => self.key("Escape", "Escape", ESCAPE_KEY_CODE, "").await?,
             Action::Scroll => {
                 if let Some((x, y, _)) = self.scroll_point().await? {
                     self.call(
@@ -1154,19 +1240,18 @@ impl Browser {
     }
 
     pub(super) async fn close(mut self) {
-        self.connection
-            .send(None, "Browser.close", json!({}))
-            .await
-            .ok();
-        if tokio::time::timeout(CLOSE_WITHIN, self.child.wait())
-            .await
-            .is_err()
-        {
-            tokio::time::timeout(CLOSE_WITHIN, self.child.kill())
-                .await
-                .ok();
-        }
+        tokio::time::timeout(
+            CLOSE_WITHIN,
+            self.connection.send(None, "Browser.close", json!({})),
+        )
+        .await
+        .ok();
+        shell::end(&mut self.group, &mut self.child, CLOSE_WITHIN).await;
         std::fs::remove_dir_all(&self.profile).ok();
+    }
+
+    pub(super) fn group(&self) -> Option<u32> {
+        self.group.0
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -1190,10 +1275,14 @@ impl Browser {
     }
 
     async fn settle(&self, before: Option<f64>, started: Instant) {
-        surface::settle(before, started, async || {
+        surface::settle(before, Instant::now(), async || {
             let (busy, loading) = {
                 let page = self.connection.page.lock().unwrap();
-                let loading = page.loading && page.held.is_empty();
+                let loading = page
+                    .loading
+                    .get(&page.main_frame)
+                    .is_some_and(|at| at.elapsed() < surface::LOAD_WITHIN)
+                    && !page.holds();
                 let busy = loading
                     || page
                         .requests
@@ -1257,19 +1346,27 @@ impl Browser {
     }
 
     async fn on(&self, element: &Element, function: &str, arguments: Value) -> Result<Value> {
+        self.on_node(element.frame, element.handle, function, arguments)
+            .await?
+            .with_context(|| format!("{} is gone", element.describe()))
+    }
+
+    async fn on_node(
+        &self,
+        frame: usize,
+        handle: usize,
+        function: &str,
+        arguments: Value,
+    ) -> Result<Option<Value>> {
         let resolved = self
-            .call_in(
-                element.frame,
-                "DOM.resolveNode",
-                json!({ "backendNodeId": element.handle }),
-            )
+            .call_in(frame, "DOM.resolveNode", json!({ "backendNodeId": handle }))
             .await?;
-        let object = resolved["object"]["objectId"]
-            .as_str()
-            .with_context(|| format!("{} is gone", element.describe()))?;
+        let Some(object) = resolved["object"]["objectId"].as_str() else {
+            return Ok(None);
+        };
         let result = self
             .call_in(
-                element.frame,
+                frame,
                 "Runtime.callFunctionOn",
                 json!({ "objectId": object, "functionDeclaration": function, "arguments": arguments, "returnByValue": true, "awaitPromise": true }),
             )
@@ -1282,7 +1379,7 @@ impl Browser {
                     .unwrap_or("script failed")
             );
         }
-        Ok(result["result"]["value"].clone())
+        Ok(Some(result["result"]["value"].clone()))
     }
 
     async fn click(&self, x: f64, y: f64) -> Result<()> {
@@ -1323,7 +1420,8 @@ impl Browser {
                     STABLE,
                     json!([
                         { "value": FRAMES_WITHIN.as_secs_f64() * 1000.0 },
-                        { "value": STILL_PIXELS }
+                        { "value": STILL_PIXELS },
+                        { "value": FRAMES_APART.as_secs_f64() * 1000.0 }
                     ]),
                 )
                 .await?;
@@ -1349,7 +1447,7 @@ impl Browser {
                 (left + right) / 2.0 + origin.0,
                 (top + bottom) / 2.0 + origin.1,
             );
-            let hit = self
+            let mut hit = self
                 .on(
                     element,
                     HIT,
@@ -1357,6 +1455,18 @@ impl Browser {
                 )
                 .await?
                 == json!(true);
+            let mut frame = element.frame;
+            while hit
+                && let Some(Frame {
+                    owner: Some((parent, owner)),
+                    ..
+                }) = self.frames.get(frame)
+            {
+                let (_, document) = self.place(*parent).await?;
+                let at = json!([{ "value": x - document.0 }, { "value": y - document.1 }]);
+                hit = self.on_node(*parent, *owner, HIT, at).await? == Some(json!(true));
+                frame = *parent;
+            }
             if still && hit {
                 return Ok((x, y));
             }
@@ -1373,15 +1483,15 @@ impl Browser {
                 bail!("{} is covered by another element", element.describe());
             }
             tries += 1;
-            tokio::time::sleep(surface::POLL).await;
+            tokio::time::sleep(surface::POLL_EVERY).await;
         }
     }
 
-    async fn key(&self, key: &str, code: u32, text: &str) -> Result<()> {
+    async fn key(&self, key: &str, code: &str, number: u32, text: &str) -> Result<()> {
         for (kind, text) in [("keyDown", text), ("keyUp", "")] {
             self.call(
                 "Input.dispatchKeyEvent",
-                json!({ "type": kind, "key": key, "code": key, "windowsVirtualKeyCode": code, "text": text }),
+                json!({ "type": kind, "key": key, "code": code, "windowsVirtualKeyCode": number, "text": text }),
             )
             .await?;
         }
@@ -1401,7 +1511,11 @@ impl Connection {
     }
 
     async fn prepare(&self, session: &str, resume: bool) -> Result<()> {
-        let injected = self.page.lock().unwrap().injected.clone();
+        let injected = {
+            let mut page = self.page.lock().unwrap();
+            page.ready.insert(session.to_owned());
+            page.injected.clone()
+        };
         let mut commands = vec![
             ("Page.enable", json!({})),
             ("Network.enable", json!({})),
@@ -1420,10 +1534,7 @@ impl Connection {
                 json!({ "enabled": true }),
             ),
             ("Runtime.addBinding", json!({ "name": "__iu2uPick" })),
-            (
-                "Target.setAutoAttach",
-                json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
-            ),
+            ("Target.setAutoAttach", auto_attach()),
         ];
         commands.extend(
             std::iter::once(PICKERS)
@@ -1487,10 +1598,16 @@ impl Connection {
         }
         let mut bytes = serde_json::to_vec(&message)?;
         bytes.push(0);
-        self.writer.lock().await.write_all(&bytes).await?;
-        let reply = tokio::time::timeout(REPLY_WITHIN, replied)
-            .await
-            .with_context(|| format!("the browser did not answer {method}"))?
+        let exchange = tokio::time::timeout(REPLY_WITHIN, async {
+            self.writer.lock().await.write_all(&bytes).await?;
+            anyhow::Ok(replied.await)
+        })
+        .await;
+        if !matches!(exchange, Ok(Ok(_))) {
+            self.replies.lock().unwrap().remove(&id);
+        }
+        let reply = exchange
+            .with_context(|| format!("the browser did not answer {method}"))??
             .context("the browser closed")?;
         if let Some(error) = reply.get("error") {
             bail!(
@@ -1528,7 +1645,7 @@ impl Connection {
                 let request = params["requestId"].as_str().unwrap_or_default();
                 page.requests.remove(request);
                 if page.held_network.remove(request) {
-                    page.held.retain(|(_, _, network, _)| network != request);
+                    page.held.retain(|held| held.network != request);
                 }
                 let address = page.addresses.remove(request);
                 if let Some(mut address) = address
@@ -1546,15 +1663,30 @@ impl Connection {
                     }
                 }
             }
-            "Page.frameStartedLoading" if main_frame => {
-                page.loading = true;
-                page.failures.clear();
+            "Page.frameStartedLoading" => {
+                if main_frame {
+                    page.loading
+                        .insert(text(&params["frameId"]), Instant::now());
+                    page.failures.clear();
+                    page.leaving = page.held.iter().map(|held| held.network.clone()).collect();
+                }
+            }
+            "Page.frameNavigated" if params["frame"]["id"] == page.main_frame.as_str() => {
                 let state = &mut *page;
-                forget_held(&mut state.held, &mut state.held_network, |from| {
-                    from.and_then(|from| state.owners.get(from)) == Some(&state.session)
+                let leaving = std::mem::take(&mut state.leaving);
+                forget_held(&mut state.held, &mut state.held_network, |held| {
+                    leaving.contains(&held.network)
+                        && held
+                            .session
+                            .as_deref()
+                            .and_then(|from| state.owners.get(from))
+                            == Some(&state.session)
                 });
             }
-            "Page.frameStoppedLoading" if main_frame => page.loading = false,
+            "Page.frameStoppedLoading" => {
+                page.loading
+                    .remove(params["frameId"].as_str().unwrap_or_default());
+            }
             "Page.javascriptDialogOpening" => {
                 let accept = ["beforeunload", "confirm"].contains(&text(&params["type"]).as_str());
                 if page.dialogs.len() < MAX_DIALOGS {
@@ -1590,14 +1722,14 @@ impl Connection {
                     None => ("Fetch.continueRequest", json!({ "requestId": request })),
                     Some(_) if preflight => (
                         "Fetch.fulfillRequest",
-                        json!({ "requestId": request, "responseCode": 204, "responseHeaders": cors(asked, &url) }),
+                        json!({ "requestId": request, "responseCode": reqwest::StatusCode::NO_CONTENT.as_u16(), "responseHeaders": cors(asked, &url) }),
                     ),
                     Some(route) => {
                         route.hits += 1;
                         match &route.handling {
                             Handling::To(target) => (
                                 "Fetch.continueRequest",
-                                json!({ "requestId": request, "url": format!("{target}{}", &url[route.pattern.len()..]) }),
+                                json!({ "requestId": request, "url": rerouted(target, &route.pattern, &url) }),
                             ),
                             Handling::Answer {
                                 status,
@@ -1617,7 +1749,12 @@ impl Connection {
                                 page.requests.remove(&network);
                                 page.held_network.insert(network.clone());
                                 let session = event["sessionId"].as_str().map(str::to_owned);
-                                page.held.push((pattern, request, network, session));
+                                page.held.push(Held {
+                                    pattern,
+                                    request,
+                                    network,
+                                    session,
+                                });
                                 return;
                             }
                         }
@@ -1626,10 +1763,20 @@ impl Connection {
                 let connection = self.clone();
                 let session = event["sessionId"].as_str().map(str::to_owned);
                 tokio::spawn(async move {
-                    connection
+                    if connection
                         .send(session.as_deref(), method, arguments)
                         .await
-                        .ok();
+                        .is_err()
+                    {
+                        connection
+                            .send(
+                                session.as_deref(),
+                                "Fetch.failRequest",
+                                json!({ "requestId": request, "errorReason": "Failed" }),
+                            )
+                            .await
+                            .ok();
+                    }
                 });
             }
             "Page.fileChooserOpened" => {
@@ -1722,10 +1869,16 @@ impl Connection {
             "Target.detachedFromTarget" => {
                 let session = text(&params["sessionId"]);
                 page.isolated.retain(|_, attached| *attached != session);
+                page.prepared.retain(|_, prepared| *prepared != session);
                 page.owners.remove(&session);
+                page.ready.remove(&session);
+                if let Some(target) = params["targetId"].as_str() {
+                    page.blank.remove(target);
+                    page.loading.remove(target);
+                }
                 let state = &mut *page;
-                forget_held(&mut state.held, &mut state.held_network, |from| {
-                    from == Some(session.as_str())
+                forget_held(&mut state.held, &mut state.held_network, |held| {
+                    held.session.as_deref() == Some(session.as_str())
                 });
                 page.closed |= params["targetId"] == page.main_frame.as_str();
                 if page.opened.as_deref() == params["targetId"].as_str() {
@@ -1775,7 +1928,10 @@ async fn read(receiver: pipe::Receiver, connection: Arc<Connection>) {
         .is_ok_and(|read| read > 0)
     {
         buffer.pop();
-        if let Ok(message) = serde_json::from_slice::<Value>(&buffer) {
+        if let Some(message) = serde_json::from_slice::<Value>(&buffer)
+            .ok()
+            .or_else(|| serde_json::from_slice(&without_lone_surrogates(&buffer)).ok())
+        {
             match message["id"].as_u64() {
                 Some(id) => {
                     if let Some(reply) = connection.replies.lock().unwrap().remove(&id) {
@@ -1790,15 +1946,48 @@ async fn read(receiver: pipe::Receiver, connection: Arc<Connection>) {
     connection.replies.lock().unwrap().clear();
 }
 
+fn attribute<'a>(node: &'a Value, name: &str) -> Option<&'a str> {
+    node["attributes"]
+        .as_array()?
+        .chunks(2)
+        .find(|pair| pair[0] == name)
+        .and_then(|pair| pair.get(1)?.as_str())
+}
+
+fn without_lone_surrogates(json: &[u8]) -> Vec<u8> {
+    let unit = |at: usize| {
+        json.get(at + 2..at + 6)
+            .filter(|_| json.get(at..at + 2) == Some(b"\\u".as_slice()))
+            .and_then(|hex| u16::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok())
+    };
+    let mut fixed = Vec::with_capacity(json.len());
+    let mut at = 0;
+    while at < json.len() {
+        let length = match (json[at], unit(at)) {
+            (b'\\', Some(0xD800..=0xDBFF)) if matches!(unit(at + 6), Some(0xDC00..=0xDFFF)) => 12,
+            (b'\\', Some(0xD800..=0xDFFF)) => {
+                fixed.extend_from_slice(b"\\ufffd");
+                at += 6;
+                continue;
+            }
+            (b'\\', _) => 2,
+            _ => 1,
+        };
+        fixed.extend_from_slice(&json[at..(at + length).min(json.len())]);
+        at += length;
+    }
+    fixed
+}
+
 fn forget_held(
-    held: &mut Vec<(String, String, String, Option<String>)>,
+    held: &mut Vec<Held>,
     held_network: &mut HashSet<String>,
-    gone: impl Fn(Option<&str>) -> bool,
+    gone: impl Fn(&Held) -> bool,
 ) {
-    held.retain(|(_, _, network, from)| {
-        let gone = gone(from.as_deref());
+    held.retain(|entry| {
+        let gone = gone(entry);
         if gone {
-            held_network.remove(network);
+            held_network.remove(&entry.network);
         }
         !gone
     });
@@ -1847,10 +2036,9 @@ fn tree(path: &Path, budget: &mut u64) -> Result<Value> {
         let mut entries: Vec<_> = std::fs::read_dir(path)?.flatten().collect();
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
-            if entry
-                .file_type()
-                .is_ok_and(|kind| kind.is_dir() || kind.is_file())
-            {
+            if entry.file_type().is_ok_and(|kind| {
+                kind.is_dir() || kind.is_file() || (kind.is_symlink() && entry.path().is_file())
+            }) {
                 children.push(tree(&entry.path(), budget)?);
             }
         }
@@ -1859,7 +2047,7 @@ fn tree(path: &Path, budget: &mut u64) -> Result<Value> {
     *budget = budget.checked_sub(metadata.len()).with_context(|| {
         format!(
             "the files given to the page pass {} MiB",
-            MAX_PICKED_BYTES / 1024 / 1024
+            MAX_PICKED_BYTES >> 20
         )
     })?;
     let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -1868,7 +2056,10 @@ fn tree(path: &Path, budget: &mut u64) -> Result<Value> {
 }
 
 fn arena(tree: &Value, frame: usize, clickable: &HashSet<usize>) -> Result<Vec<Node>> {
-    let nodes = tree["nodes"].as_array().context("no accessibility tree")?;
+    let nodes = tree["nodes"]
+        .as_array()
+        .filter(|nodes| !nodes.is_empty())
+        .context("no accessibility tree")?;
     let index: HashMap<&str, usize> = nodes
         .iter()
         .enumerate()
@@ -1897,15 +2088,12 @@ fn arena(tree: &Value, frame: usize, clickable: &HashSet<usize>) -> Result<Vec<N
         if candidates.contains(&at) && !holds_control(&arena, at, &candidates) {
             if arena[at].role.is_empty() {
                 arena[at].role = "generic".into();
+                arena[at].name = text(&nodes[at]["name"]);
             }
             arena[at].kind = Some(Kind::Press);
             arena[at].states.push("clickable");
         }
-        if named_by_contents(&arena[at].name, &arena[at].role, &arena[at].states) {
-            let mut names = Vec::new();
-            contents(&arena, at, &mut names);
-            arena[at].name = names.join(" ");
-        }
+        name_by_contents(&mut arena, at);
     }
     Ok(arena)
 }
@@ -1949,39 +2137,42 @@ fn holds_control(arena: &[Node], at: usize, candidates: &HashSet<usize>) -> bool
     })
 }
 
-fn named_by_contents(name: &str, role: &str, states: &[&str]) -> bool {
-    name.is_empty() && (role == "row" || states.contains(&"clickable"))
-}
-
-fn contents(arena: &[Node], at: usize, names: &mut Vec<String>) {
-    for &child in &arena[at].children {
-        match arena.get(child) {
-            Some(node) if !node.name.is_empty() => names.push(node.name.clone()),
-            Some(_) => contents(arena, child, names),
-            None => {}
-        }
-    }
-}
-
 fn addressed(url: &Value) -> bool {
     url.as_str()
         .is_some_and(|url| !url.is_empty() && url != "about:blank")
 }
 
 fn cdp_pattern(pattern: &str) -> String {
-    let escaped = pattern.replace('\\', "\\\\").replace('?', "\\?");
-    if pattern.contains('*') {
-        escaped
-    } else {
-        format!("{escaped}*")
+    match pattern.split_once('?') {
+        Some((path, _)) => format!("{}\\?*", path.replace('\\', "\\\\")),
+        None if pattern.contains('*') => pattern.replace('\\', "\\\\"),
+        None => format!("{}*", pattern.replace('\\', "\\\\")),
     }
 }
 
+fn auto_attach() -> Value {
+    json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true })
+}
+
+fn rerouted(target: &str, pattern: &str, url: &str) -> String {
+    let kept = pattern.trim_end_matches('/').len();
+    format!("{}{}", target.trim_end_matches('/'), &url[kept..])
+}
+
 fn matches(pattern: &str, url: &str) -> bool {
+    let (pattern, url) = (canonical_query(pattern, true), canonical_query(url, false));
+    let url = url.as_str();
     let parts: Vec<&str> = pattern.split('*').collect();
     let (first, last) = (parts[0], parts[parts.len() - 1]);
     if parts.len() == 1 {
-        return url.starts_with(first);
+        let ends: &[char] = if first.contains('?') {
+            &['&', '=', '#']
+        } else {
+            &['/', '?', '#']
+        };
+        return url.strip_prefix(first).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with(ends) || first.ends_with(['/', '?', '&', '='])
+        });
     }
     if !url.starts_with(first) || url.len() < first.len() + last.len() || !url.ends_with(last) {
         return false;
@@ -1994,6 +2185,21 @@ fn matches(pattern: &str, url: &str) -> bool {
         }
     }
     true
+}
+
+fn canonical_query(address: &str, wildcard: bool) -> String {
+    let Some((path, query)) = address.split_once('?') else {
+        return address.to_owned();
+    };
+    let structural = |c: char| matches!(c, '&' | '=' | '#') || (wildcard && c == '*');
+    let mut canonical = format!("{path}?");
+    for piece in query.split_inclusive(structural) {
+        let (text, mark) = piece.split_at(piece.len() - usize::from(piece.ends_with(structural)));
+        let decoded: Vec<u8> = percent_decode_str(&text.replace('+', " ")).collect();
+        canonical.extend(percent_encode(&decoded, QUERY_VALUE));
+        canonical.push_str(mark);
+    }
+    canonical
 }
 
 pub(super) fn content_type(path: &str) -> String {
@@ -2041,7 +2247,7 @@ fn cors(request: &Value, url: &str) -> Vec<Value> {
 }
 
 fn find() -> Result<PathBuf> {
-    if let Some(path) = Config::load()?.get("browser") {
+    if let Some(path) = Config::load()?.get("browser")? {
         return Ok(path.into());
     }
     candidates(std::env::var_os("HOME"), std::env::var_os("PATH"))
@@ -2068,12 +2274,7 @@ pub(super) fn sweep(dir: &Path) {
             .to_str()
             .and_then(|name| name.strip_prefix(SUITE_PREFIX))
             .and_then(|pid| pid.parse::<libc::pid_t>().ok());
-        let gone = pid.is_some_and(|pid| {
-            pid > 0
-                && unsafe { libc::kill(pid, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        });
-        if gone {
+        if pid.is_some_and(crate::gone) {
             std::fs::remove_dir_all(entry.path()).ok();
         }
     }
@@ -2086,7 +2287,7 @@ pub(super) fn private_dir(path: &Path) -> std::io::Result<()> {
 
 fn above_stdio(fd: impl Into<OwnedFd>) -> std::io::Result<OwnedFd> {
     let fd = fd.into();
-    let copy = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+    let copy = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, PIPE_WRITE_FD + 1) };
     if copy < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -2198,7 +2399,7 @@ fn to_node(node: &Value, nodes: &[Value], index: &HashMap<&str, usize>) -> Node 
     let role = match role.as_str() {
         "StaticText" => "text".into(),
         "RootWebArea" => "page".into(),
-        "Iframe" | "IframePresentational" => "iframe".into(),
+        "Iframe" | "IframePresentational" | "EmbeddedObject" => "iframe".into(),
         _ if shown => role,
         _ => String::new(),
     };
@@ -2229,6 +2430,47 @@ fn to_node(node: &Value, nodes: &[Value], index: &HashMap<&str, usize>) -> Node 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_half_of_a_character_in_a_message_becomes_a_replacement_character() {
+        let fixed =
+            |json: &str| String::from_utf8(without_lone_surrogates(json.as_bytes())).unwrap();
+        assert_eq!(fixed(r#"{"a":"\ud83d ok"}"#), r#"{"a":"\ufffd ok"}"#);
+        assert_eq!(fixed(r#"{"a":"\ude00"}"#), r#"{"a":"\ufffd"}"#);
+        assert_eq!(fixed(r#"{"a":"\ud83d\ude00"}"#), r#"{"a":"\ud83d\ude00"}"#);
+        assert_eq!(fixed(r#"{"a":"\\ud83d"}"#), r#"{"a":"\\ud83d"}"#);
+        assert_eq!(fixed(r#"{"a":"\ud83dxude00"}"#), r#"{"a":"\ufffdxude00"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_detached_target_leaves_nothing_behind() {
+        let (_, write) = std::io::pipe().unwrap();
+        let connection = Arc::new(Connection {
+            writer: tokio::sync::Mutex::new(pipe::Sender::from_owned_fd(write.into()).unwrap()),
+            replies: Mutex::default(),
+            last_id: AtomicU64::new(0),
+            page: Mutex::default(),
+        });
+        {
+            let mut page = connection.page.lock().unwrap();
+            page.ready.insert("session".into());
+            page.prepared.insert("target".into(), "session".into());
+            page.blank.insert("target".into());
+            page.loading.insert("target".into(), Instant::now());
+        }
+        connection.track(&json!({
+            "method": "Target.detachedFromTarget",
+            "params": { "sessionId": "session", "targetId": "target" }
+        }));
+        let page = connection.page.lock().unwrap();
+        assert!(page.ready.is_empty() && page.prepared.is_empty() && page.blank.is_empty());
+        assert!(page.loading.is_empty());
+    }
+
+    #[test]
+    fn an_empty_accessibility_tree_is_an_error() {
+        assert!(arena(&json!({ "nodes": [] }), 0, &HashSet::new()).is_err());
+    }
 
     #[test]
     fn a_profile_left_by_a_killed_run_is_replaced_by_a_private_one() {
@@ -2301,6 +2543,34 @@ mod tests {
             "https://login.example.com",
             "http://login.example.com/"
         ));
+        for (pattern, url, matched) in [
+            ("https://shop.test/api", "https://shop.test/api", true),
+            (
+                "https://shop.test/api",
+                "https://shop.test/api?page=2",
+                true,
+            ),
+            ("https://shop.test/api", "https://shop.test/api-docs", false),
+            ("https://shop.test", "https://shop.test.example.com/", false),
+            ("http://localhost:3000", "http://localhost:30001/x", false),
+            ("https://a.test/x?y", "https://a.test/x?y=1", true),
+            ("https://a.test/x?y", "https://a.test/x?yz=1", false),
+            ("https://a.test/x?y=", "https://a.test/x?y=1", true),
+            (
+                "https://a.test/s?q=red%20shirt",
+                "https://a.test/s?q=red+shirt",
+                true,
+            ),
+            (
+                "https://a.test/s?q=a%28b%29%21%2A",
+                "https://a.test/s?q=a(b)!*",
+                true,
+            ),
+            ("https://a.test/s?q=a", "https://a.test/s?q=a%26b=c", false),
+            ("https://a.test/x?y=1", "https://a.test/x?y=1&z=2", true),
+        ] {
+            assert_eq!(matches(pattern, url), matched, "{pattern} {url}");
+        }
         assert!(matches("*/api/prototypes*", "http://h/api/prototypes?q=1"));
         assert!(matches("*/captures/*.png", "http://h/captures/a/v1.png"));
         assert!(!matches(
@@ -2308,8 +2578,34 @@ mod tests {
             "http://h/captures/a/v1.png?retry=1"
         ));
         assert!(!matches("*/api/a*b", "http://h/api/b"));
-        assert_eq!(cdp_pattern("https://a.test/x?y"), "https://a.test/x\\?y*");
+        assert_eq!(cdp_pattern("https://a.test/x?y"), "https://a.test/x\\?*");
         assert_eq!(cdp_pattern("*/api/*"), "*/api/*");
+    }
+
+    #[test]
+    fn a_rerouted_address_joins_its_target_with_one_slash() {
+        for (target, pattern, url, rerouted_to) in [
+            (
+                "http://h:1",
+                "https://l.test/",
+                "https://l.test/login",
+                "http://h:1/login",
+            ),
+            (
+                "http://h:1/",
+                "https://l.test",
+                "https://l.test/login",
+                "http://h:1/login",
+            ),
+            (
+                "http://h:1/base",
+                "https://l.test/app",
+                "https://l.test/app?x=1",
+                "http://h:1/base?x=1",
+            ),
+        ] {
+            assert_eq!(rerouted(target, pattern, url), rerouted_to, "{pattern}");
+        }
     }
 
     #[test]
@@ -2319,11 +2615,19 @@ mod tests {
         std::fs::write(root.join("real/a.txt"), "a").unwrap();
         std::os::unix::fs::symlink(root.join("real"), root.join("current")).unwrap();
         std::os::unix::net::UnixListener::bind(root.join("real/s.sock")).unwrap();
+        std::fs::write(root.join("shared.txt"), "b").unwrap();
+        std::os::unix::fs::symlink(root.join("shared.txt"), root.join("real/b.txt")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("real/loop")).unwrap();
         let given = tree(&root.join("current"), &mut 1024);
         std::fs::remove_dir_all(&root).ok();
         let given = given.unwrap();
-        assert_eq!(given["children"][0]["name"], "a.txt");
-        assert_eq!(given["children"].as_array().unwrap().len(), 1);
+        let names: Vec<_> = given["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["a.txt", "b.txt"]);
     }
 
     #[test]

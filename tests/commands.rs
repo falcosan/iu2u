@@ -12,7 +12,7 @@ use common::{
 use futures_util::{StreamExt, stream};
 use iu2u::commands;
 use serde_json::json;
-use wiremock::MockServer;
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 #[tokio::test]
 async fn filter_keeps_the_lines_for_which_the_statement_holds() {
@@ -32,6 +32,31 @@ async fn filter_keeps_the_lines_for_which_the_statement_holds() {
     .await;
     assert_eq!(kept, ["ERROR refused"]);
     assert_eq!(model.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn filter_sends_a_request_again_after_a_passing_server_error() {
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&model)
+        .await;
+    answer_when(&model, "ERROR", json!({ "holds": yes(0.95) })).await;
+    answer_always(&model, json!({ "holds": yes(0.05) })).await;
+    let lines = ["ERROR one", "INFO two", "ERROR three"].map(|line| Ok(line.to_string()));
+    let kept: Vec<String> = commands::filter(
+        &client(&model),
+        "This line reports a problem",
+        0.5,
+        stream::iter(lines),
+    )
+    .map(Result::unwrap)
+    .collect()
+    .await;
+    assert_eq!(kept, ["ERROR one", "ERROR three"]);
+    assert_eq!(model.received_requests().await.unwrap().len(), 4);
 }
 
 #[tokio::test]
@@ -106,7 +131,7 @@ async fn filter_stops_on_an_error_while_its_input_stays_open() {
         .unwrap();
     let mut input = filter.stdin.take().unwrap();
     input.write_all(b"ERROR refused\n").unwrap();
-    let exited = tokio::time::timeout(Duration::from_secs(5), async {
+    let exited = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(status) = filter.try_wait().unwrap() {
                 return status;
@@ -174,7 +199,7 @@ async fn filter_reads_past_lines_that_are_not_utf8() {
 }
 
 #[test]
-fn a_zero_timeout_in_the_environment_is_refused() {
+fn a_bad_variable_is_refused_where_it_is_read_and_shown_by_config() {
     let output = iu2u()
         .args(["filter", "This line reports a problem"])
         .env("IU2U_MODEL", "model-x")
@@ -184,7 +209,32 @@ fn a_zero_timeout_in_the_environment_is_refused() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(
-        text(&output.stderr).contains("IU2U_TIMEOUT_MS must be a positive number of milliseconds")
+        text(&output.stderr)
+            .contains("IU2U_TIMEOUT_MS must be a positive whole number of milliseconds")
+    );
+    let home = config_home("bad-variable", "");
+    let env = [("IU2U_TRIM", "yes")];
+    let listed = text(&config(&home, &env, &[]).stdout);
+    assert!(
+        listed.contains("IU2U_TRIM must be true or false"),
+        "{listed}"
+    );
+    let got = config(&home, &env, &["get", "trim"]);
+    assert_eq!(got.status.code(), Some(2));
+    assert!(text(&got.stderr).contains("IU2U_TRIM must be true or false"));
+}
+
+#[test]
+fn switches_take_1_or_0_from_the_file_the_environment_and_config_set() {
+    let home = config_home("switch-numbers", "trim = 1\n");
+    assert_eq!(text(&config(&home, &[], &["get", "trim"]).stdout), "true\n");
+    let off = config(&home, &[("IU2U_TRIM", "0")], &["get", "trim"]);
+    assert_eq!(text(&off.stdout), "false\n");
+    config(&home, &[], &["set", "compass", "1"]);
+    assert!(
+        std::fs::read_to_string(home.join("iu2u/config.toml"))
+            .unwrap()
+            .contains("compass = true")
     );
 }
 
@@ -354,11 +404,7 @@ fn a_bad_config_file_is_named_with_its_key_or_line_and_left_alone() {
     ] {
         let home = config_home(name, written);
         let file = home.join("iu2u/config.toml");
-        for args in [
-            [].as_slice(),
-            &["set", "guard", "false"],
-            &["unset", "guard"],
-        ] {
+        for args in [[].as_slice(), &["set", "guard", "false"]] {
             let output = config(&home, &[], args);
             let stderr = text(&output.stderr);
             assert_eq!(output.status.code(), Some(2), "{name} {args:?}");
@@ -369,6 +415,47 @@ fn a_bad_config_file_is_named_with_its_key_or_line_and_left_alone() {
         }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
     }
+}
+
+#[test]
+fn config_unset_removes_a_key_the_file_got_wrong() {
+    for (name, written, key, left) in [
+        (
+            "unset-unknown",
+            "colour = \"red\"\nguard = false\n",
+            "colour",
+            "guard = false\n",
+        ),
+        (
+            "unset-type",
+            "guard = \"yes\"\ntrim = true\n",
+            "guard",
+            "trim = true\n",
+        ),
+    ] {
+        let home = config_home(name, written);
+        assert!(
+            config(&home, &[], &["unset", key]).status.success(),
+            "{name}"
+        );
+        assert!(config(&home, &[], &[]).status.success(), "{name}");
+        assert_eq!(
+            std::fs::read_to_string(home.join("iu2u/config.toml")).unwrap(),
+            left
+        );
+    }
+    let written = "model = \"x\"\nguard =\n";
+    let broken = config_home("unset-syntax", written);
+    let output = config(&broken, &[], &["unset", "guard"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("line 2"));
+    assert_eq!(
+        std::fs::read_to_string(broken.join("iu2u/config.toml")).unwrap(),
+        written
+    );
+    let unknown = config(&config_home("unset-absent", ""), &[], &["unset", "colour"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(text(&unknown.stderr).contains("unknown key `colour`"));
 }
 
 #[test]
@@ -408,5 +495,18 @@ fn config_set_stores_a_hugging_face_link_in_short_form_and_names_init() {
     assert_eq!(
         std::fs::read_to_string(home.join("iu2u/config.toml")).unwrap(),
         "model = \"decision:o/r:m-Q8_0.gguf\"\n"
+    );
+    let pinned = format!(
+        "https://huggingface.co/o/r/blob/{}/m-Q8_0.gguf",
+        "c".repeat(40)
+    );
+    assert!(
+        config(&home, &[], &["set", "model", &pinned])
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("iu2u/config.toml")).unwrap(),
+        format!("model = \"{pinned}\"\n")
     );
 }

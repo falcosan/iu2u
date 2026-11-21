@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -19,37 +19,34 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 
-use super::{Reference, UNSUPPORTED};
-use crate::commands::tail;
+use super::{HUGGING_FACE, REVISION_CHARS, Reference, UNSUPPORTED, is_hex};
 use crate::config::{self, Config};
+use crate::tail::tail;
 use crate::write_atomically;
 
 pub(crate) const BUILD: &str = "b12359";
 const RELEASES: &str = "https://github.com/ggml-org/llama.cpp/releases/download";
-const HUGGING_FACE: &str = "https://huggingface.co";
-const ARGS: [&str; 8] = [
-    "-c",
-    "32768",
-    "--no-webui",
-    "--offline",
-    "--log-verbosity",
-    "1",
-    "--sleep-idle-seconds",
-    "300",
-];
+const CONTEXT: usize = 32_768;
+const IDLE: Duration = Duration::from_secs(300);
 const READY_WITHIN: Duration = Duration::from_secs(120);
 const POLL_EVERY: Duration = Duration::from_millis(100);
+const LOCK_PATIENCE: Duration = Duration::from_millis(300);
 const RESPAWN_AFTER: Duration = Duration::from_secs(1);
 const PROPS_EVERY: Duration = Duration::from_secs(1);
 const STOP_WITHIN: Duration = Duration::from_secs(5);
 const ASK_SERVER_WITHIN: Duration = Duration::from_secs(2);
+const DOWNLOAD_CONNECT_WITHIN: Duration = Duration::from_secs(30);
+const DOWNLOAD_READ_WITHIN: Duration = Duration::from_secs(60);
+const HASH_CHUNK: usize = 1 << 20;
+const SHA256_CHARS: usize = 64;
+const IDENTITY_CHARS: usize = 16;
 const DISK_MARGIN: u64 = 1 << 30;
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
-pub(crate) const LOCAL_URL: &str = "http://localhost/v1/systemone";
+pub(crate) const LOCAL_BASE: &str = "http://localhost";
 const MISSING_LIBRARIES: [(&str, &str); 4] = [
     ("libgomp.so.1", "the GNU OpenMP runtime, package libgomp1"),
     ("libssl.so.3", "OpenSSL 3, package libssl3t64 or libssl3"),
@@ -124,6 +121,7 @@ impl Reference {
                 selector,
                 ..
             } => {
+                let pinned = self.pinned();
                 let dir = home.join("models").join(repository);
                 let names: Vec<String> = std::fs::read_dir(&dir)
                     .ok()?
@@ -135,6 +133,7 @@ impl Reference {
                     .collect();
                 let file = pick(&names, Some(selector.as_deref().unwrap_or("Q4_K_M"))).ok()?;
                 read_record(home, &dir.join(format!("{file}.json")))
+                    .filter(|record| pinned.is_none_or(|commit| record.revision == commit))
             }
         }
     }
@@ -210,11 +209,17 @@ pub(crate) fn runtime_dir(home: &Path) -> PathBuf {
     home.join("runtime").join(BUILD)
 }
 
-fn is_sha256(text: &str) -> bool {
-    text.len() == 64
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+fn args() -> [String; 8] {
+    [
+        "-c".into(),
+        CONTEXT.to_string(),
+        "--no-webui".into(),
+        "--offline".into(),
+        "--log-verbosity".into(),
+        "1".into(),
+        "--sleep-idle-seconds".into(),
+        IDLE.as_secs().to_string(),
+    ]
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -237,11 +242,11 @@ pub(crate) struct Server {
 impl Server {
     pub(crate) fn new(home: &Path, sha256: &str) -> Result<Self> {
         supported()?;
-        ensure!(is_sha256(sha256), "{sha256} is not a SHA-256");
+        ensure!(is_hex(sha256, SHA256_CHARS), "{sha256} is not a SHA-256");
         let identity = hex(&Sha256::digest(format!(
             "{BUILD}\n{sha256}\n{}",
-            ARGS.join(" ")
-        )))[..16]
+            args().join(" ")
+        )))[..IDENTITY_CHARS]
             .to_owned();
         let run = home.join("run");
         let socket = run.join(format!("{identity}.sock"));
@@ -276,7 +281,7 @@ impl Server {
     pub(crate) async fn asked(&self, path: &str) -> Option<(StatusCode, Value)> {
         let response = self
             .http
-            .get(format!("http://localhost{path}"))
+            .get(format!("{LOCAL_BASE}{path}"))
             .timeout(ASK_SERVER_WITHIN)
             .send()
             .await
@@ -331,21 +336,27 @@ impl Server {
 
     async fn ready(&self) -> Result<()> {
         let started = Instant::now();
-        let mut spawned: Option<SystemTime> = None;
+        let log = || {
+            std::fs::metadata(&self.log)
+                .ok()
+                .map(|log| (log.modified().ok(), log.len()))
+        };
+        let mut spawned = None;
         loop {
             if let Some((StatusCode::OK, _)) = self.asked("/health").await {
                 return Ok(());
             }
             if !self.supervised()? {
-                if let Some(at) = spawned
-                    && std::fs::metadata(&self.log)
-                        .and_then(|log| log.modified())
-                        .is_ok_and(|modified| modified >= at)
+                if let Some((_, before)) = &spawned
+                    && log() != *before
                 {
                     return Err(self.failed("stopped before it was ready"));
                 }
-                if spawned.is_none_or(|at| at.elapsed().unwrap_or_default() >= RESPAWN_AFTER) {
-                    spawned = Some(SystemTime::now());
+                if spawned
+                    .as_ref()
+                    .is_none_or(|(at, _): &(Instant, _)| at.elapsed() >= RESPAWN_AFTER)
+                {
+                    spawned = Some((Instant::now(), log()));
                     self.spawn()?;
                 }
             }
@@ -447,7 +458,7 @@ async fn peer(socket: &Path) -> Option<i32> {
 
 pub async fn serve(sha256: &str, identity: &str) -> Result<()> {
     ensure!(
-        identity.len() == 16 && identity.bytes().all(|b| b.is_ascii_hexdigit()),
+        is_hex(identity, IDENTITY_CHARS),
         "{identity} is not a server identity"
     );
     let home = home()?;
@@ -460,8 +471,15 @@ pub async fn serve(sha256: &str, identity: &str) -> Result<()> {
         )?;
         return Ok(());
     }
-    let Some(_lock) = locked(&server.lock)? else {
-        return Ok(());
+    let started = Instant::now();
+    let _lock = loop {
+        if let Some(lock) = locked(&server.lock)? {
+            break lock;
+        }
+        if started.elapsed() >= LOCK_PATIENCE {
+            return Ok(());
+        }
+        tokio::time::sleep(POLL_EVERY).await;
     };
     let mut log = File::create(&server.log)?;
     if let Err(error) = supervise(&server, &log).await {
@@ -482,7 +500,7 @@ async fn supervise(server: &Server, log: &File) -> Result<()> {
         .arg(model_path(&server.home, &server.sha256))
         .arg("--host")
         .arg(&server.socket)
-        .args(ARGS)
+        .args(args())
         .current_dir(server.socket.parent().unwrap_or(&server.home))
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -530,8 +548,8 @@ async fn supervise(server: &Server, log: &File) -> Result<()> {
 pub(crate) fn downloader() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .https_only(true)
-        .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(60))
+        .connect_timeout(DOWNLOAD_CONNECT_WITHIN)
+        .read_timeout(DOWNLOAD_READ_WITHIN)
         .build()?)
 }
 
@@ -574,7 +592,7 @@ pub(crate) async fn download(
     let mut hasher = Sha256::new();
     let mut have = 0;
     if let Ok(mut file) = File::open(partial) {
-        let mut buffer = vec![0; 1 << 20];
+        let mut buffer = vec![0; HASH_CHUNK];
         loop {
             let read = file.read(&mut buffer)?;
             if read == 0 {
@@ -680,7 +698,7 @@ impl Repository {
     fn from_api(name: &str, info: &Value) -> Result<Self> {
         let revision = info["sha"]
             .as_str()
-            .filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+            .filter(|sha| is_hex(sha, REVISION_CHARS))
             .context("it gives no revision")?;
         let files = info["siblings"]
             .as_array()
@@ -691,7 +709,7 @@ impl Repository {
                 let size = file["size"].as_u64()?;
                 let sha256 = file["lfs"]["sha256"]
                     .as_str()
-                    .filter(|sha| is_sha256(sha))?;
+                    .filter(|sha| is_hex(sha, SHA256_CHARS))?;
                 (!name.contains('/') && name.to_lowercase().ends_with(".gguf"))
                     .then(|| (name.to_owned(), size, sha256.to_owned()))
             })
@@ -790,7 +808,7 @@ pub(crate) fn bytes(count: u64) -> String {
 
 pub async fn status() -> Result<String> {
     let config = Config::load()?;
-    let Some(model) = config.get("model") else {
+    let Some(model) = config.get("model")? else {
         return Ok("model      (none): run iu2u init\n".into());
     };
     let mut lines = vec![format!(
@@ -885,7 +903,9 @@ pub(crate) fn installed_models(home: &Path) -> Vec<Record> {
 fn read_record(home: &Path, path: &Path) -> Option<Record> {
     serde_json::from_str::<Record>(&std::fs::read_to_string(path).ok()?)
         .ok()
-        .filter(|record| is_sha256(&record.sha256) && model_path(home, &record.sha256).is_file())
+        .filter(|record| {
+            is_hex(&record.sha256, SHA256_CHARS) && model_path(home, &record.sha256).is_file()
+        })
 }
 
 pub(crate) fn unfinished_downloads(home: &Path) -> Vec<(PathBuf, u64)> {
@@ -938,11 +958,7 @@ fn abandoned(name: &str) -> bool {
     name.strip_prefix('.')
         .and_then(|rest| rest.split('.').next())
         .and_then(|pid| pid.parse::<i32>().ok())
-        .filter(|pid| *pid > 0)
-        .is_some_and(|pid| {
-            let signalled = unsafe { libc::kill(pid, 0) };
-            signalled == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        })
+        .is_some_and(crate::gone)
 }
 
 pub(crate) fn installation(home: &Path) -> Result<File> {
@@ -1198,6 +1214,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_download_longer_than_its_pin_is_cut_off() {
+        let server = served(BODY).await;
+        let dir = scratch("longer");
+        let target = dir.join("model");
+        let short = BODY.len() as u64 - 1;
+        let error = download(
+            &reqwest::Client::new(),
+            &server.uri(),
+            &target,
+            &dir.join("model.partial"),
+            (short, &hex(&Sha256::digest(&BODY[..BODY.len() - 1]))),
+            &mut |_, _| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(&format!("longer than its pin of {short} bytes")),
+            "{error}"
+        );
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn a_partial_file_longer_than_its_pin_is_downloaded_again() {
+        let server = served(BODY).await;
+        let dir = scratch("partial-longer");
+        let (target, partial) = (dir.join("model"), dir.join("model.partial"));
+        std::fs::write(&partial, b"model weights and more").unwrap();
+        download(
+            &reqwest::Client::new(),
+            &server.uri(),
+            &target,
+            &partial,
+            (BODY.len() as u64, &hex(&Sha256::digest(BODY))),
+            &mut |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), BODY);
+    }
+
+    #[tokio::test]
     async fn a_gated_repository_names_its_page_and_hf_token() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1222,6 +1281,26 @@ mod tests {
                 && error.contains("HF_TOKEN"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_link_pinned_to_a_commit_finds_only_that_commit_installed() {
+        let home = scratch("pinned");
+        let installed = record("o/r", "m.gguf");
+        std::fs::create_dir_all(home.join("models")).unwrap();
+        std::fs::write(model_path(&home, &installed.sha256), "weights").unwrap();
+        install_model(&home, &installed, &mut |_, _| {})
+            .await
+            .unwrap();
+        let link = |revision: &str| {
+            Reference::parse(&format!("{HUGGING_FACE}/o/r/blob/{revision}/m.gguf"))
+                .unwrap()
+                .unwrap()
+                .installed(&home)
+        };
+        assert_eq!(link(&installed.revision), Some(installed.clone()));
+        assert_eq!(link(&"b".repeat(40)), None);
+        assert_eq!(link("main"), Some(installed));
     }
 
     #[tokio::test]

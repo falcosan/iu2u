@@ -36,8 +36,9 @@ async fn handback(input: &Value, client: &Client) -> Result<String> {
     if marker.exists() {
         return Ok(String::new());
     }
+    let unproven = done_without_proof(report, client).await?;
     std::fs::File::create(&marker)?;
-    if !done_without_proof(report, client).await? {
+    if !unproven {
         return Ok(String::new());
     }
     Ok(permission("deny", SEND_BACK))

@@ -126,7 +126,7 @@ fn filter_spawned(base: &Path, env: &[(&str, &str)]) -> Child {
         .take()
         .unwrap()
         .write_all(b"INFO started\nERROR refused\n")
-        .unwrap();
+        .ok();
     child
 }
 
@@ -357,6 +357,16 @@ fn warm_starts_the_server_at_once_and_replaces_one_that_lost_its_supervisor() {
     std::fs::write(broken.join("iu2u/config.toml"), "colour = 1\n").unwrap();
     let warm = run(&broken, &["hook", "warm"], &[]);
     assert_eq!((warm.status.code(), warm.stdout.len()), (Some(0), 0));
+}
+
+#[test]
+fn warm_leaves_the_model_unloaded_while_every_hook_is_off() {
+    let base = local("warm-off", true);
+    let env = [("IU2U_GUARD", "false"), ("IU2U_PROOF", "false")];
+    let warm = run(&base, &["hook", "warm"], &env);
+    assert_eq!((warm.status.code(), warm.stdout.len()), (Some(0), 0));
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(sockets(&base), 0);
 }
 
 const HANDS_OVER: &str = r#"

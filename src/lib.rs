@@ -3,7 +3,18 @@ pub mod config;
 pub mod hooks;
 pub mod mcp;
 pub mod model;
+#[cfg(unix)]
+mod tail;
 pub mod tools;
+
+pub(crate) const PROJECT_DIR: &str = "CLAUDE_PROJECT_DIR";
+
+#[cfg(unix)]
+pub(crate) fn gone(pid: i32) -> bool {
+    pid > 0
+        && unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
 
 pub(crate) fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());

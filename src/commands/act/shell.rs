@@ -1,4 +1,4 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -8,11 +8,14 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
 use super::script::Start;
+use crate::tail::{KEPT_BYTES, from_a_line, read_tail, tail};
 
 const READY_EVERY: Duration = Duration::from_millis(250);
+const GONE_EVERY: Duration = Duration::from_millis(25);
+const READY_ASK_WITHIN: Duration = Duration::from_secs(1);
+const READ_CHUNK: usize = 1 << 16;
 const STOP_WITHIN: Duration = Duration::from_secs(5);
-const TAIL_LINES: usize = 20;
-pub(super) const KEPT_BYTES: usize = 1024 * 1024;
+const READY_REFUSALS: RangeInclusive<u16> = 400..=403;
 
 pub(super) struct Service {
     pub(super) name: String,
@@ -24,8 +27,8 @@ pub(super) struct Service {
 
 pub(super) struct Ran {
     pub(super) code: Option<i32>,
-    pub(super) lines: Vec<String>,
     pub(super) stdout: String,
+    pub(super) stderr: String,
     pub(super) cut: bool,
 }
 
@@ -37,7 +40,7 @@ impl Ran {
 
     pub(super) fn shown(self) -> Vec<String> {
         let exit = self.exit();
-        let mut lines = self.lines;
+        let mut lines: Vec<String> = self.stdout.lines().map(str::to_owned).collect();
         if self.cut {
             lines.insert(
                 0,
@@ -61,7 +64,11 @@ fn shell(command: &str, env: &[(String, String)]) -> Command {
     shell
 }
 
-pub(super) async fn run(command: &str, env: &[(String, String)], within: Duration) -> Result<Ran> {
+pub(super) async fn run(
+    command: &str,
+    env: &[(String, String)],
+    within: Duration,
+) -> Result<Option<Ran>> {
     let mut child = shell(command, env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -70,10 +77,7 @@ pub(super) async fn run(command: &str, env: &[(String, String)], within: Duratio
     let group = Group(child.id());
     let (stdout, stderr) = (read_all(child.stdout.take()), read_all(child.stderr.take()));
     let Ok(status) = tokio::time::timeout(within, child.wait()).await else {
-        bail!(
-            "the command did not finish within {}s",
-            within.as_secs_f64()
-        );
+        return Ok(None);
     };
     let status = status.context("the command broke off")?;
     drop(group);
@@ -84,28 +88,19 @@ pub(super) async fn run(command: &str, env: &[(String, String)], within: Duratio
             "the command ended, but a process it started outside its group still holds its output"
         );
     };
-    let lines = [&stdout, &stderr]
-        .into_iter()
-        .flat_map(|bytes| {
-            String::from_utf8_lossy(bytes)
-                .lines()
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    Ok(Ran {
+    Ok(Some(Ran {
         code: status.code(),
-        lines,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
         cut,
-    })
+    }))
 }
 
 fn read_all(
     pipe: Option<impl AsyncRead + Unpin + Send + 'static>,
 ) -> tokio::task::JoinHandle<(Vec<u8>, bool)> {
     tokio::spawn(async move {
-        let (mut bytes, mut chunk, mut cut) = (Vec::new(), vec![0; 64 * 1024], false);
+        let (mut bytes, mut chunk, mut cut) = (Vec::new(), vec![0; READ_CHUNK], false);
         if let Some(mut pipe) = pipe {
             while let Ok(read @ 1..) = pipe.read(&mut chunk).await {
                 bytes.extend_from_slice(&chunk[..read]);
@@ -126,15 +121,6 @@ fn read_all(
     })
 }
 
-fn from_a_line(mut bytes: Vec<u8>) -> Vec<u8> {
-    let start = bytes
-        .iter()
-        .position(|&byte| byte == b'\n')
-        .map_or(0, |at| at + 1);
-    bytes.drain(..start);
-    bytes
-}
-
 pub(super) async fn start(
     client: &reqwest::Client,
     start: &Start,
@@ -142,7 +128,7 @@ pub(super) async fn start(
     dir: &Path,
     within: Duration,
 ) -> Result<Service> {
-    let answers = async |at: &str| client.get(at).timeout(READY_EVERY * 4).send().await;
+    let answers = async |at: &str| client.get(at).timeout(READY_ASK_WITHIN).send().await;
     if let Some(at) = &start.at {
         anyhow::ensure!(
             reqwest::Url::parse(at).is_ok_and(|url| matches!(url.scheme(), "http" | "https")),
@@ -166,13 +152,20 @@ pub(super) async fn start(
     let group = Group(child.id());
     if let Some(at) = &start.at {
         let started = Instant::now();
+        let (mut answered, mut failed) = (None, None);
         loop {
-            if let Ok(response) = answers(at).await
-                && (response.status().is_success()
-                    || response.status().is_redirection()
-                    || (400..=403).contains(&response.status().as_u16()))
-            {
-                break;
+            match answers(at).await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success()
+                        || status.is_redirection()
+                        || READY_REFUSALS.contains(&status.as_u16())
+                    {
+                        break;
+                    }
+                    answered = Some(status);
+                }
+                Err(error) => failed = Some(anyhow::Error::new(error)),
             }
             let ended = child.try_wait()?;
             if ended.is_some() || started.elapsed() >= within {
@@ -187,7 +180,19 @@ pub(super) async fn start(
                         "{} stopped ({status}) before {at} answered{said}",
                         start.name
                     ),
-                    None => bail!("{at} did not answer within {}s{said}", within.as_secs_f64()),
+                    None => match answered {
+                        Some(status) => bail!(
+                            "{at} answered only {status} within {}s{said}",
+                            within.as_secs_f64()
+                        ),
+                        None => bail!(
+                            "{at} did not answer within {}s{}{said}",
+                            within.as_secs_f64(),
+                            failed
+                                .map(|error| format!(": {error:#}"))
+                                .unwrap_or_default()
+                        ),
+                    },
                 }
             }
             tokio::time::sleep(READY_EVERY).await;
@@ -217,44 +222,40 @@ pub(super) fn logs(service: &Service) -> Vec<String> {
         .collect()
 }
 
-fn read_tail(path: &Path, shown_from: u64) -> (Vec<u8>, bool) {
-    let (mut bytes, mut cut) = (Vec::new(), false);
-    if let Ok(mut file) = std::fs::File::open(path)
-        && let Ok(length) = file.metadata().map(|meta| meta.len())
-    {
-        let kept = u64::try_from(KEPT_BYTES).unwrap_or(u64::MAX);
-        let from = shown_from.max(length.saturating_sub(kept));
-        cut = from > shown_from;
-        if file.seek(SeekFrom::Start(from)).is_ok() {
-            file.take(kept).read_to_end(&mut bytes).ok();
-        }
-    }
-    if cut {
-        bytes = from_a_line(bytes);
-    }
-    (bytes, cut)
-}
-
 pub(super) async fn stop(mut service: Service) {
     let Some(group) = service.group.0 else {
         return;
     };
     signal(group, libc::SIGTERM);
+    end(&mut service.group, &mut service.child, STOP_WITHIN).await;
+}
+
+pub(super) async fn end(group: &mut Group, child: &mut Child, within: Duration) {
+    let Some(id) = group.0 else {
+        return;
+    };
     let started = Instant::now();
-    while started.elapsed() < STOP_WITHIN && running(group) {
-        service.child.try_wait().ok();
-        tokio::time::sleep(READY_EVERY).await;
+    while started.elapsed() < within && running(id) {
+        child.try_wait().ok();
+        tokio::time::sleep(GONE_EVERY).await;
     }
-    signal(group, libc::SIGKILL);
-    service.group.0 = None;
-    service.child.wait().await.ok();
+    signal(id, libc::SIGKILL);
+    group.0 = None;
+    tokio::time::timeout(within, child.wait()).await.ok();
+}
+
+pub(super) async fn gone(groups: &[u32], within: Duration) {
+    let started = Instant::now();
+    while started.elapsed() < within && groups.iter().any(|group| running(*group)) {
+        tokio::time::sleep(GONE_EVERY).await;
+    }
 }
 
 fn running(group: u32) -> bool {
     libc::pid_t::try_from(group).is_ok_and(|group| unsafe { libc::kill(-group, 0) } == 0)
 }
 
-struct Group(Option<u32>);
+pub(super) struct Group(pub(super) Option<u32>);
 
 impl Drop for Group {
     fn drop(&mut self) {
@@ -270,11 +271,4 @@ fn signal(group: u32, signal: libc::c_int) {
             libc::kill(-group, signal);
         }
     }
-}
-
-pub(crate) fn tail(log: &Path) -> String {
-    let (bytes, _) = read_tail(log, 0);
-    let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n")
 }

@@ -8,11 +8,11 @@ use super::decide::Input;
 use super::mac::Mac;
 use super::screen::{Element, Node};
 
-pub(super) const POLL: Duration = Duration::from_millis(25);
+pub(super) const POLL_EVERY: Duration = Duration::from_millis(25);
 pub(super) const FIRST_CHANGE: Duration = Duration::from_millis(500);
 const QUIET: Duration = Duration::from_millis(100);
 const SETTLE_WITHIN: Duration = Duration::from_secs(3);
-const LOAD_WITHIN: Duration = Duration::from_secs(10);
+pub(super) const LOAD_WITHIN: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Action {
@@ -123,7 +123,7 @@ pub(super) async fn settle<T: PartialEq>(
         if settled || started.elapsed() >= within {
             return;
         }
-        tokio::time::sleep(POLL).await;
+        tokio::time::sleep(POLL_EVERY).await;
     }
 }
 

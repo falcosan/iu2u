@@ -56,6 +56,20 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
+        let config = Self::read()?;
+        let file = || shown(config.path.as_deref());
+        for (name, item) in config.document.iter() {
+            let key = known(name).with_context(|| {
+                format!("{}: unknown key `{name}`; the keys are {}", file(), names())
+            })?;
+            item.as_value()
+                .and_then(|value| text_of(key.kind, value))
+                .with_context(|| format!("{}: `{name}` must be {}", file(), expected(key.kind)))?;
+        }
+        Ok(config)
+    }
+
+    fn read() -> Result<Self> {
         let path = path();
         let text = match &path {
             Some(path) => match std::fs::read_to_string(path) {
@@ -67,28 +81,28 @@ impl Config {
             },
             None => String::new(),
         };
-        let config = Self {
+        Ok(Self {
             document: text
                 .parse()
                 .with_context(|| format!("{} is not valid TOML", shown(path.as_deref())))?,
             path,
-        };
-        let file = || shown(config.path.as_deref());
-        for (name, item) in config.document.iter() {
-            let key = KEYS.iter().find(|key| key.name == name).with_context(|| {
-                format!("{}: unknown key `{name}`; the keys are {}", file(), names())
-            })?;
-            item.as_value()
-                .and_then(|value| text_of(key.kind, value))
-                .with_context(|| format!("{}: `{name}` must be {}", file(), expected(key.kind)))?;
-        }
-        Ok(config)
+        })
     }
 
-    pub fn get(&self, name: &str) -> Option<String> {
-        variable(name)
-            .or_else(|| self.in_file(name))
-            .or_else(|| default(name).map(str::to_owned))
+    pub fn get(&self, name: &str) -> Result<Option<String>> {
+        if let Some(text) = variable(name) {
+            let kind = key(name)?.kind;
+            anyhow::ensure!(
+                accepts(kind, &text),
+                "{} must be {}",
+                variable_name(name),
+                expected(kind)
+            );
+            return Ok(Some(text));
+        }
+        Ok(self
+            .in_file(name)
+            .or_else(|| default(name).map(str::to_owned)))
     }
 
     pub(crate) fn origin(&self, name: &str) -> String {
@@ -110,7 +124,7 @@ impl Config {
     }
 
     fn in_file(&self, name: &str) -> Option<String> {
-        let key = KEYS.iter().find(|key| key.name == name)?;
+        let key = known(name)?;
         text_of(key.kind, self.document.get(name)?.as_value()?).filter(|text| !text.is_empty())
     }
 
@@ -160,7 +174,7 @@ fn shown(path: Option<&Path>) -> String {
 }
 
 pub(crate) fn default(name: &str) -> Option<&'static str> {
-    KEYS.iter().find(|key| key.name == name)?.default
+    known(name)?.default
 }
 
 pub(crate) fn variable_name(name: &str) -> String {
@@ -168,9 +182,14 @@ pub(crate) fn variable_name(name: &str) -> String {
 }
 
 pub(crate) fn variable(name: &str) -> Option<String> {
-    std::env::var(variable_name(name))
+    let text = std::env::var(variable_name(name))
         .ok()
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty())?;
+    Some(
+        known(name)
+            .and_then(|key| normal(key.kind, &text))
+            .unwrap_or(text),
+    )
 }
 
 pub(crate) fn api_key() -> Option<(String, &'static str)> {
@@ -194,33 +213,54 @@ fn expected(kind: Kind) -> String {
     }
 }
 
-fn text_of(kind: Kind, value: &Value) -> Option<String> {
-    match (kind, value) {
-        (Kind::Switch, Value::Boolean(on)) => Some(on.value().to_string()),
-        (Kind::Milliseconds, Value::Integer(ms)) if *ms.value() > 0 => Some(ms.value().to_string()),
-        (Kind::Text, Value::String(text)) => Some(text.value().clone()),
-        (Kind::Url, Value::String(url))
-            if reqwest::Url::parse(url.value())
-                .is_ok_and(|url| matches!(url.scheme(), "http" | "https")) =>
-        {
-            Some(url.value().clone())
+fn accepts(kind: Kind, text: &str) -> bool {
+    match kind {
+        Kind::Text => true,
+        Kind::Url => {
+            reqwest::Url::parse(text).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
         }
-        (Kind::Effort, Value::String(effort)) if EFFORTS.contains(&effort.value().as_str()) => {
-            Some(effort.value().clone())
-        }
+        Kind::Effort => EFFORTS.contains(&text),
+        Kind::Milliseconds => text.parse::<u64>().is_ok_and(|ms| ms > 0),
+        Kind::Switch => switch(text).is_some(),
+    }
+}
+
+fn switch(text: &str) -> Option<bool> {
+    match text {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
         _ => None,
     }
+}
+
+fn normal(kind: Kind, text: &str) -> Option<String> {
+    match kind {
+        Kind::Switch => switch(text).map(|on| on.to_string()),
+        _ => accepts(kind, text).then(|| text.to_owned()),
+    }
+}
+
+fn text_of(kind: Kind, value: &Value) -> Option<String> {
+    let text = match (kind, value) {
+        (Kind::Switch, Value::Boolean(on)) => on.value().to_string(),
+        (Kind::Switch | Kind::Milliseconds, Value::Integer(number)) => number.value().to_string(),
+        (Kind::Text | Kind::Url | Kind::Effort, Value::String(text)) => text.value().clone(),
+        _ => return None,
+    };
+    normal(kind, &text)
+}
+
+fn known(name: &str) -> Option<&'static Key> {
+    KEYS.iter().find(|key| key.name == name)
 }
 
 fn key(name: &str) -> Result<&'static Key> {
     if name == "api_key" {
         bail!(
-            "the API key is not kept in the config file: set it with /plugin configure iu2u@iu2u in Claude Code, or with IU2U_API_KEY"
+            "the API key is not kept in the config file: set it with /plugin configure iu2u@iu2u in Claude Code, or with IU2U_API_KEY outside it"
         );
     }
-    KEYS.iter()
-        .find(|key| key.name == name)
-        .with_context(|| format!("unknown key `{name}`; the keys are {}", names()))
+    known(name).with_context(|| format!("unknown key `{name}`; the keys are {}", names()))
 }
 
 pub fn list() -> Result<String> {
@@ -228,7 +268,10 @@ pub fn list() -> Result<String> {
     let rows: Vec<(&str, String, String)> = KEYS
         .iter()
         .map(|key| {
-            let value = config.get(key.name).unwrap_or_else(|| "(none)".into());
+            let value = match config.get(key.name) {
+                Ok(value) => value.unwrap_or_else(|| "(none)".into()),
+                Err(error) => format!("{error:#}"),
+            };
             (key.name, value, config.origin(key.name))
         })
         .chain(std::iter::once(match api_key() {
@@ -250,7 +293,7 @@ pub fn list() -> Result<String> {
 
 pub fn get(name: &str) -> Result<Option<String>> {
     key(name)?;
-    Ok(Config::load()?.get(name))
+    Config::load()?.get(name)
 }
 
 pub fn set(name: &str, text: &str) -> Result<()> {
@@ -294,7 +337,7 @@ fn value(name: &str, text: &str) -> Result<Value> {
     };
     let text = stored.as_deref().unwrap_or(text);
     match key.kind {
-        Kind::Switch => text.parse::<bool>().ok().map(Value::from),
+        Kind::Switch => switch(text).map(Value::from),
         Kind::Milliseconds => text.parse::<i64>().ok().map(Value::from),
         Kind::Text | Kind::Url | Kind::Effort => Some(Value::from(text)),
     }
@@ -318,13 +361,12 @@ pub(crate) fn write(settings: &[(&str, String)]) -> Result<()> {
 }
 
 pub fn unset(name: &str) -> Result<()> {
-    key(name)?;
-    let mut config = Config::load()?;
+    let mut config = Config::read()?;
     config.path.as_ref().context(NO_LOCATION)?;
-    if config.document.remove(name).is_some() {
-        config.write()?;
+    match config.document.remove(name) {
+        Some(_) => config.write(),
+        None => key(name).map(drop),
     }
-    Ok(())
 }
 
 pub fn location() -> Result<PathBuf> {

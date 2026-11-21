@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
-use crate::model::{Answers, Question, Questions};
+use crate::model::{Answers, MAX_LEVELS, MAX_OPTIONS, Question, Questions};
 use excerpts::{Excerpt, excerpts};
 
 pub use lint::{LintParams, lint};
@@ -20,8 +20,6 @@ pub use weigh::{WeighParams, weigh};
 
 const MAX_ITEMS: usize = 500;
 const MAX_QUESTIONS: usize = 50;
-const MAX_OPTIONS: usize = 255;
-const MAX_LEVELS: usize = 10;
 const MAX_FILE_BYTES: u64 = 1 << 20;
 const MATCH_AT: f64 = 0.5;
 const EXCERPT_CHARS: usize = 2000;
@@ -69,12 +67,16 @@ fn number(entry: &Value, key: &str) -> f64 {
     entry[key].as_f64().unwrap_or(f64::NEG_INFINITY)
 }
 
-async fn read_text(file: &str) -> Result<String, String> {
-    let cannot_read = |reason: &dyn std::fmt::Display| format!("cannot read {file}: {reason}");
-    let path = std::env::var_os("CLAUDE_PROJECT_DIR").map_or_else(
+fn located(file: &str) -> PathBuf {
+    std::env::var_os(crate::PROJECT_DIR).map_or_else(
         || PathBuf::from(file),
         |project| Path::new(&project).join(file),
-    );
+    )
+}
+
+async fn read_text(file: &str) -> Result<String, String> {
+    let cannot_read = |reason: &dyn std::fmt::Display| format!("cannot read {file}: {reason}");
+    let path = located(file);
     let metadata = tokio::fs::metadata(&path)
         .await
         .map_err(|error| cannot_read(&error))?;
@@ -103,7 +105,11 @@ async fn read_excerpts(
     bounded("files", files.len(), MAX_ITEMS)?;
     let mut found = Vec::new();
     let mut unreadable = BTreeMap::new();
-    for file in files {
+    let mut read = HashSet::new();
+    for file in files.iter().filter(|file| {
+        let path = located(file);
+        read.insert(std::fs::canonicalize(&path).unwrap_or(path))
+    }) {
         match read_text(file).await {
             Ok(text) => found.extend(excerpts(file, &text, budget)),
             Err(error) => {
@@ -116,7 +122,7 @@ async fn read_excerpts(
             ));
         }
     }
-    if unreadable.len() == files.len() {
+    if unreadable.len() == read.len() {
         return Err(format!("nothing readable: {unreadable:?}"));
     }
     Ok((found, unreadable))

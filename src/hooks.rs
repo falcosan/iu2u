@@ -19,7 +19,8 @@ use crate::model::{ADAPTER_SESSION, Client};
 
 const ITEM_CHARS: usize = 300;
 const KEPT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
-const JUDGE_WITHIN: Duration = Duration::from_secs(12);
+pub(crate) const JUDGE_WITHIN: Duration = Duration::from_secs(12);
+const BATCH_WITHIN: Duration = Duration::from_secs(110);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Power {
@@ -37,14 +38,19 @@ impl Power {
             return false;
         }
         if self == Self::Warm {
-            return true;
+            return Self::value_variants()
+                .iter()
+                .any(|power| *power != Self::Warm && power.enabled());
         }
         let name = format!("{self:?}").to_lowercase();
-        match Config::load().unwrap_or_default().get(&name).as_deref() {
-            Some("true") => true,
-            Some("false") => false,
-            _ => config::default(&name) == Some("true"),
-        }
+        Config::load()
+            .unwrap_or_default()
+            .get(&name)
+            .ok()
+            .flatten()
+            .as_deref()
+            .or(config::default(&name))
+            == Some("true")
     }
 
     pub async fn run(self, input: &Value, client: Result<Client>) -> Result<String> {
@@ -67,6 +73,13 @@ impl Power {
             String::new()
         }))
     }
+}
+
+fn command(input: &Value) -> &str {
+    input
+        .pointer("/tool_input/command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 fn data_path(folder: &str, id: &str) -> Result<PathBuf> {

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 
-use crate::config::{self, Config};
-use crate::hooks::IRREVERSIBLE;
+use crate::config::{self, Config, EFFORTS};
+use crate::hooks::{IRREVERSIBLE, JUDGE_WITHIN};
 use crate::model::decision::{self, Record, bytes};
 use crate::model::{Client, DEFAULT_CLAUDE_MODEL, Question, Questions, Reference, is_claude};
 use crate::write_atomically;
@@ -94,9 +94,13 @@ pub async fn init(input: &mut dyn BufRead, yes: bool) -> Result<()> {
     eprintln!(
         "\nNext, add the plugin to Claude Code:\n  claude plugin marketplace add falcosan/iu2u\n  claude plugin install iu2u@iu2u"
     );
-    if local.is_none() && !is_claude(&settings[0].1) {
+    if local.is_none()
+        && settings
+            .iter()
+            .any(|(name, value)| *name == "model" && !is_claude(value))
+    {
         eprintln!(
-            "If your server needs an API key, set it in Claude Code with /plugin configure iu2u@iu2u, or export IU2U_API_KEY."
+            "If your server needs an API key, set it in Claude Code with /plugin configure iu2u@iu2u; outside Claude Code, export IU2U_API_KEY."
         );
     }
     Ok(())
@@ -132,48 +136,74 @@ async fn unattended(config: &Config) -> Result<Plan> {
     })
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Source {
+    Glide,
+    Linked,
+    Claude,
+    Server,
+}
+
+const SOURCES: [Source; 4] = [
+    Source::Glide,
+    Source::Linked,
+    Source::Claude,
+    Source::Server,
+];
+
+impl Source {
+    fn label(self) -> String {
+        match self {
+            Self::Glide => format!(
+                "GLiDE-9B, run on this machine by iu2u (downloads {})",
+                bytes(decision::built_in().size)
+            ),
+            Self::Linked => "Another local model, from a Hugging Face link".into(),
+            Self::Claude => {
+                "Claude, through Claude Code (each request counts against your Claude plan)".into()
+            }
+            Self::Server => "A System One server you run or rent".into(),
+        }
+    }
+}
+
 async fn asked(input: &mut dyn BufRead, config: &Config) -> Result<Plan> {
     let current = config.saved("model");
     let local = current
         .as_deref()
         .and_then(|model| Reference::parse(model).ok().flatten());
     let default = match (&current, &local) {
-        (_, Some(Reference::BuiltIn)) => 1,
-        (_, Some(_)) => 2,
-        (Some(model), None) if is_claude(model) => 3,
-        (Some(_), None) => 4,
-        (None, None) if LOCAL_BY_DEFAULT => 1,
-        (None, None) => 4,
+        (_, Some(Reference::BuiltIn)) => Source::Glide,
+        (_, Some(_)) => Source::Linked,
+        (Some(model), None) if is_claude(model) => Source::Claude,
+        (Some(_), None) => Source::Server,
+        (None, None) if LOCAL_BY_DEFAULT => Source::Glide,
+        (None, None) => Source::Server,
     };
+    let labels: Vec<String> = SOURCES.iter().map(|source| source.label()).collect();
+    let at = SOURCES
+        .iter()
+        .position(|source| *source == default)
+        .unwrap_or_default();
     let choice = loop {
-        let choice = choose(
-            input,
-            "Which decision model should iu2u use?",
-            &[
-                "GLiDE-9B, run on this machine by iu2u (downloads 5.8 GB)".into(),
-                "Another local model, from a Hugging Face link".into(),
-                "Claude, through Claude Code (each request counts against your Claude plan)".into(),
-                "A System One server you run or rent".into(),
-            ],
-            default,
-        )?;
+        let choice = SOURCES[choose(input, "Which decision model should iu2u use?", &labels, at)?];
         match (choice, decision::supported()) {
-            (1 | 2, Err(error)) => eprintln!("{error}"),
+            (Source::Glide | Source::Linked, Err(error)) => eprintln!("{error}"),
             _ => break choice,
         }
     };
     let mut settings = Vec::new();
     let mut record = None;
     match choice {
-        1 | 2 => {
-            let reference = if choice == 1 {
+        Source::Glide | Source::Linked => {
+            let reference = if choice == Source::Glide {
                 Reference::BuiltIn
             } else {
                 loop {
                     let link = answer(
                         input,
                         "Hugging Face link, or decision:<owner>/<repo>[:<file>]",
-                        current.as_deref().filter(|_| default == 2),
+                        current.as_deref().filter(|_| default == Source::Linked),
                     )?;
                     match Reference::parse(&link) {
                         Ok(Some(reference)) => break reference,
@@ -186,7 +216,7 @@ async fn asked(input: &mut dyn BufRead, config: &Config) -> Result<Plan> {
             settings.push(("model", reference.stored(Some(&found.file))));
             record = Some(found);
         }
-        3 => {
+        Source::Claude => {
             let model = current
                 .as_deref()
                 .and_then(|model| model.strip_prefix("claude:"))
@@ -194,13 +224,13 @@ async fn asked(input: &mut dyn BufRead, config: &Config) -> Result<Plan> {
             let model = answer(input, "Claude model", Some(model))?;
             let effort = setting(
                 input,
-                "Effort: low, medium, high, xhigh or max",
+                &format!("Effort: {}", EFFORTS.join(", ")),
                 "effort",
                 config.saved("effort").as_deref(),
             )?;
             settings.extend([("model", claude_model(&model)), ("effort", effort)]);
         }
-        _ => {
+        Source::Server => {
             let url = setting(
                 input,
                 "Server URL",
@@ -210,7 +240,7 @@ async fn asked(input: &mut dyn BufRead, config: &Config) -> Result<Plan> {
             let model = answer(
                 input,
                 "Model name on that server",
-                current.as_deref().filter(|_| default == 4),
+                current.as_deref().filter(|_| default == Source::Server),
             )?;
             settings.extend([("model", model), ("base_url", url)]);
         }
@@ -272,7 +302,7 @@ async fn resolved(input: Option<&mut dyn BufRead>, reference: &Reference) -> Res
             let default = decision::pick(&names, selector.as_deref())
                 .ok()
                 .and_then(|file| names.iter().position(|name| name == file))
-                .map_or(1, |index| index + 1);
+                .unwrap_or_default();
             let listed: Vec<String> = found
                 .files
                 .iter()
@@ -281,7 +311,7 @@ async fn resolved(input: Option<&mut dyn BufRead>, reference: &Reference) -> Res
             if listed.is_empty() {
                 bail!("{repository} has no .gguf file with a SHA-256");
             }
-            names[choose(input, "Which file?", &listed, default)? - 1].clone()
+            names[choose(input, "Which file?", &listed, default)?].clone()
         }
     };
     found
@@ -399,13 +429,16 @@ async fn test(input: &mut dyn BufRead, yes: bool, local: Option<(&Path, &Record)
         "The model answered in {:.1} s: `{TEST_STATE}` is hard to recover with probability {yes_probability:.2}.",
         took.as_secs_f64()
     );
-    let timeout_ms: u128 = Config::load()?
-        .get("timeout_ms")
+    let hooks_wait = Config::load()?
+        .get("timeout_ms")?
         .and_then(|ms| ms.parse().ok())
-        .unwrap_or_default();
-    if took.as_millis() > timeout_ms {
+        .map_or(JUDGE_WITHIN, |ms| {
+            Duration::from_millis(ms).min(JUDGE_WITHIN)
+        });
+    if took > hooks_wait {
         eprintln!(
-            "warning: that is longer than timeout_ms ({timeout_ms} ms), so hooks will time out"
+            "warning: hooks wait {} ms for an answer, so they will time out",
+            hooks_wait.as_millis()
         );
     }
     Ok(())
@@ -555,9 +588,9 @@ fn choose(
         eprintln!("  {}) {option}", index + 1);
     }
     loop {
-        let text = answer(input, "Number", Some(&default.to_string()))?;
-        match text.parse() {
-            Ok(number) if (1..=options.len()).contains(&number) => return Ok(number),
+        let text = answer(input, "Number", Some(&(default + 1).to_string()))?;
+        match text.parse::<usize>() {
+            Ok(number) if (1..=options.len()).contains(&number) => return Ok(number - 1),
             _ => eprintln!("Answer with a number from 1 to {}.", options.len()),
         }
     }
@@ -587,6 +620,27 @@ fn memory() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_numbered_menu_picks_the_model_source_it_shows() {
+        let plan = |answers: &str| {
+            let mut input = std::io::Cursor::new(answers.to_owned());
+            async move { asked(&mut input, &Config::default()).await.unwrap().0 }
+        };
+        let server = plan("5\n4\nhttp://127.0.0.1:1\nmodel-x\n\n").await;
+        assert_eq!(
+            &server[..2],
+            [
+                ("model", "model-x".into()),
+                ("base_url", "http://127.0.0.1:1".into())
+            ]
+        );
+        let claude = plan("3\n\n\n\n").await;
+        assert_eq!(
+            &claude[..2],
+            [("model", "claude".into()), ("effort", "medium".into())]
+        );
+    }
 
     #[test]
     fn a_claude_model_is_stored_with_one_prefix() {

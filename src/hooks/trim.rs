@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use super::{ITEM_CHARS, data_path};
+use super::{BATCH_WITHIN, ITEM_CHARS, command, data_path};
 use crate::clip;
 use crate::model::{Client, Question, Questions};
 
@@ -24,15 +24,12 @@ const ALWAYS_KEPT: [&str; 7] = [
 pub(super) async fn run(input: &Value, client: &Client) -> Result<String> {
     let response = input.get("tool_response").context("no tool_response")?;
     let stdout = response["stdout"].as_str().context("no stdout")?;
-    if stdout.len() < TRIM_AT_CHARS || response.get("persistedOutputPath").is_some() {
+    if stdout.chars().count() < TRIM_AT_CHARS || response.get("persistedOutputPath").is_some() {
         return Ok(String::new());
     }
     let saved = data_path("trimmed", input["tool_use_id"].as_str().unwrap_or("output"))?
         .with_extension("txt");
-    let command = input
-        .pointer("/tool_input/command")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let command = command(input);
     let purpose = input
         .pointer("/tool_input/description")
         .and_then(Value::as_str)
@@ -53,12 +50,13 @@ pub(super) async fn run(input: &Value, client: &Client) -> Result<String> {
         .filter(|&index| index != 0 && index != last && !always_kept(blocks[index]))
         .collect();
     let answers = client
-        .ask_each(
+        .ask_each_within(
             undecided
                 .iter()
                 .map(|&index| blocks[index].join("\n"))
                 .collect(),
             &question,
+            BATCH_WITHIN,
         )
         .await;
     let mut dropped = vec![false; blocks.len()];

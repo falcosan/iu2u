@@ -6,10 +6,10 @@ use serde_json::Value;
 
 use super::{ITEM_CHARS, context};
 use crate::clip;
-use crate::model::{Answer, Client, Question, Questions};
+use crate::model::{Answer, Client, MAX_OPTIONS, Question, Questions};
 
 const PICK_AT: f64 = 0.6;
-const MAX_SKILLS: usize = 254;
+const MAX_SKILLS: usize = MAX_OPTIONS - 1;
 
 pub(super) async fn run(input: &Value, client: &Client) -> Result<String> {
     let prompt = input["prompt"].as_str().context("no prompt")?;
@@ -19,8 +19,7 @@ pub(super) async fn run(input: &Value, client: &Client) -> Result<String> {
             .filter(|dir| !dir.is_empty())
             .map(PathBuf::from)
             .or_else(|| Some(std::env::home_dir()?.join(".claude"))),
-        std::env::var_os("CLAUDE_PROJECT_DIR")
-            .map(|project| PathBuf::from(project).join(".claude")),
+        std::env::var_os(crate::PROJECT_DIR).map(|project| PathBuf::from(project).join(".claude")),
         input["cwd"]
             .as_str()
             .map(|cwd| Path::new(cwd).join(".claude")),
@@ -42,7 +41,12 @@ pub(super) async fn run(input: &Value, client: &Client) -> Result<String> {
         options.len() <= MAX_SKILLS,
         "more than {MAX_SKILLS} skills to choose from"
     );
-    options.insert("none".into(), "No listed skill fits this request".into());
+    let none = if options.contains_key("none") {
+        "none of these"
+    } else {
+        "none"
+    };
+    options.insert(none.into(), "No listed skill fits this request".into());
     let question = Questions::from([(
         "skill".into(),
         Question::Pick {
@@ -57,7 +61,7 @@ pub(super) async fn run(input: &Value, client: &Client) -> Result<String> {
     else {
         return Ok(String::new());
     };
-    if pick == "none" || confidence.unwrap_or(0.0) < PICK_AT {
+    if pick == none || confidence.unwrap_or(0.0) < PICK_AT {
         return Ok(String::new());
     }
     Ok(context(

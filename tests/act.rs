@@ -73,6 +73,16 @@ fn decision(operation: &str, pick: &str, pick_reversed: &str) -> Value {
     })
 }
 
+async fn questions_asked(model: &MockServer) -> Vec<wiremock::Request> {
+    model
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/systemone")
+        .collect()
+}
+
 async fn mock(replies: impl IntoIterator<Item = (&str, Value)>) -> MockServer {
     mock_after(Duration::ZERO, replies).await
 }
@@ -485,6 +495,17 @@ fn an_empty_secret_stops_the_script_before_it_runs() {
     std::fs::write(&silent, "with token = run true\nrun echo never\n").unwrap();
     let report = exits(2, act(&silent, None, false));
     assert_eq!(report["error"], "with token: the command printed nothing");
+    let slow = temp_path("slow-run.e2e");
+    std::fs::write(
+        &slow,
+        "with token = run sleep 5 within 1s\nrun echo never\n",
+    )
+    .unwrap();
+    let report = exits(2, act(&slow, None, false));
+    assert_eq!(
+        report["error"],
+        "with token: the command did not finish within 1s"
+    );
     let failing = temp_path("failing-run.e2e");
     std::fs::write(
         &failing,
@@ -816,6 +837,51 @@ fn a_browser_that_fails_to_start_says_why() {
 }
 
 #[test]
+fn a_browser_that_hangs_at_start_is_launched_again() {
+    let hung = temp_path("hangs-browser.hung");
+    std::fs::remove_file(&hung).ok();
+    let (output, report) = act_with_browser(
+        "hangs",
+        r#"#!/bin/sh
+if [ ! -e "$0.hung" ]; then touch "$0.hung"; exec sleep 300; fi
+for browser in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "$(command -v chromium)" "$(command -v chromium-browser)" "$(command -v google-chrome)"; do
+  [ -x "$browser" ] && exec "$browser" "$@"
+done
+exit 127
+"#,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert!(hung.exists());
+}
+
+#[test]
+fn a_broken_lock_stops_the_script_before_its_commands_run() {
+    let ran = temp_path("broken-lock-ran");
+    std::fs::remove_file(&ran).ok();
+    let script = temp_path("broken-lock.e2e");
+    std::fs::write(
+        &script,
+        format!(
+            "with token = run touch {}; echo tok\nrun echo never\n",
+            ran.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(temp_path("broken-lock.e2e.lock"), "<<<<<<< HEAD\n").unwrap();
+    let report = exits(2, act(&script, None, false));
+    has(&report, "/error", "is not valid");
+    assert!(!ran.exists());
+}
+
+#[test]
+fn the_browser_starts_without_asking_for_the_system_keychain() {
+    let (_, report) = act_with_browser("keychain", "#!/bin/sh\necho \"$*\" >&2\nexit 1\n", None);
+    has(&report, "/error", "--use-mock-keychain");
+    has(&report, "/error", "--password-store=basic");
+}
+
+#[test]
 fn the_browser_runs_headless_unless_headful_is_passed() {
     for (flag, mode) in [(None, "mode=headless"), (Some("--headful"), "mode=window")] {
         let (_, report) = act_with_browser(
@@ -921,11 +987,30 @@ fn a_secret_stays_out_of_failed_steps_and_errors() {
     let erroring = script(
         "secret-request",
         "",
-        "with token = run printf 'tok-%s' 5f3a9c1e7b\nrequest GET http://127.0.0.1:9/items?key=$token\n",
+        "with token = run printf 'tok-%s' '5f3a9c1e7b@ñ'\nrequest GET http://127.0.0.1:9/items?key=$token\n",
     );
     let sent = exits(2, act(&erroring, None, false));
     for report in [seen, sent] {
         assert!(!report.to_string().contains("5f3a9c1e7b"), "{report}");
+    }
+}
+
+#[test]
+fn a_secret_named_by_a_later_step_is_hidden_from_the_first() {
+    for later in [
+        "request GET http://127.0.0.1:9/x\n  authorization: Bearer $IU2U_TEST_SECRET",
+        "do sign in with $IU2U_TEST_SECRET",
+        "extract key = the key after $IU2U_TEST_SECRET",
+        "route */x answer 200 file $IU2U_TEST_SECRET.json",
+    ] {
+        let script = script(
+            "secret-ahead",
+            &format!("<!doctype html><p>Key {SECRET}</p>"),
+            &format!("open PAGE\nsee \"Signed in\" within 0s\n{later}\n"),
+        );
+        let report = exits(1, act(&script, None, false));
+        assert!(report["screenshot"].is_null(), "{later} {report}");
+        assert!(!report.to_string().contains("7f3a"), "{later} {report}");
     }
 }
 
@@ -946,7 +1031,7 @@ async fn a_secret_read_for_a_request_is_never_offered_for_typing() {
         "request GET SITE/api\n  authorization: Bearer $IU2U_TEST_SECRET\nopen SITE/app\ndo search for cats\n",
     );
     act(&script, Some(&model), false);
-    let asked = model.received_requests().await.unwrap();
+    let asked = questions_asked(&model).await;
     assert!(!asked.is_empty());
     for request in asked {
         assert!(!String::from_utf8_lossy(&request.body).contains("IU2U_TEST_SECRET"));
@@ -1068,6 +1153,21 @@ async fn a_control_that_pulses_in_place_is_pressed() {
 #[tokio::test]
 async fn a_control_that_keeps_moving_is_not_pressed() {
     not_pressed("moving", r#"<!doctype html><style>@keyframes slide { to { transform: translateX(300px) } } button { animation: slide 1s linear infinite }</style><button onclick="out.textContent = 'Saved'">Save</button><p id="out"></p>"#, "button \"Save\" did not hold still").await;
+}
+
+#[test]
+fn a_page_with_half_of_a_character_is_still_read() {
+    let script = script(
+        "half-character",
+        r#"<!doctype html><p id="x"></p><script>x.textContent = "\u{1F600} hi".slice(0, 1) + " ok";</script>"#,
+        "open PAGE\nsee \"ok\"\n",
+    );
+    runs(&script);
+}
+
+#[tokio::test]
+async fn a_control_measured_on_frames_too_close_together_is_not_taken_for_still() {
+    not_pressed("close-frames", r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><p id="out"></p><script>window.requestAnimationFrame = callback => setTimeout(() => callback(performance.now()), 0); document.querySelector('button').getBoundingClientRect = () => new DOMRect(performance.now() * 0.1, 0, 60, 20);</script>"#, "button \"Save\" did not hold still").await;
 }
 
 #[tokio::test]
@@ -1388,6 +1488,23 @@ async fn presses_that_stay_covered_stop_even_when_the_model_takes_turns_with_the
         "it could not do this, even after trying again: pressed button \"Save\" (button \"Save\" is covered by another element)",
         "{report}"
     );
+}
+
+#[tokio::test]
+async fn a_picker_opened_with_a_chooser_that_cannot_take_the_files_is_answered() {
+    let note = temp_path("unfit-picker-note.txt");
+    std::fs::write(&note, "note").unwrap();
+    let model = mock([("", does("press"))]).await;
+    let script = script(
+        "unfit-picker",
+        "<!doctype html><button onclick=\"showOpenFilePicker().then(() => out.textContent = 'Picked', error => out.textContent = 'Picker ' + error.name); fi.click()\">Upload</button><input id=\"fi\" type=\"file\" webkitdirectory style=\"display:none\"><p id=\"out\">Nothing yet</p>",
+        &format!(
+            "with note = file {}\nopen PAGE\ndo attach the note\n",
+            note.display()
+        ),
+    );
+    let (_, report) = act(&script, Some(&model), false);
+    has(&report, "/screen", "Picker ");
 }
 
 #[tokio::test]
@@ -1856,6 +1973,41 @@ async fn a_json_file_is_sent_as_it_is() {
 }
 
 #[tokio::test]
+async fn files_are_found_beside_the_script_that_names_them() {
+    let api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/schema"))
+        .and(body_json(json!({ "from": "fixture" })))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&api)
+        .await;
+    let root = temp_path("beside");
+    let scripts = root.join("scripts$w");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.join("body.json"), r#"{"from": "fixture"}"#).unwrap();
+    std::fs::write(
+        scripts.join("shared.e2e"),
+        format!(
+            "request POST {}/schema\n  json file body.json\nsee \"HTTP 204\"\n",
+            api.uri()
+        ),
+    )
+    .unwrap();
+    std::fs::write(scripts.join("main.e2e"), "use shared.e2e\n").unwrap();
+    let output = command(None)
+        .current_dir(&root)
+        .args(["--json", "scripts$w/main.e2e"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[tokio::test]
 async fn a_relative_request_goes_to_the_open_page_and_needs_one() {
     let site = site(&[
         ("/", "<!doctype html><p>Home</p>"),
@@ -1871,6 +2023,13 @@ async fn a_relative_request_goes_to_the_open_page_and_needs_one() {
     let alone = self::script("alone", "", "request GET /api/items\n");
     let report = exits(2, act(&alone, None, false));
     has(&report, "/error", "is relative");
+    let port = self::script("bad-port", "", "request GET http://localhost:70000/x\n");
+    let report = exits(2, act(&port, None, false));
+    has(
+        &report,
+        "/error",
+        "is not a valid address: invalid port number",
+    );
 }
 
 #[tokio::test]
@@ -1905,14 +2064,16 @@ async fn routes_send_a_site_elsewhere_answer_in_its_place_and_answer_once() {
 }
 
 #[test]
-fn a_route_to_another_address_refuses_a_star_even_from_a_value() {
-    let script = script(
-        "star-route",
-        "",
-        "with sso = http://127.0.0.1:9/d*/p.html\nroute $sso to http://127.0.0.1:9\n",
-    );
-    let report = exits(2, act(&script, None, false));
-    has(&report, "/error", "without *");
+fn a_route_to_another_address_refuses_a_star_or_a_query_even_from_a_value() {
+    for address in ["http://127.0.0.1:9/d*/p.html", "https://a.test/x?y"] {
+        let script = script(
+            "star-route",
+            "",
+            &format!("with sso = {address}\nroute $sso to http://127.0.0.1:9\n"),
+        );
+        let report = exits(2, act(&script, None, false));
+        has(&report, "/error", "without * or ?");
+    }
 }
 
 #[test]
@@ -2043,6 +2204,34 @@ async fn a_held_request_waits_for_its_release_without_holding_up_the_steps() {
     let unheld = self::script("unheld", "", "release */api/nothing\n");
     let report = exits(2, act(&unheld, None, false));
     has(&report, "/error", "no route holds");
+}
+
+#[tokio::test]
+async fn a_route_matches_a_value_after_the_question_mark_as_the_page_encodes_it() {
+    let site = site(&[(
+        "/app",
+        "<!doctype html><p id=\"b\">Searching</p><script>fetch('/search?' + new URLSearchParams({ q: 'red shirt' })).then(r => r.text()).then(t => b.textContent = t);</script>",
+    )])
+    .await;
+    let script = site_script(
+        "route-query",
+        &site,
+        "with term = red shirt\nroute */search?q=$term answer 200 Found shirts\nopen SITE/app\nsee \"Found shirts\"\n",
+    );
+    runs(&script);
+    for target in ["http://[::1", "ftp://files.test"] {
+        let typo = self::script(
+            "route-typo",
+            "",
+            &format!("route https://api.test to {target}\n"),
+        );
+        let report = exits(2, act(&typo, None, false));
+        has(
+            &report,
+            "/error",
+            "route ... to needs a whole http or https address",
+        );
+    }
 }
 
 #[tokio::test]
@@ -2345,6 +2534,102 @@ async fn a_followed_tab_that_closes_goes_back_to_the_tab_that_opened_it() {
         "route */close hold\nopen SITE/app\ndo open the help\nsee \"Help center\"\ninject document.addEventListener('DOMContentLoaded', () => document.body.append('Injected'))\nrelease */close\nsee \"App page\" within 30s\nsee no \"Injected\"\nreload\nsee \"Injected\"\n",
     );
     passes(&script, &model);
+}
+
+#[tokio::test]
+async fn a_closed_tab_behind_is_skipped_on_the_way_back() {
+    let site = site(&[
+        (
+            "/app",
+            "<!doctype html><p>App page</p><a href=\"/help\" target=\"_blank\">Help</a>",
+        ),
+        (
+            "/help",
+            "<!doctype html><p>Help center</p><a href=\"/chat\" target=\"_blank\" rel=\"opener\">Chat</a>",
+        ),
+        (
+            "/chat",
+            "<!doctype html><p>Chat room</p><script>fetch('/close').finally(() => { opener.close(); window.close(); });</script>",
+        ),
+        ("/close", ""),
+    ])
+    .await;
+    let model = mock([
+        ("Chat room", does("done")),
+        ("Goal: open the chat", does("press")),
+        ("Help center", does("done")),
+        ("", does("press")),
+    ])
+    .await;
+    let script = site_script(
+        "closed-behind",
+        &site,
+        "route */close hold\nopen SITE/app\ndo open the help\nsee \"Help center\"\ndo open the chat\nsee \"Chat room\"\nrelease */close\nsee \"App page\" within 30s\n",
+    );
+    passes(&script, &model);
+}
+
+#[tokio::test]
+async fn a_followed_tab_is_read_once_it_has_loaded_while_the_tab_behind_holds_a_request() {
+    let site = site(&[
+        (
+            "/app",
+            "<!doctype html><p>App page</p><a href=\"/help\" target=\"_blank\">Help</a><script>fetch('/analytics')</script>",
+        ),
+        (
+            "/help",
+            "<!doctype html><p>Help center</p><script src=\"/slow.js\"></script><p>Help ready</p>",
+        ),
+    ])
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/slow.js"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("", "text/javascript")
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&site)
+        .await;
+    let model = mock([
+        ("Help ready", does("done")),
+        ("Goal: read the help", does("stuck")),
+        ("App page", does("press")),
+        ("", does("done")),
+    ])
+    .await;
+    let script = site_script(
+        "slow-tab",
+        &site,
+        "route */analytics hold\nopen SITE/app\ndo open the help\ndo read the help\n",
+    );
+    passes(&script, &model);
+}
+
+#[tokio::test]
+async fn a_route_also_answers_the_tab_behind_a_followed_one() {
+    let site = site(&[
+        (
+            "/app",
+            "<!doctype html><p>App page</p><a href=\"/help\" target=\"_blank\">Help</a><script>setInterval(() => fetch('/api/me').then(reply => reply.text()).then(text => fetch('/seen?' + text)), 200)</script>",
+        ),
+        ("/help", "<!doctype html><p>Help center</p>"),
+        ("/api/me", "Real"),
+        ("/seen", ""),
+    ])
+    .await;
+    let model = pressing("Help center").await;
+    let script = site_script(
+        "routed-behind",
+        &site,
+        "open SITE/app\ndo open the help\nsee \"Help center\"\nroute */api/me answer 200 Routed\nwait 3s\n",
+    );
+    passes(&script, &model);
+    let seen = site.received_requests().await.unwrap();
+    assert!(
+        seen.iter()
+            .any(|request| request.url.query() == Some("Routed"))
+    );
 }
 
 #[tokio::test]
@@ -3230,6 +3515,22 @@ async fn the_screen_reads_and_acts_inside_iframes_of_any_origin() {
     );
 }
 
+#[tokio::test]
+async fn a_frame_that_shows_up_while_the_model_looks_does_not_move_the_press() {
+    let model = pressing("Approved").await;
+    let script = script(
+        "late-frame",
+        "<!doctype html><body style=\"margin: 0\"><iframe style=\"display: block; width: 300px; height: 120px; border: 0\" srcdoc=\"<button onclick='this.textContent = &quot;Approved&quot;'>Approve</button>\"></iframe><script>const images = Object.getOwnPropertyDescriptor(Document.prototype, 'images').get; let late = false; Object.defineProperty(document, 'images', { get() { if (!late) { late = true; const chat = document.createElement('iframe'); chat.style.cssText = 'display: block; width: 300px; height: 120px; border: 0'; chat.srcdoc = '<p>Chat</p>'; document.body.prepend(chat); } return images.call(this); } });</script></body>",
+        "open PAGE\ndo approve\nsee \"Approved\"\n",
+    );
+    let report = succeeded(sees(&script, &model));
+    assert_eq!(
+        report["steps"][1]["actions"].as_array().unwrap().len(),
+        1,
+        "{report}"
+    );
+}
+
 #[test]
 fn scripts_run_commands_start_services_read_their_logs_and_reuse_steps() {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -3468,7 +3769,7 @@ async fn extract_leaves_out_a_response_value_with_an_encoded_secret() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    let asked = model.received_requests().await.unwrap();
+    let asked = questions_asked(&model).await;
     assert!(!asked.is_empty());
     for request in asked {
         assert!(!String::from_utf8_lossy(&request.body).contains("7f3a"));
@@ -3814,10 +4115,8 @@ async fn a_model_that_sees_gets_a_new_screenshot_in_each_step() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0));
-    let shots: Vec<Value> = model
-        .received_requests()
+    let shots: Vec<Value> = questions_asked(&model)
         .await
-        .unwrap()
         .iter()
         .map(|request| {
             serde_json::from_slice::<Value>(&request.body).unwrap()["assets"]["iu2u-screenshot"]
@@ -3855,7 +4154,7 @@ async fn a_claim_on_how_the_page_looks_is_asked_again_when_only_its_look_changes
         "open SITE/app\nexpect the status is shown in green within 10s\n",
     );
     succeeded(sees(&script, &model));
-    assert_eq!(model.received_requests().await.unwrap().len(), 2);
+    assert_eq!(questions_asked(&model).await.len(), 2);
 }
 
 #[tokio::test]
@@ -3891,7 +4190,7 @@ async fn a_model_that_sees_gets_no_screenshot_while_a_secret_shows() {
             .ends_with("no screenshot is sent while a secret shows on the screen"),
         "{report}"
     );
-    let asked = model.received_requests().await.unwrap();
+    let asked = questions_asked(&model).await;
     assert!(!asked.is_empty());
     for request in asked {
         assert!(!String::from_utf8_lossy(&request.body).contains("iu2u-screenshot"));
@@ -3999,7 +4298,7 @@ async fn a_page_with_a_frame_act_did_not_read_gets_no_screenshot_while_secrets_e
         ),
     );
     succeeded(sees(&script, &model));
-    let requests = model.received_requests().await.unwrap();
+    let requests = questions_asked(&model).await;
     assert!(!requests.is_empty());
     for request in requests {
         assert!(!String::from_utf8_lossy(&request.body).contains("iu2u-screenshot"));
@@ -4105,10 +4404,8 @@ async fn a_model_that_sees_gets_the_part_of_a_scrolled_page_in_view() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0));
-    let shots: Vec<Value> = model
-        .received_requests()
+    let shots: Vec<Value> = questions_asked(&model)
         .await
-        .unwrap()
         .iter()
         .map(|request| {
             serde_json::from_slice::<Value>(&request.body).unwrap()["assets"]["iu2u-screenshot"]
@@ -4465,7 +4762,7 @@ fn a_run_stopped_by_a_signal_reports_the_script_it_stopped() {
     std::fs::write(
         &script,
         format!(
-            "open file://{}\nrun touch {}\nwait 30s\n",
+            "open file://{}\nrun true\nrun touch {}\nwait 30s\n",
             page.display(),
             started.display()
         ),
@@ -4501,6 +4798,15 @@ fn a_run_stopped_by_a_signal_reports_the_script_it_stopped() {
         })
         .collect();
     assert!(left.is_empty(), "{left:?}");
+    let browsers = Command::new("pgrep")
+        .args(["-f", &format!("iu2u-act-{pid}/")])
+        .output()
+        .unwrap();
+    assert!(
+        browsers.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&browsers.stdout)
+    );
 }
 
 #[test]
@@ -4707,6 +5013,65 @@ fn a_command_leaves_nothing_running_behind_it() {
 }
 
 #[test]
+fn a_command_still_running_at_its_limit_fails_and_leaves_nothing_behind() {
+    let pid = temp_path("timed-out.pid");
+    let script = script(
+        "timed-out",
+        "",
+        &format!(
+            "run sleep 300 & echo $! > {}; wait within 1s\n",
+            pid.display()
+        ),
+    );
+    let report = exits(1, act(&script, None, false));
+    has(
+        &report,
+        "/steps/0/detail",
+        "the command did not finish within 1s",
+    );
+    let pid = std::fs::read_to_string(&pid).unwrap();
+    assert!(!still_runs(pid.trim()), "sleep {} still runs", pid.trim());
+}
+
+#[test]
+fn a_service_that_never_answers_says_why() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let script = script(
+        "never-answers",
+        "",
+        &format!("start idle = sleep 300 at http://127.0.0.1:{port}/ within 1s\n"),
+    );
+    let report = exits(2, act(&script, None, false));
+    has(
+        &report,
+        "/error",
+        "did not answer within 1s: error sending request",
+    );
+}
+
+#[test]
+fn a_service_that_answers_only_with_an_error_says_which() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let script = script(
+        "not-found",
+        "",
+        &format!(
+            "start web = python3 -m http.server {port} --bind 127.0.0.1 at http://127.0.0.1:{port}/missing within 2s\n"
+        ),
+    );
+    let report = exits(2, act(&script, None, false));
+    has(&report, "/error", "answered only 404 Not Found within 2s");
+}
+
+#[test]
 fn a_service_that_stops_before_it_answers_shows_what_it_said() {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -4868,6 +5233,27 @@ async fn within_never_sends_a_post_again() {
     );
     let report = exits(1, act(&script, None, false));
     assert_eq!(api.received_requests().await.unwrap().len(), 1);
+    assert!(
+        report["steps"][1]["seconds"].as_f64().unwrap() < 1.0,
+        "{report}"
+    );
+}
+
+#[test]
+fn within_never_runs_a_command_again() {
+    let count = temp_path("ran-once");
+    std::fs::remove_file(&count).ok();
+    let script = temp_path("run-within.e2e");
+    std::fs::write(
+        &script,
+        format!(
+            "run echo ran >> {}; echo pending\nsee \"done\" within 30s\n",
+            count.display()
+        ),
+    )
+    .unwrap();
+    let report = exits(1, act(&script, None, false));
+    assert_eq!(std::fs::read_to_string(&count).unwrap(), "ran\n");
     assert!(
         report["steps"][1]["seconds"].as_f64().unwrap() < 1.0,
         "{report}"
@@ -5218,7 +5604,6 @@ async fn a_model_request_that_times_out_is_sent_again() {
         .unwrap();
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(0), "{report}");
-    assert_eq!(report["model_calls"], 2, "{report}");
 }
 
 #[tokio::test]
@@ -5236,8 +5621,7 @@ async fn a_model_request_answered_with_a_server_error_is_sent_again() {
         "<!doctype html><p>Hello</p>",
         "open PAGE\nexpect the page says hello\n",
     );
-    let report = passes(&script, &model);
-    assert_eq!(report["model_calls"], 2, "{report}");
+    passes(&script, &model);
 }
 
 #[tokio::test]
@@ -5274,7 +5658,7 @@ async fn the_json_report_keeps_every_character_the_model_server_sent() {
     );
     let report = exits(2, act(&script, Some(&model), false));
     has(&report, "/error", "bad \u{7f} body");
-    assert_eq!(model.received_requests().await.unwrap().len(), 1);
+    assert_eq!(questions_asked(&model).await.len(), 1);
 }
 
 #[test]
@@ -5455,14 +5839,20 @@ async fn stopped(name: &str, page: &str, model: &MockServer) -> String {
 async fn a_step_stops_when_the_model_repeats_itself_gives_up_or_stays_unsure() {
     let mut unsure = does("press");
     unsure["operation"] = json!({ "type": "choice", "choice": "press", "confidence": 0.4, "probabilities": { "press": 0.4, "done": 0.35, "none": 0.25 } });
-    for (name, answers, detail) in [
-        ("repeat", does("press"), "would repeat"),
-        ("stuck", does("stuck"), "sees no way"),
-        ("unsure", unsure, "unsure which operation"),
+    for (name, answers, status, detail) in [
+        ("repeat", does("press"), "failed", "would repeat"),
+        ("stuck", does("stuck"), "failed", "sees no way"),
+        ("unsure", unsure, "inconclusive", "unsure which operation"),
     ] {
         let model = mock([("", answers)]).await;
-        let detail_seen = stopped(name, "<!doctype html><button>Noop</button>", &model).await;
-        assert!(detail_seen.contains(detail), "{detail_seen}");
+        let script = script(
+            name,
+            "<!doctype html><button>Noop</button>",
+            "open PAGE\ndo reach the goal\n",
+        );
+        let report = exits(1, act(&script, Some(&model), false));
+        assert_eq!(report["steps"][1]["status"], status, "{report}");
+        has(&report, "/steps/1/detail", detail);
     }
 }
 
@@ -5508,20 +5898,140 @@ async fn a_failed_step_on_a_crowded_screen_says_which_controls_were_left_out() {
     );
 }
 
-#[tokio::test]
-async fn a_failed_step_on_a_long_screen_says_how_much_the_model_saw() {
-    let model = mock([("", does("stuck"))]).await;
+fn long_page() -> String {
     let items: String = (1..=400)
         .map(|item| format!("<p>Item {item} costs ${}</p>", 1000 - item))
         .collect();
-    let page = format!("<!doctype html>{items}<button>Buy</button>");
-    let detail = stopped("catalog", &page, &model).await;
+    format!("<!doctype html>{items}<button>Buy</button>")
+}
+
+async fn tells_context(model: &MockServer, tokens: usize) {
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "default_generation_settings": { "n_ctx": tokens } })),
+        )
+        .mount(model)
+        .await;
+}
+
+async fn counts_two_characters_a_token(model: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/tokenize"))
+        .respond_with(|request: &wiremock::Request| {
+            let content: Value = serde_json::from_slice(&request.body).unwrap();
+            let tokens = content["content"].as_str().unwrap().chars().count() / 2;
+            ResponseTemplate::new(200).set_body_json(json!({ "tokens": vec![0; tokens] }))
+        })
+        .with_priority(1)
+        .mount(model)
+        .await;
+}
+
+#[tokio::test]
+async fn the_controls_offered_to_the_model_take_their_share_of_its_context() {
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(reply(does("wait")))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&model)
+        .await;
+    answer_always(&model, does("stuck")).await;
+    tells_context(&model, 20_000).await;
+    counts_two_characters_a_token(&model).await;
+    let buttons: String = (0..100)
+        .map(|index| format!("<button>{index:03} {}</button>", "x".repeat(96)))
+        .collect();
+    let detail = stopped("offered", &format!("{}{buttons}", long_page()), &model).await;
+    let shown: usize = detail
+        .split("the model saw only the first ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("{detail}"));
+    assert!(shown / 2 <= 4_500, "{detail}");
+    let counted = model
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/tokenize")
+        .count();
+    assert_eq!(counted, 3, "the unchanged screen was counted again");
+}
+
+#[tokio::test]
+async fn a_failed_step_on_a_long_screen_says_how_much_the_model_saw() {
+    let model = mock([("", does("stuck"))]).await;
+    let detail = stopped("catalog", &long_page(), &model).await;
     assert!(
         detail.contains("the model saw only the first 6000 characters"),
         "{detail}"
     );
-    let asked = model.received_requests().await.unwrap();
+    let asked = questions_asked(&model).await;
     assert!(String::from_utf8_lossy(&asked[0].body).contains("The screen goes on"));
+}
+
+#[tokio::test]
+async fn a_long_screen_goes_whole_to_a_model_with_room_and_is_cut_to_fit_one_without() {
+    for (name, context, counts) in [
+        ("roomy", 1_000_000, true),
+        ("tight", 14_000, true),
+        ("uncounted", 17_000, false),
+        ("barely", 10_500, true),
+    ] {
+        let model = mock([("", does("stuck"))]).await;
+        tells_context(&model, context).await;
+        if counts {
+            counts_two_characters_a_token(&model).await;
+        }
+        let detail = stopped(name, &long_page(), &model).await;
+        let state = String::from_utf8_lossy(&questions_asked(&model).await[0].body).into_owned();
+        if name == "roomy" {
+            assert!(!detail.contains("the model saw only"), "{detail}");
+            assert!(state.contains("Item 400 costs $600"), "{state}");
+            continue;
+        }
+        let shown: usize = detail
+            .split("the model saw only the first ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|count| count.parse().ok())
+            .unwrap_or_else(|| panic!("{detail}"));
+        let tokens = (context / 2).min(context - 10_000);
+        assert!(
+            match (name, counts) {
+                ("barely", _) => shown == 6000,
+                (_, true) => shown / 2 <= tokens && shown / 2 >= tokens * 8 / 10,
+                (_, false) => shown <= tokens && shown >= tokens * 9 / 10,
+            },
+            "{detail}"
+        );
+        assert!(
+            state.contains(&format!("only its first {shown} characters")),
+            "{state}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_long_screen_gets_time_in_proportion_to_its_length() {
+    let model = mock_after(Duration::from_millis(1500), [("\"holds\"", verdict(0.95))]).await;
+    tells_context(&model, 1_000_000).await;
+    let script = script(
+        "long-time",
+        &long_page(),
+        "open PAGE\nexpect the last item costs $600\n",
+    );
+    succeeded(act_with(
+        &script,
+        Some(&model),
+        false,
+        &[("IU2U_TIMEOUT_MS", "1000")],
+    ));
 }
 
 #[tokio::test]
@@ -5689,6 +6199,50 @@ async fn a_replayed_enter_still_waits_for_the_page_to_be_ready() {
 }
 
 #[tokio::test]
+async fn typing_key_by_key_still_waits_for_what_the_typing_asked_for() {
+    let site = site(&[(
+        "/app",
+        "<!doctype html><label>Note <input id=\"note\" onbeforeinput=\"if (event.data && event.data.length > 1) event.preventDefault()\" onkeydown=\"const end = performance.now() + 12; while (performance.now() < end);\" oninput=\"const typed = this.value.length; window.asking?.abort(); window.asking = new AbortController(); fetch('/api/suggest', { signal: window.asking.signal }).then(reply => reply.text()).then(text => { out.textContent = text + ' for ' + typed; }, () => {});\"></label><p id=\"out\"></p>",
+    )])
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/api/suggest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("Suggested")
+                .set_delay(Duration::from_secs(1)),
+        )
+        .mount(&site)
+        .await;
+    let model = mock([("Suggested for 300", does("done")), ("", does("type"))]).await;
+    let script = site_script(
+        "typed-slowly",
+        &site,
+        &format!(
+            "open SITE/app\ndo type \"{}\" in the note\n",
+            "x".repeat(300)
+        ),
+    );
+    let report = passes(&script, &model);
+    assert_eq!(
+        report["steps"][1]["actions"].as_array().unwrap().len(),
+        1,
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn typing_key_by_key_names_each_key_as_the_keyboard_does() {
+    let model = mock([("Got a1", does("done")), ("", does("type"))]).await;
+    let script = script(
+        "key-codes",
+        "<!doctype html><label>Code <input onbeforeinput=\"if (event.data?.length > 1) event.preventDefault()\" onkeydown=\"if (!/^(Key[A-Z]|Digit[0-9])$/.test(event.code)) event.preventDefault()\" oninput=\"out.textContent = 'Got ' + this.value\"></label><p id=\"out\"></p>",
+        "open PAGE\ndo type \"a1\" in the code\n",
+    );
+    passes(&script, &model);
+}
+
+#[tokio::test]
 async fn act_chooses_an_option_showing_a_secret_and_replays_the_choice() {
     let model = mock([
         ("chose", does("done")),
@@ -5778,7 +6332,7 @@ final class Upper: NSTextField {
         super.textDidChange(notification)
     }
 }
-final class Delegate: NSObject, NSApplicationDelegate {
+final class Delegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
     var window: NSWindow!
     let echo = NSTextField(labelWithString: "echo")
     let frozen = Stubborn(string: "")
@@ -5786,8 +6340,12 @@ final class Delegate: NSObject, NSApplicationDelegate {
     let field = NSTextField(string: "")
     let code = Stubborn(string: "old")
     let codeEcho = NSTextField(labelWithString: "code")
+    let approve = NSButton(title: "Approve", target: nil, action: nil)
+    let rows = ["Alpha", "Beta"]
+    let table = NSTableView()
+    let picked = NSTextField(labelWithString: "picked none")
     func applicationDidFinishLaunching(_ notification: Notification) {
-        window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 360, height: 320), styleMask: [.titled], backing: .buffered, defer: false)
+        window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 360, height: 440), styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "Fixture"
         field.setAccessibilityLabel("Name")
         field.target = self
@@ -5798,15 +6356,36 @@ final class Delegate: NSObject, NSApplicationDelegate {
         frozen.setAccessibilityLabel("Frozen")
         frozen.formatter = Reject()
         upper.setAccessibilityLabel("Coupon")
-        let stack = NSStackView(views: [field, Locked(), code, frozen, upper, echo, codeEcho])
+        approve.target = self
+        approve.action = #selector(approved)
+        table.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name")))
+        table.headerView = nil
+        table.dataSource = self
+        table.delegate = self
+        table.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        table.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        table.reloadData()
+        let stack = NSStackView(views: [field, Locked(), code, frozen, upper, echo, codeEcho, approve, table, picked])
         stack.orientation = .vertical
-        stack.frame = NSRect(x: 20, y: 20, width: 320, height: 280)
+        stack.frame = NSRect(x: 20, y: 20, width: 320, height: 400)
         window.contentView!.addSubview(stack)
         window.makeKeyAndOrderFront(nil)
         DispatchQueue.main.asyncAfter(deadline: .now() + 120) { NSApp.terminate(nil) }
     }
     @objc func submitted() { echo.stringValue = "echo \(field.stringValue)" }
     @objc func coded() { codeEcho.stringValue = "code \(code.stringValue)" }
+    @objc func approved() {
+        let alert = NSAlert()
+        alert.messageText = "Approved"
+        alert.runModal()
+    }
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        NSTextField(labelWithString: rows[row])
+    }
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        if table.selectedRow >= 0 { picked.stringValue = "picked \(rows[table.selectedRow])" }
+    }
 }
 let app = App.shared
 app.setActivationPolicy(.regular)
@@ -6048,7 +6627,7 @@ async fn a_mac_app_slow_to_answer_is_still_read_whole() {
         return;
     }
     assert_eq!(output.status.code(), Some(0), "{report}");
-    let asked = model.received_requests().await.unwrap();
+    let asked = questions_asked(&model).await;
     let seen = String::from_utf8_lossy(&asked[0].body);
     assert!(
         seen.contains("Label 40") && !seen.contains("was not read"),
@@ -6124,6 +6703,63 @@ fn a_mac_app_that_stops_answering_is_an_error_not_an_empty_screen() {
 impl Drop for Quit {
     fn drop(&mut self) {
         Command::new("pkill").arg("-f").arg(&self.0).status().ok();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pressing_the(target: &'static str) -> impl Fn(&wiremock::Request) -> ResponseTemplate {
+    move |request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let mut answers = serde_json::Map::new();
+        for (id, question) in body["questions"].as_object().unwrap() {
+            let pick = match id.as_str() {
+                "operation" => "press".to_owned(),
+                _ => question["criteria"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .find(|(_, about)| about.as_str().unwrap_or_default().contains(target))
+                    .map_or_else(|| "none".to_owned(), |(label, _)| label.clone()),
+            };
+            answers.insert(id.clone(), choice(&pick));
+        }
+        reply(Value::Object(answers))
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn act_presses_a_mac_button_that_opens_an_alert_and_a_row_by_its_text() {
+    let (bundle, _quit) = mac_app("Pressed", FIXTURE);
+    for (goal, target, shown) in [
+        ("pick Beta", "row \"Beta\"", "picked Beta"),
+        ("approve", "button \"Approve\"", "Approved"),
+    ] {
+        let model = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(shown))
+            .respond_with(reply(does("done")))
+            .mount(&model)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(pressing_the(target))
+            .mount(&model)
+            .await;
+        let script = temp_path("pressed.e2e");
+        std::fs::write(
+            &script,
+            format!("app {}\ndo {goal}\nsee \"{shown}\"\n", bundle.display()),
+        )
+        .unwrap();
+        let (output, report) = act(&script, Some(&model), false);
+        if report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Privacy & Security"))
+        {
+            eprintln!("skipped: this process may not use the accessibility API");
+            return;
+        }
+        assert_eq!(output.status.code(), Some(0), "{report}");
     }
 }
 
@@ -6225,4 +6861,399 @@ async fn act_drives_a_mac_app_through_its_accessibility_tree() {
     .unwrap();
     let report = passes(&coupon, &upper_model);
     has(&report, "/screen", "textbox \"Coupon\" = \"SAVE10\"");
+}
+
+#[test]
+fn a_repeated_request_that_fails_keeps_the_last_response() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.unwrap();
+            std::io::Read::read(&mut stream, &mut [0; 1024]).ok();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\nrunning",
+                )
+                .ok();
+        }
+    });
+    let script = script(
+        "job-down",
+        "",
+        &format!("request GET http://127.0.0.1:{port}/jobs/7\nsee no \"running\" within 3s\n"),
+    );
+    exits(1, act(&script, None, false));
+}
+
+#[tokio::test]
+async fn a_press_inside_a_frame_the_page_covers_is_refused() {
+    let model = mock([("", does("press"))]).await;
+    let script = script(
+        "frame-covered",
+        r#"<!doctype html><iframe srcdoc="<button onclick='parent.out.textContent = &quot;Saved&quot;'>Save</button>"></iframe><div style="position: fixed; inset: 0"></div><p id="out"></p><p id="clock">0</p><script>setInterval(() => clock.textContent++, 200)</script>"#,
+        "open PAGE\ndo save\n",
+    );
+    let report = exits(1, act(&script, Some(&model), false));
+    assert_eq!(
+        report["steps"][1]["actions"],
+        json!([REFUSED_SAVE, REFUSED_SAVE]),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_held_request_outlasts_a_navigation_that_loads_no_page() {
+    let site = site(&[(
+        "/app",
+        "<!doctype html><p id=\"b\">Loading</p><script>fetch('/api/save').then(() => b.textContent = 'Saved'); setTimeout(() => location.href = '/empty', 300);</script>",
+    )])
+    .await;
+    for (at, status) in [("/empty", 204), ("/api/save", 200)] {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&site)
+            .await;
+    }
+    let script = site_script(
+        "hold-204",
+        &site,
+        "route */api/save hold\nopen SITE/app\nwait 1s\nrelease */api/save\nsee \"Saved\"\n",
+    );
+    let report = runs(&script);
+    assert_eq!(report["steps"][3]["detail"], "let 1 held request go");
+}
+
+#[test]
+fn a_secret_a_before_script_read_stays_hidden_in_the_scripts_after_it() {
+    let before = script(
+        "before-secret",
+        "<!doctype html><p>Setup</p>",
+        "open PAGE?token=$IU2U_TEST_SECRET\n",
+    );
+    let later = script(
+        "after-secret",
+        &format!("<!doctype html><p>Key {SECRET}</p>"),
+        "open PAGE\nsee \"Signed in\" within 0s\n",
+    );
+    let output = command(None)
+        .arg("--json")
+        .arg("--before")
+        .arg(&before)
+        .arg(&later)
+        .env("IU2U_TEST_SECRET", SECRET)
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(
+        !shown.contains("7f3a") && !shown.contains("failed.png"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn a_goal_and_an_extract_show_the_model_the_values_they_name() {
+    let model = mock([("Got red shirt", does("done")), ("", does("type"))]).await;
+    let page = "<!doctype html><label>Search <input oninput=\"out.textContent = 'Got ' + this.value\"></label><p id=\"out\"></p><p>Invoice 1002</p>";
+    for (name, steps) in [
+        (
+            "goal-values",
+            "with product = red shirt\nwith password = $IU2U_TEST_SECRET\nopen PAGE\ndo type \"$product\" and $password in the search\n",
+        ),
+        (
+            "extract-values",
+            "with field = invoice number\nopen PAGE\nextract id = the $field\n",
+        ),
+    ] {
+        act(&script(name, page, steps), Some(&model), false);
+    }
+    let asked: String = questions_asked(&model)
+        .await
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .collect();
+    assert!(
+        asked.contains("red shirt") && asked.contains("the invoice number"),
+        "{asked}"
+    );
+    for hidden in ["$product", "$password", "$field", "7f3a"] {
+        assert!(!asked.contains(hidden), "{hidden} in {asked}");
+    }
+}
+
+#[test]
+fn a_secret_read_inside_a_with_value_is_hidden_on_its_own() {
+    let script = script(
+        "secret-inside",
+        &format!("<!doctype html><p>Key {SECRET}</p>"),
+        "with auth = Bearer $IU2U_TEST_SECRET\nopen PAGE\nsee \"Signed in\" within 0s\n",
+    );
+    let report = exits(1, act(&script, None, false));
+    assert!(report["screenshot"].is_null(), "{report}");
+    assert!(!report.to_string().contains("7f3a"), "{report}");
+}
+
+#[tokio::test]
+async fn a_clickable_icon_named_by_its_title_is_pressed() {
+    let model = pressing("Deleted").await;
+    let script = script(
+        "titled-icon",
+        r#"<!doctype html><div tabindex="0" title="Delete" onclick="out.textContent = 'Deleted'">🗑</div><p id="out"></p>"#,
+        "open PAGE\ndo delete it\n",
+    );
+    passes(&script, &model);
+}
+
+#[tokio::test]
+async fn a_secret_inside_an_embed_keeps_the_screenshot_from_the_model() {
+    let site = MockServer::start().await;
+    let port = site.address().port();
+    for (at, body) in [
+        (
+            "/app",
+            format!(
+                "<!doctype html><p>Embedded</p><embed type=\"text/html\" style=\"width: 300px; height: 80px\" src=\"http://localhost:{port}/inner\">"
+            ),
+        ),
+        ("/inner", format!("<!doctype html><p>Token {SECRET}</p>")),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/html"))
+            .mount(&site)
+            .await;
+    }
+    let model = MockServer::start().await;
+    answer_always(&model, verdict(0.95)).await;
+    let script = script(
+        "embed-secret",
+        "",
+        &format!(
+            "with token = $IU2U_TEST_SECRET\nopen http://127.0.0.1:{port}/app\nexpect the page is shown\n"
+        ),
+    );
+    succeeded(sees(&script, &model));
+    let requests = questions_asked(&model).await;
+    assert!(!requests.is_empty());
+    for request in requests {
+        assert!(!String::from_utf8_lossy(&request.body).contains("iu2u-screenshot"));
+    }
+}
+
+#[test]
+fn a_command_whose_escaped_process_holds_its_output_says_so() {
+    let script = script(
+        "escaped",
+        "",
+        "run python3 -c 'import os, time; os.setsid(); time.sleep(7)' & sleep 1\n",
+    );
+    let report = exits(2, act(&script, None, false));
+    has(&report, "/error", "still holds its output");
+}
+
+#[tokio::test]
+async fn a_json_body_that_starts_with_a_byte_order_mark_is_read_as_json() {
+    let api = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/item"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw("\u{feff}{\"id\": 7}", "application/json"),
+        )
+        .mount(&api)
+        .await;
+    let script = script(
+        "bom",
+        "",
+        &format!("request GET {}/item\nsee \"id: 7\"\n", api.uri()),
+    );
+    runs(&script);
+}
+
+#[test]
+fn a_value_command_that_prints_a_secret_read_inside_a_value_keeps_it_hidden() {
+    let script = script(
+        "value-says-secret",
+        "",
+        "with auth = Bearer $IU2U_TEST_SECRET\nwith id = run sh -c 'echo \"token $IU2U_TEST_SECRET rejected\" >&2; exit 1'\nrun echo never\n",
+    );
+    let report = exits(2, act(&script, None, false));
+    has(&report, "/error", "rejected");
+    assert!(!report.to_string().contains("7f3a"), "{report}");
+}
+
+#[tokio::test]
+async fn a_file_that_cannot_be_read_keeps_its_secret_path_from_the_report_and_the_model() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_path("unreadable").join(SECRET);
+    std::fs::create_dir_all(&dir).unwrap();
+    let note = dir.join("note.txt");
+    std::fs::write(&note, "hello").unwrap();
+    std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let model = mock([("", does("press"))]).await;
+    let script = script(
+        "unreadable-note",
+        "<!doctype html><button onclick=\"showOpenFilePicker().catch(error => out.textContent = 'Picker failed ' + error.name)\">Pick file</button><p id=\"out\"></p>",
+        "with note = file $IU2U_NOTES/note.txt\nopen PAGE\ndo open the note\n",
+    );
+    let (_, report) = act_with(
+        &script,
+        Some(&model),
+        false,
+        &[("IU2U_NOTES", dir.to_str().unwrap())],
+    );
+    has(&report, "/steps/1/actions/1", "could not take the files");
+    assert!(!report.to_string().contains("7f3a"), "{report}");
+    for request in questions_asked(&model).await {
+        assert!(!String::from_utf8_lossy(&request.body).contains("7f3a"));
+    }
+}
+
+#[tokio::test]
+async fn a_secret_in_a_frame_behind_a_modal_keeps_the_screenshot_from_the_model() {
+    let site = MockServer::start().await;
+    let port = site.address().port();
+    for (at, body) in [
+        (
+            "/app",
+            format!(
+                "<!doctype html><iframe style=\"width: 300px; height: 80px\" src=\"http://localhost:{port}/inner\"></iframe><dialog id=\"d\"><p>Confirm</p></dialog><script>d.showModal()</script>"
+            ),
+        ),
+        ("/inner", format!("<!doctype html><p>Token {SECRET}</p>")),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/html"))
+            .mount(&site)
+            .await;
+    }
+    let model = MockServer::start().await;
+    answer_always(&model, verdict(0.95)).await;
+    let script = script(
+        "modal-frame-secret",
+        "",
+        &format!(
+            "with token = $IU2U_TEST_SECRET\nopen http://127.0.0.1:{port}/app\nexpect the dialog is shown\n"
+        ),
+    );
+    succeeded(sees(&script, &model));
+    let requests = questions_asked(&model).await;
+    assert!(!requests.is_empty());
+    for request in requests {
+        assert!(!String::from_utf8_lossy(&request.body).contains("iu2u-screenshot"));
+    }
+}
+
+#[tokio::test]
+async fn a_page_that_never_finishes_loading_holds_up_only_its_open() {
+    let site = site(&[(
+        "/app",
+        "<!doctype html><button onclick=\"out.textContent = 'Saved'\">Save</button><p id=\"out\"></p><img src=\"/hang.png\">",
+    )])
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/hang.png"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .mount(&site)
+        .await;
+    let model = pressing("Saved").await;
+    let script = site_script("hanging", &site, "open SITE/app\ndo save\nsee \"Saved\"\n");
+    let report = passes(&script, &model);
+    assert!(
+        report["steps"][1]["seconds"].as_f64().unwrap() < 5.0,
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_secret_painted_escaped_outside_the_accessibility_tree_keeps_the_screenshot_from_the_model()
+ {
+    let model = MockServer::start().await;
+    answer_always(&model, verdict(0.95)).await;
+    let script = script(
+        "painted-escaped",
+        r#"<!doctype html><p>Settings</p><pre aria-hidden="true">{"token":"ab\/cd-long-token"}</pre>"#,
+        "with token = $IU2U_SLASH_TOKEN\nopen PAGE\nexpect the settings are shown\n",
+    );
+    let (_, report) = act_with(
+        &script,
+        Some(&model),
+        false,
+        &[
+            ("IU2U_VISION", "true"),
+            ("IU2U_SLASH_TOKEN", "ab/cd-long-token"),
+        ],
+    );
+    assert_eq!(report["status"], "passed", "{report}");
+    let requests = questions_asked(&model).await;
+    assert!(!requests.is_empty());
+    for request in requests {
+        assert!(!String::from_utf8_lossy(&request.body).contains("iu2u-screenshot"));
+    }
+}
+
+#[test]
+fn a_goal_that_names_an_unknown_value_stops_instead_of_typing_it() {
+    let script = script(
+        "typo-goal",
+        "<!doctype html><label>Search <input></label>",
+        "with email = a@b.c\nopen PAGE\ndo type \"$emial\" in the search\n",
+    );
+    let report = exits(2, act(&script, None, false));
+    has(&report, "/error", "$emial has no value");
+}
+
+#[tokio::test]
+async fn a_file_path_in_a_step_reads_a_value_anywhere_in_it() {
+    let fixtures = temp_path("fixtures-by-name");
+    std::fs::create_dir_all(&fixtures).unwrap();
+    std::fs::write(fixtures.join("body.json"), "{\"id\": 7}").unwrap();
+    let api = MockServer::start().await;
+    for (at, status) in [("/items", 201), ("/upload", 204)] {
+        Mock::given(method("POST"))
+            .and(path(at))
+            .and(body_string_contains("\"id\": 7"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&api)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/app"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<!doctype html><p id=\"out\">Waiting</p><script>fetch('/api/data').then(r => r.text()).then(t => out.textContent = 'Got ' + t);</script>",
+            "text/html",
+        ))
+        .mount(&api)
+        .await;
+    let script = site_script(
+        "file-by-name",
+        &api,
+        "request POST SITE/items\n  json file $IU2U_FIXTURES/body.json\nsee \"HTTP 201\"\nrequest POST SITE/upload\n  form doc = file $IU2U_FIXTURES/body.json\nsee \"HTTP 204\"\nroute */api/data answer 200 file $IU2U_FIXTURES/body.json\nopen SITE/app\nsee \"Got {\"\n",
+    );
+    let (output, report) = act_with(
+        &script,
+        None,
+        false,
+        &[("IU2U_FIXTURES", fixtures.to_str().unwrap())],
+    );
+    assert_eq!(output.status.code(), Some(0), "{report}");
+}
+
+#[tokio::test]
+async fn a_with_value_reads_the_value_a_command_printed_before_it() {
+    let api = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/me"))
+        .and(header("authorization", "Bearer tok-31337"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&api)
+        .await;
+    let script = site_script(
+        "value-after-command",
+        &api,
+        "with token = run printf tok-31337\nwith auth = Bearer $token\nrequest GET SITE/me\n  authorization: $auth\nsee \"HTTP 200\"\n",
+    );
+    runs(&script);
 }

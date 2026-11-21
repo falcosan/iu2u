@@ -8,6 +8,7 @@ use super::{ADAPTER_SESSION, SYSTEM, printed, run};
 
 pub(super) const PROGRAM: &str = "claude";
 pub(crate) const MODEL: &str = "haiku";
+pub(super) const CONTEXT: usize = 200_000;
 
 pub(super) async fn reply(
     model: &str,

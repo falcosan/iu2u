@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{permission, within_hook_timeout};
+use super::{command, permission, within_hook_timeout};
 use crate::model::{Answers, Client, Question, Questions};
 
 const MAX_COMMAND_CHARS: usize = 4000;
@@ -18,13 +18,14 @@ enum Verdict {
 }
 
 pub(super) async fn run(input: &Value, client: Result<Client>) -> String {
-    let command = input
-        .pointer("/tool_input/command")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let command = command(input);
     let permission_mode = input["permission_mode"].as_str().unwrap_or_default();
     let host_can_ask = input.get("turn_id").is_none();
-    let judged = if command.is_empty() || command.chars().count() > MAX_COMMAND_CHARS {
+    let judged = if command.chars().count() > MAX_COMMAND_CHARS {
+        Some(Verdict::Escalate(
+            "iu2u guard: this command is too long to judge",
+        ))
+    } else if command.is_empty() {
         None
     } else {
         within_hook_timeout(async { client?.ask(command, &questions()).await })

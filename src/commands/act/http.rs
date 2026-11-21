@@ -10,7 +10,7 @@ use serde_json::Value;
 use super::script::{Body, Part, Request};
 
 const ANSWER_WITHIN: Duration = Duration::from_secs(30);
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_BODY_BYTES: usize = 1 << 20;
 
 pub(super) fn client() -> Result<Client> {
     Client::builder()
@@ -51,7 +51,7 @@ pub(super) async fn send(
             let body = form_urlencoded::Serializer::new(String::new())
                 .extend_pairs(fields.iter().filter_map(|(name, part)| match part {
                     Part::Text(text) => Some((name, text)),
-                    Part::File(_) => None,
+                    Part::File(..) => None,
                 }))
                 .finish();
             if !typed {
@@ -71,7 +71,7 @@ pub(super) async fn send(
             for (name, part) in fields {
                 form = match part {
                     Part::Text(text) => form.text(name.clone(), text.clone()),
-                    Part::File(path) => form.part(name.clone(), file(path).await?),
+                    Part::File(_, path) => form.part(name.clone(), file(path).await?),
                 };
             }
             builder = builder.multipart(form);
@@ -115,7 +115,7 @@ pub(super) async fn send(
     let mut json = None;
     match String::from_utf8(body) {
         Ok(text) if !text.contains('\0') => {
-            json = serde_json::from_str(&text).ok();
+            json = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok();
             match &json {
                 Some(json) => lines.extend(
                     leaves(json)

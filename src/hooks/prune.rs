@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::ITEM_CHARS;
+use super::{BATCH_WITHIN, ITEM_CHARS};
 use crate::clip;
 use crate::model::{Client, Question, Questions};
 
@@ -46,7 +46,9 @@ pub(super) async fn run(input: &Value, client: &Client) -> Result<String> {
             "This step is still needed to continue the latest requests: {requests}."
         )),
     )]);
-    let answers = client.ask_each(steps.clone(), &question).await;
+    let answers = client
+        .ask_each_within(steps.clone(), &question, BATCH_WITHIN)
+        .await;
     let mut keep = Vec::new();
     let mut drop = Vec::new();
     for (step, answer) in steps.iter().zip(answers).rev() {
@@ -56,14 +58,21 @@ pub(super) async fn run(input: &Value, client: &Client) -> Result<String> {
             _ => {}
         }
     }
-    if keep.is_empty() && drop.is_empty() {
-        return Ok(String::new());
-    }
-    Ok(format!(
-        "Keep exact details (paths, commands, values, decisions and open problems) from these steps, newest first:\n{}\n\nReduce these steps to one line each or drop them, newest first:\n{}",
-        clip(&keep.join("\n"), MAX_LIST_CHARS),
-        clip(&drop.join("\n"), MAX_LIST_CHARS)
-    ))
+    Ok([
+        (
+            "Keep exact details (paths, commands, values, decisions and open problems) from these steps, newest first:",
+            keep,
+        ),
+        (
+            "Reduce these steps to one line each or drop them, newest first:",
+            drop,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, steps)| !steps.is_empty())
+    .map(|(heading, steps)| format!("{heading}\n{}", clip(&steps.join("\n"), MAX_LIST_CHARS)))
+    .collect::<Vec<_>>()
+    .join("\n\n"))
 }
 
 fn push_bounded<T>(queue: &mut VecDeque<T>, item: T, max: usize) {

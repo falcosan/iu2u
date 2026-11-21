@@ -10,8 +10,8 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::{CGEvent, CGEventFlags};
 
-use super::screen::{Element, Kind, Node, Screen};
-use super::surface::{self, Action, FIRST_CHANGE, POLL, Probe};
+use super::screen::{Element, Kind, Node, Screen, name_by_contents, withhold_unfinished};
+use super::surface::{self, Action, FIRST_CHANGE, POLL_EVERY, Probe};
 
 const ATTRIBUTES: [&str; 12] = [
     "AXRole",
@@ -36,7 +36,7 @@ const QUIT_WITHIN: Duration = Duration::from_secs(1);
 const RETURN: u16 = 36;
 const ESCAPE: u16 = 53;
 const PAGE_DOWN: u16 = 121;
-const LETTER_A: u16 = 0;
+const SECURE_FIELD: &str = "AXSecureTextField";
 
 pub(super) struct Mac {
     pid: i32,
@@ -71,6 +71,7 @@ impl Mac {
             unsafe { AXIsProcessTrusted() },
             "allow the app that runs iu2u, such as your terminal or editor, in System Settings > Privacy & Security > Accessibility"
         );
+        unsafe { AXUIElement::new_system_wide().set_messaging_timeout(MESSAGING_TIMEOUT) };
         let opened = tokio::process::Command::new("open")
             .args(["-g", "-a", name])
             .status()
@@ -88,7 +89,6 @@ impl Mac {
                 .find_map(|pid| {
                     running_here = true;
                     let app = unsafe { AXUIElement::new_application(pid) };
-                    unsafe { app.set_messaging_timeout(MESSAGING_TIMEOUT) };
                     let mut windows = 0;
                     let counted = unsafe {
                         app.attribute_value_count(
@@ -108,7 +108,7 @@ impl Mac {
             if shown.is_some() || started.elapsed() >= LAUNCH_WITHIN {
                 break shown;
             }
-            tokio::time::sleep(POLL).await;
+            tokio::time::sleep(POLL_EVERY).await;
         };
         let Some((pid, app)) = shown else {
             if running_here {
@@ -129,12 +129,8 @@ impl Mac {
         })
     }
 
-    fn alive(&self) -> bool {
-        unsafe { libc::kill(self.pid, 0) == 0 }
-    }
-
     pub(super) async fn observe(&mut self) -> Result<Vec<Node>> {
-        anyhow::ensure!(self.alive(), "the app quit");
+        anyhow::ensure!(!crate::gone(self.pid), "the app quit");
         let mut started = Instant::now();
         let mut nodes: Vec<Node> = Vec::new();
         let mut handles = Vec::new();
@@ -143,6 +139,12 @@ impl Mac {
         while let Some((element, parent)) = stack.pop() {
             if nodes.len() >= self.limit || started.elapsed() >= WALK_WITHIN {
                 self.limit = next_limit(self.limit, nodes.len(), started.elapsed());
+                withhold_unfinished(
+                    &mut nodes,
+                    parent
+                        .into_iter()
+                        .chain(stack.iter().filter_map(|(_, parent)| *parent)),
+                );
                 cut_short(&mut nodes);
                 break;
             }
@@ -157,7 +159,7 @@ impl Mac {
             let Some(read) = read else {
                 continue;
             };
-            if read.empty || read.role == "AXMenuBar" {
+            if !read.shown() {
                 continue;
             }
             let index = nodes.len();
@@ -176,10 +178,13 @@ impl Mac {
         if nodes.is_empty() {
             let quitting = Instant::now();
             while quitting.elapsed() < QUIT_WITHIN {
-                anyhow::ensure!(self.alive(), "the app quit");
-                tokio::time::sleep(POLL).await;
+                anyhow::ensure!(!crate::gone(self.pid), "the app quit");
+                tokio::time::sleep(POLL_EVERY).await;
             }
             anyhow::bail!("the app did not answer");
+        }
+        for at in (0..nodes.len()).rev() {
+            name_by_contents(&mut nodes, at);
         }
         self.handles = handles;
         self.fingerprint = Screen::new(&nodes, &[]).fingerprint();
@@ -193,9 +198,11 @@ impl Mac {
         match action {
             Action::Press(element) => {
                 let target = self.fresh(element)?;
-                if unsafe { target.perform_action(&CFString::from_str("AXPress")) }
-                    != AXError::Success
+                let pressed = unsafe { target.perform_action(&CFString::from_str("AXPress")) };
+                if pressed != AXError::Success
+                    && pressed != AXError::CannotComplete
                     && !self.set(&target, "AXSelected", CFBoolean::new(true))
+                    && !self.set(&target, "AXFocused", CFBoolean::new(true))
                 {
                     bail!("{} cannot be pressed", element.describe());
                 }
@@ -215,7 +222,7 @@ impl Mac {
                     );
                     let secure = read
                         .as_ref()
-                        .is_some_and(|read| read.subrole == "AXSecureTextField");
+                        .is_some_and(|read| read.subrole == SECURE_FIELD);
                     let length = read
                         .as_ref()
                         .map_or(0, |read| read.text.encode_utf16().count());
@@ -223,19 +230,23 @@ impl Mac {
                         location: 0,
                         length: length as CFIndex,
                     };
-                    if let Some(range) =
-                        unsafe { AXValue::new(AXValueType::CFRange, NonNull::from(&all).cast()) }
-                    {
-                        self.set(&target, "AXSelectedTextRange", &range);
-                    }
-                    self.key(LETTER_A, CGEventFlags::MaskCommand, None);
+                    let selected = length == 0
+                        || unsafe {
+                            AXValue::new(AXValueType::CFRange, NonNull::from(&all).cast())
+                        }
+                        .is_some_and(|range| self.set(&target, "AXSelectedTextRange", &range));
+                    anyhow::ensure!(
+                        selected,
+                        "{} cannot select its text to replace it",
+                        element.describe()
+                    );
                     for character in input.text.chars() {
                         self.key(0, CGEventFlags::empty(), Some(character));
                     }
                     let typed_at = Instant::now();
                     let mut took = secure;
                     while !took && typed_at.elapsed() < FIRST_CHANGE {
-                        tokio::time::sleep(POLL).await;
+                        tokio::time::sleep(POLL_EVERY).await;
                         took = self.read(&target).as_ref().is_some_and(taken);
                     }
                     anyhow::ensure!(took, "{} did not take the text", element.describe());
@@ -271,14 +282,28 @@ impl Mac {
             .handles
             .get(element.handle)
             .with_context(|| format!("{} is gone", element.describe()))?;
-        let current = self
-            .read(target)
-            .map(|read| read.node(element.handle))
+        let mut nodes = Vec::new();
+        self.named(target, &mut nodes)
             .with_context(|| format!("{} is gone", element.describe()))?;
-        if current.role != element.role || current.name != element.raw_name {
+        if nodes[0].role != element.role || nodes[0].name != element.raw_name {
             bail!("{} changed before it could be used", element.describe());
         }
         Ok(target.clone())
+    }
+
+    fn named(&self, element: &AXUIElement, nodes: &mut Vec<Node>) -> Option<usize> {
+        let read = self.read(element).filter(Read::shown)?;
+        let at = nodes.len();
+        nodes.push(read.node(at));
+        if nodes[at].name.is_empty() {
+            for child in &read.children {
+                if let Some(child) = self.named(child, nodes) {
+                    nodes[at].children.push(child);
+                }
+            }
+            name_by_contents(nodes, at);
+        }
+        Some(at)
     }
 
     fn set(&self, element: &AXUIElement, attribute: &str, value: &CFType) -> bool {
@@ -360,8 +385,9 @@ impl Mac {
             children: at(11)
                 .and_then(|value| value.downcast::<CFArray>().ok())
                 .map(|children| {
-                    unsafe { CFRetained::cast_unchecked::<CFArray<AXUIElement>>(children) }
+                    unsafe { CFRetained::cast_unchecked::<CFArray<CFType>>(children) }
                         .iter()
+                        .filter_map(|child| child.downcast::<AXUIElement>().ok())
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -400,9 +426,13 @@ fn switch_off(app: &AXUIElement) {
 }
 
 impl Read {
+    fn shown(&self) -> bool {
+        !self.empty && self.role != "AXMenuBar"
+    }
+
     fn node(&self, handle: usize) -> Node {
         let (role, kind) = role(&self.role, &self.subrole);
-        let secret = self.subrole == "AXSecureTextField";
+        let secret = self.subrole == SECURE_FIELD;
         let mut value = if secret {
             String::new()
         } else {
@@ -462,8 +492,8 @@ fn role(role: &str, subrole: &str) -> (&'static str, Option<Kind>) {
         ("AXCheckBox", _) => ("checkbox", Some(Kind::Press)),
         ("AXRadioButton", "AXTabButton") | ("AXTab", _) => ("tab", Some(Kind::Press)),
         ("AXRadioButton", _) => ("radio", Some(Kind::Press)),
-        ("AXMenuItem" | "AXMenuBarItem", _) => ("menuitem", Some(Kind::Press)),
-        ("AXRow" | "AXOutlineRow", _) => ("row", Some(Kind::Press)),
+        ("AXMenuItem", _) => ("menuitem", Some(Kind::Press)),
+        ("AXRow", _) => ("row", Some(Kind::Press)),
         ("AXCell", _) => ("gridcell", Some(Kind::Press)),
         ("AXStaticText", _) => ("text", None),
         ("AXHeading", _) => ("heading", None),
@@ -605,7 +635,7 @@ mod tests {
         );
         let secret = Read {
             role: "AXTextField".into(),
-            subrole: "AXSecureTextField".into(),
+            subrole: SECURE_FIELD.into(),
             placeholder: "Password".into(),
             text: "hunter2".into(),
             ..Read::default()

@@ -165,16 +165,19 @@ async fn a_bad_config_file_takes_the_cannot_judge_path_and_says_why() {
 }
 
 #[tokio::test]
-async fn unknown_switch_values_keep_the_default() {
+async fn unknown_switch_values_keep_the_default_and_0_turns_a_power_off() {
     let model = MockServer::start().await;
     answer_always(&model, irreversible()).await;
     let base_url = model.uri();
-    let options = [
-        ("IU2U_BASE_URL", base_url.as_str()),
-        ("IU2U_MODEL", "model-x"),
-        ("IU2U_GUARD", "1"),
-    ];
-    assert_eq!(permission(&guard_hook(&options)), "deny");
+    let hook = |guard: &str| {
+        guard_hook(&[
+            ("IU2U_BASE_URL", base_url.as_str()),
+            ("IU2U_MODEL", "model-x"),
+            ("IU2U_GUARD", guard),
+        ])
+    };
+    assert_eq!(permission(&hook("yes")), "deny");
+    assert_eq!(hook("0"), "");
 }
 
 #[tokio::test]
@@ -275,14 +278,22 @@ fn unconfigured_guard_asks_when_nobody_is_watching() {
 }
 
 #[tokio::test]
-async fn guard_does_not_judge_oversized_commands() {
+async fn guard_asks_about_commands_too_long_to_judge() {
     let model = MockServer::start().await;
     answer_always(&model, json!({})).await;
-    let input = json!({ "permission_mode": "auto", "tool_input": { "command": "x".repeat(4001) } });
-    assert_eq!(
-        permission(&run(Power::Guard, &input, &client(&model)).await),
-        "ask"
-    );
+    for (input, expected) in [
+        (json!({ "permission_mode": "default" }), "ask"),
+        (json!({ "permission_mode": "auto" }), "ask"),
+        (json!({ "turn_id": "codex-turn" }), "deny"),
+    ] {
+        let mut input = input;
+        input["tool_input"] = json!({ "command": "x".repeat(4001) });
+        assert_eq!(
+            permission(&run(Power::Guard, &input, &client(&model)).await),
+            expected,
+            "{input}"
+        );
+    }
     assert!(model.received_requests().await.unwrap().is_empty());
 }
 
@@ -355,8 +366,20 @@ async fn trim_needs_the_plugin_data_folder() {
 #[tokio::test]
 async fn trim_leaves_short_output_alone() {
     let model = MockServer::start().await;
-    let input = json!({ "tool_response": { "stdout": "short" } });
-    assert_eq!(run(Power::Trim, &input, &client(&model)).await, "");
+    answer_always(&model, json!({ "matters": yes(0.05) })).await;
+    let data = temp_path("plugin-data-short");
+    let base_url = model.uri();
+    let env = [
+        ("CLAUDE_PLUGIN_DATA", data.to_str().unwrap()),
+        ("IU2U_BASE_URL", base_url.as_str()),
+        ("IU2U_MODEL", "model-x"),
+        ("IU2U_TRIM", "true"),
+    ];
+    for stdout in ["short".to_string(), "é\n".repeat(5_000)] {
+        let input = json!({ "tool_response": { "stdout": stdout } });
+        assert_eq!(hook("trim", &env, &input), "");
+    }
+    assert!(model.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -429,11 +452,11 @@ fn write_deploy_skill(claude_dir: &Path) {
     .unwrap();
 }
 
-fn suggests_deploy(output: &str) -> bool {
+fn suggests(skill: &str, output: &str) -> bool {
     serde_json::from_str::<Value>(output).unwrap()["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap()
-        .contains("\"deploy\"")
+        .contains(&format!("\"{skill}\""))
 }
 
 fn compass_hook(model: &MockServer, env: &[(&str, &str)], cwd: &Path) -> String {
@@ -474,6 +497,44 @@ async fn hooks_stay_quiet_inside_an_adapter_session() {
     });
     assert_eq!(hook("proof", &env, &handback), "");
     assert!(model.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_handback_the_model_could_not_judge_is_judged_when_the_subagent_stops() {
+    let model = MockServer::start().await;
+    answer_always(
+        &model,
+        json!({ "finished": yes(0.95), "verified": yes(0.05) }),
+    )
+    .await;
+    let data = temp_path("proof-unjudged");
+    std::fs::remove_dir_all(&data).ok();
+    let base_url = model.uri();
+    let hook_with = |base_url: &str, input: &Value| {
+        hook(
+            "proof",
+            &[
+                ("CLAUDE_PLUGIN_DATA", data.to_str().unwrap()),
+                ("IU2U_BASE_URL", base_url),
+                ("IU2U_MODEL", "model-x"),
+            ],
+            input,
+        )
+    };
+    let handback = json!({
+        "hook_event_name": "PreToolUse",
+        "agent_id": "agent-unjudged",
+        "tool_name": "SubagentHandback",
+        "tool_input": { "message": "All done!" }
+    });
+    assert_eq!(hook_with("http://127.0.0.1:9", &handback), "");
+    let stop = json!({
+        "hook_event_name": "SubagentStop",
+        "agent_id": "agent-unjudged",
+        "stop_hook_active": false,
+        "last_assistant_message": "All done!"
+    });
+    assert!(hook_with(&base_url, &stop).contains("iu2u proof"));
 }
 
 #[tokio::test]
@@ -520,7 +581,33 @@ async fn compass_suggests_a_confident_skill_pick() {
     std::fs::create_dir_all(&home).unwrap();
     write_deploy_skill(&project.join(".claude"));
     let env = [("HOME", home.to_str().unwrap())];
-    assert!(suggests_deploy(&compass_hook(&model, &env, &project)));
+    assert!(suggests("deploy", &compass_hook(&model, &env, &project)));
+}
+
+#[tokio::test]
+async fn compass_can_suggest_a_skill_named_none() {
+    let model = MockServer::start().await;
+    answer_always(&model, json!({ "skill": {
+        "type": "choice", "choice": "none", "confidence": 0.8, "probabilities": { "none": 0.9, "none of these": 0.1 }
+    }}))
+    .await;
+    let home = temp_path("compass-none-home");
+    let skill = temp_path("compass-none").join(".claude/skills/none");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: none\ndescription: Says no\n---\n",
+    )
+    .unwrap();
+    let output = compass_hook(
+        &model,
+        &[("HOME", home.to_str().unwrap())],
+        &temp_path("compass-none"),
+    );
+    assert!(suggests("none", &output), "{output}");
+    let asked = model.received_requests().await.unwrap();
+    assert!(String::from_utf8_lossy(&asked[0].body).contains("none of these"));
 }
 
 #[tokio::test]
@@ -534,11 +621,10 @@ async fn compass_finds_project_skills_after_a_cd() {
         ("HOME", home.to_str().unwrap()),
         ("CLAUDE_PROJECT_DIR", project.to_str().unwrap()),
     ];
-    assert!(suggests_deploy(&compass_hook(
-        &model,
-        &env,
-        &project.join("backend")
-    )));
+    assert!(suggests(
+        "deploy",
+        &compass_hook(&model, &env, &project.join("backend"))
+    ));
 }
 
 #[tokio::test]
@@ -552,7 +638,7 @@ async fn compass_reads_personal_skills_from_the_claude_config_dir() {
         ("HOME", home.to_str().unwrap()),
         ("CLAUDE_CONFIG_DIR", config.to_str().unwrap()),
     ];
-    assert!(suggests_deploy(&compass_hook(&model, &env, &home)));
+    assert!(suggests("deploy", &compass_hook(&model, &env, &home)));
 }
 
 #[tokio::test]
@@ -603,6 +689,30 @@ async fn prune_lists_steps_to_keep_and_to_drop() {
                 .contains("latest requests: look at the old-detour | fix the login bug | yes.")
         );
     }
+}
+
+#[tokio::test]
+async fn prune_leaves_out_a_list_with_nothing_in_it() {
+    let model = MockServer::start().await;
+    answer_always(&model, json!({ "needed": yes(0.9) })).await;
+    let transcript = [
+        json!({ "type": "user", "turnOrigin": "human", "origin": { "kind": "human" }, "message": { "content": "fix the login bug" } }),
+        json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "name": "Edit", "input": { "file_path": "src/login.rs" } }] } }),
+    ]
+    .map(|entry| entry.to_string())
+    .join("\n");
+    let path = temp_path("kept-transcript.jsonl");
+    std::fs::write(&path, transcript).unwrap();
+    let output = run(
+        Power::Prune,
+        &json!({ "transcript_path": path }),
+        &client(&model),
+    )
+    .await;
+    assert!(
+        output.contains("src/login.rs") && !output.contains("Reduce"),
+        "{output}"
+    );
 }
 
 #[tokio::test]

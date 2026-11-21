@@ -5,12 +5,12 @@ use std::time::Duration;
 use common::{
     answer_always, answer_when, client, client_with_timeout, fail_always, reply, temp_path, yes,
 };
-use iu2u::model::{Answers, CONCURRENCY, Client, Question, Questions};
+use iu2u::model::{Answers, CONCURRENCY, Client, Question, Questions, TRIES};
 use iu2u::tools::{self, LintParams, RankParams, SeekParams, WeighParams};
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_string_contains, method},
+    matchers::{body_json, body_string_contains, header, method, path},
 };
 
 async fn skipped_after_a_silent_model(client: &Client) -> usize {
@@ -109,6 +109,104 @@ async fn weigh_reports_questions_the_model_left_unanswered() {
 }
 
 #[tokio::test]
+async fn a_llama_server_tells_its_context_once_and_counts_tokens() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .and(header("authorization", "Bearer key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "default_generation_settings": { "n_ctx": 32768 } })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tokenize"))
+        .and(body_json(json!({ "content": "two words" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tokens": [17, 4] })))
+        .mount(&server)
+        .await;
+    let model = client(&server);
+    assert_eq!(model.context().await, Some(32768));
+    assert_eq!(model.context().await, Some(32768));
+    assert_eq!(model.tokens("two words").await.unwrap(), 2);
+    let plain = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&plain)
+        .await;
+    assert_eq!(client(&plain).context().await, None);
+}
+
+#[tokio::test]
+async fn a_batch_with_a_time_limit_gives_up_on_what_it_could_not_ask_in_time() {
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(reply(json!({ "refund": yes(0.9) })).set_delay(Duration::from_secs(5)))
+        .mount(&model)
+        .await;
+    let questions = Questions::from([("refund".into(), Question::yesno("Asks for a refund."))]);
+    let started = std::time::Instant::now();
+    let results = client(&model)
+        .ask_each_within(
+            vec!["charged twice".into(); 3],
+            &questions,
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(results.iter().all(Result::is_err));
+}
+
+#[tokio::test]
+async fn a_model_trained_on_less_context_than_its_server_gives_gets_its_own() {
+    let server = MockServer::start().await;
+    for (at, body) in [
+        (
+            "/props",
+            json!({ "default_generation_settings": { "n_ctx": 32768 } }),
+        ),
+        (
+            "/v1/models",
+            json!({ "data": [{ "meta": { "n_ctx_train": 8192 } }] }),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+    }
+    assert_eq!(client(&server).context().await, Some(8192));
+}
+
+#[tokio::test]
+async fn a_server_still_loading_is_asked_for_its_context_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "default_generation_settings": { "n_ctx": 4096 } })),
+        )
+        .mount(&server)
+        .await;
+    let model = client(&server);
+    assert_eq!(model.context().await, None);
+    assert_eq!(model.context().await, Some(4096));
+}
+
+#[tokio::test]
 async fn batches_stop_once_the_model_cannot_be_reached() {
     let closed = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -152,7 +250,7 @@ async fn batches_stop_once_the_model_stops_answering_midway() {
     let client = client_with_timeout(&model, Duration::from_secs(1));
     let started = std::time::Instant::now();
     assert!(skipped_after_a_silent_model(&client).await >= 40 - 2 * CONCURRENCY);
-    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 #[tokio::test]
@@ -164,7 +262,7 @@ async fn batches_stop_once_every_answer_fails() {
             skipped_after_a_silent_model(&client(&model)).await >= 40 - 2 * CONCURRENCY,
             "{status}"
         );
-        assert!(model.received_requests().await.unwrap().len() <= 2 * CONCURRENCY);
+        assert!(model.received_requests().await.unwrap().len() <= TRIES as usize * 2 * CONCURRENCY);
     }
 }
 
@@ -294,7 +392,17 @@ async fn seek_returns_relevant_excerpts_and_skips_unreadable_files() {
     std::fs::write(&file, lines.join("\n")).unwrap();
     let params = SeekParams {
         query: "where are retries handled".into(),
-        files: vec![file.display().to_string(), "/nonexistent/iu2u".into()],
+        files: vec![
+            file.display().to_string(),
+            file.parent()
+                .unwrap()
+                .join("../.")
+                .join(file.parent().unwrap().file_name().unwrap())
+                .join("seek.rs")
+                .display()
+                .to_string(),
+            "/nonexistent/iu2u".into(),
+        ],
         max_excerpt_chars: Some(200),
     };
     let found = tools::seek(&client(&model), params).await.unwrap();
@@ -339,11 +447,10 @@ async fn seek_reports_why_the_model_failed_on_every_excerpt() {
         files: vec![file.display().to_string()],
         max_excerpt_chars: None,
     };
+    let error = tools::seek(&client(&model), params).await.unwrap_err();
     assert!(
-        tools::seek(&client(&model), params)
-            .await
-            .unwrap_err()
-            .contains("503")
+        error.contains("decision model rejected the request: HTTP status server error (503"),
+        "{error}"
     );
 }
 
@@ -368,7 +475,7 @@ async fn seek_fails_when_nothing_is_readable() {
     let model = MockServer::start().await;
     let params = SeekParams {
         query: "anything".into(),
-        files: vec!["/nonexistent/iu2u".into()],
+        files: vec!["/nonexistent/iu2u".into(), "/nonexistent/iu2u".into()],
         max_excerpt_chars: None,
     };
     assert!(

@@ -1,11 +1,18 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use super::decide::Input;
+
+pub(super) const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Step {
@@ -70,15 +77,39 @@ pub(super) enum Body {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Part {
     Text(String),
-    File(String),
+    File(PathBuf, String),
 }
 
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Script {
     pub(super) steps: Vec<(usize, Step, Option<Duration>)>,
-    pub(super) inputs: Vec<Input>,
-    pub(super) files: Vec<Files>,
-    pub(super) commands: Vec<(String, String)>,
+    pub(super) withs: Vec<With>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum With {
+    Value {
+        key: String,
+        text: String,
+    },
+    Run {
+        key: String,
+        command: String,
+        within: Option<Duration>,
+    },
+    Files {
+        key: String,
+        paths: Vec<String>,
+        zip: bool,
+        base: PathBuf,
+    },
+}
+
+impl With {
+    pub(super) fn key(&self) -> &str {
+        let (Self::Value { key, .. } | Self::Run { key, .. } | Self::Files { key, .. }) = self;
+        key
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -115,7 +146,7 @@ impl Step {
                     Reply::Answer(status, Some(Part::Text(body))) => {
                         write!(text, " answer {status} {body}")
                     }
-                    Reply::Answer(status, Some(Part::File(path))) => {
+                    Reply::Answer(status, Some(Part::File(_, path))) => {
                         write!(text, " answer {status} file {path}")
                     }
                     Reply::Hold => write!(text, " hold"),
@@ -142,25 +173,125 @@ impl Step {
             Self::ClockRun(duration) => format!("clock run {}s", duration.as_secs_f64()),
         }
     }
+
+    fn expanded_parts(&self) -> Vec<&str> {
+        match self {
+            Self::Open(text)
+            | Self::Do(text)
+            | Self::Expect(text)
+            | Self::See(text)
+            | Self::SeeNo(text)
+            | Self::Extract(_, text)
+            | Self::Release(text) => vec![text],
+            Self::Route(route) => {
+                let mut parts = vec![route.pattern.as_str()];
+                match &route.reply {
+                    Reply::To(url) => parts.push(url),
+                    Reply::Answer(_, Some(Part::Text(text) | Part::File(_, text))) => {
+                        parts.push(text)
+                    }
+                    Reply::Answer(_, None) | Reply::Hold => {}
+                }
+                parts
+            }
+            Self::Request(request) => {
+                let mut parts = vec![request.url.as_str()];
+                parts.extend(request.headers.iter().map(|(_, value)| value.as_str()));
+                match &request.body {
+                    Some(Body::Json(Part::Text(text) | Part::File(_, text))) => parts.push(text),
+                    Some(Body::Form(fields)) => parts.extend(
+                        fields
+                            .iter()
+                            .map(|(_, Part::Text(text) | Part::File(_, text))| text.as_str()),
+                    ),
+                    None => {}
+                }
+                parts
+            }
+            Self::Start(start) => start.at.as_deref().into_iter().collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
-pub(super) fn inputs(goal: &str, given: &[Input]) -> Vec<Input> {
-    let quoted = goal
+pub(super) fn read_ahead(
+    steps: &[(usize, Step, Option<Duration>)],
+    given: &[Input],
+    read: &mut Vec<Input>,
+) {
+    let extracted: Vec<&str> = steps
+        .iter()
+        .filter_map(|(_, step, _)| match step {
+            Step::Extract(name, _) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    for (_, step, _) in steps {
+        for name in step.expanded_parts().into_iter().flat_map(references) {
+            if !extracted.contains(&name.as_str()) {
+                value_of(&name, given, read).ok();
+            }
+        }
+    }
+}
+
+pub(super) fn inputs(
+    goal: &str,
+    given: &[Input],
+    files: &[Files],
+    read: &mut Vec<Input>,
+) -> Result<Vec<Input>> {
+    let mut quoted = Vec::new();
+    for text in goal
         .split('"')
         .skip(1)
         .step_by(2)
         .take(goal.matches('"').count() / 2)
-        .filter(|text| !text.is_empty())
-        .map(|text| Input {
-            key: format!("\"{text}\""),
-            text: text.into(),
-            secret: false,
-        });
+    {
+        let (text, secret) = filled(text, given, files, read)?;
+        if !secret && !text.is_empty() {
+            quoted.push(Input {
+                key: format!("\"{text}\""),
+                text,
+                secret: false,
+            });
+        }
+    }
     let mut seen = HashSet::new();
-    quoted
+    Ok(quoted
+        .into_iter()
         .chain(given.iter().cloned())
         .filter(|input| seen.insert(input.text.clone()))
-        .collect()
+        .collect())
+}
+
+pub(super) fn filled(
+    text: &str,
+    given: &[Input],
+    files: &[Files],
+    read: &mut Vec<Input>,
+) -> Result<(String, bool)> {
+    let mut secret = false;
+    let shown = substitute(text, |name, _| {
+        if files.iter().any(|files| files.key == name) {
+            return Ok(format!("${name}"));
+        }
+        let text = value_of(name, given, read)?;
+        Ok(
+            match given
+                .iter()
+                .chain(read.iter())
+                .find(|input| input.key == name)
+            {
+                Some(input) if input.secret => {
+                    secret = true;
+                    input.shown()
+                }
+                _ => text,
+            },
+        )
+    })?;
+    Ok((shown, secret))
 }
 
 const MAX_USES: usize = 8;
@@ -196,7 +327,7 @@ fn read(
         if raw.starts_with([' ', '\t'])
             && let Some((_, Step::Request(request), _)) = script.steps.last_mut()
         {
-            detail(request, line).with_context(|| format!("line {number}"))?;
+            detail(request, line, base).with_context(|| format!("line {number}"))?;
             continue;
         }
         let (verb, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
@@ -253,12 +384,13 @@ fn read(
         }
         let step = match verb {
             "open" => Step::Open(rest),
+            "app" if rest.contains('/') => Step::App(located(base, &rest)),
             "app" => Step::App(rest),
             "do" => Step::Do(rest),
             "expect" => Step::Expect(rest),
             "see" => Step::See(rest),
             "request" => Step::Request(request(&rest).with_context(|| format!("line {number}"))?),
-            "route" => Step::Route(route(&rest).with_context(|| format!("line {number}"))?),
+            "route" => Step::Route(route(&rest, base).with_context(|| format!("line {number}"))?),
             "release" => Step::Release(rest),
             "run" => Step::Run(rest),
             "start" => Step::Start(start(&rest).with_context(|| format!("line {number}"))?),
@@ -310,43 +442,27 @@ fn read(
                     !key.is_empty() && !key.contains('"'),
                     "line {number}: write it as: with name = run command"
                 );
-                if script.commands.contains(&(key.clone(), command.clone())) {
-                    continue;
-                }
-                anyhow::ensure!(
-                    !taken(script, &key),
-                    "line {number}: {key:?} already has a value"
-                );
-                script.commands.push((key, command));
+                let (command, within) =
+                    within(&command, true).with_context(|| format!("line {number}"))?;
+                let command = command.to_owned();
+                add(
+                    script,
+                    With::Run {
+                        key,
+                        command,
+                        within,
+                    },
+                    number,
+                )?;
                 continue;
             }
             "with" => {
-                let files = given_files(&rest).with_context(|| format!("line {number}"))?;
-                let input = match files {
-                    Some(_) => None,
-                    None => Some(input(&rest).with_context(|| format!("line {number}"))?),
-                };
-                let key = files
-                    .as_ref()
-                    .map(|files| &files.key)
-                    .or(input.as_ref().map(|input| &input.key))
-                    .cloned()
-                    .unwrap_or_default();
-                if files
-                    .as_ref()
-                    .is_some_and(|files| script.files.contains(files))
-                    || input
-                        .as_ref()
-                        .is_some_and(|input| script.inputs.contains(input))
-                {
-                    continue;
-                }
-                anyhow::ensure!(
-                    !taken(script, &key),
-                    "line {number}: {key:?} already has a value"
-                );
-                script.files.extend(files);
-                script.inputs.extend(input);
+                let with =
+                    match given_files(&rest, base).with_context(|| format!("line {number}"))? {
+                        Some(files) => files,
+                        None => input(&rest).with_context(|| format!("line {number}"))?,
+                    };
+                add(script, with, number)?;
                 continue;
             }
             _ => bail!(
@@ -393,7 +509,18 @@ fn start(definition: &str) -> Result<Start> {
 }
 
 pub(super) fn expand(text: &str, given: &[Input], read: &mut Vec<Input>) -> Result<String> {
-    substitute(text, |name, _| value_of(name, given, read))
+    Ok(resolved(text, given, read)?.0)
+}
+
+pub(super) fn expand_url(text: &str, given: &[Input], read: &mut Vec<Input>) -> Result<String> {
+    let query = text.find('?');
+    substitute(text, |name, at| {
+        let value = value_of(name, given, read)?;
+        Ok(match query {
+            Some(start) if at > start => utf8_percent_encode(&value, QUERY_VALUE).to_string(),
+            _ => value,
+        })
+    })
 }
 
 pub(super) fn expand_json(text: &str, given: &[Input], read: &mut Vec<Input>) -> Result<String> {
@@ -437,7 +564,7 @@ fn value_of(name: &str, given: &[Input], read: &mut Vec<Input>) -> Result<String
         .ok()
         .filter(|text| !text.is_empty())
         .with_context(|| {
-            format!("${name} has no value; give it with `with {name} = ...` or set the environment variable {name}")
+            format!("${name} has no value; give it with `with {name} = ...` or set the environment variable {name}; write $$ for a literal $")
         })?;
     read.push(Input {
         key: name.into(),
@@ -484,7 +611,11 @@ fn substitute(text: &str, mut value: impl FnMut(&str, usize) -> Result<String>) 
     Ok(shown)
 }
 
-fn route(definition: &str) -> Result<Route> {
+fn located(base: &Path, path: &str) -> String {
+    base.join(path).to_string_lossy().into_owned()
+}
+
+fn route(definition: &str, base: &Path) -> Result<Route> {
     const USAGE: &str = "write it as: route <address> [once] to <address>, route <address> [once] answer <status> [<body> | file <path>], or route <address> [once] hold";
     let (pattern, rest) = definition.split_once(char::is_whitespace).context(USAGE)?;
     let rest = rest.trim_start();
@@ -507,7 +638,9 @@ fn route(definition: &str) -> Result<Route> {
                 .context("route ... answer needs a status from 200 to 599")?;
             let body = body.trim();
             let body = match body.strip_prefix("file ") {
-                Some(path) if !path.trim().is_empty() => Some(Part::File(path.trim().into())),
+                Some(path) if !path.trim().is_empty() => {
+                    Some(Part::File(base.to_path_buf(), path.trim().into()))
+                }
                 _ if body.is_empty() => None,
                 _ => Some(Part::Text(body.into())),
             };
@@ -544,14 +677,14 @@ fn request(definition: &str) -> Result<Request> {
     })
 }
 
-fn detail(request: &mut Request, line: &str) -> Result<()> {
+fn detail(request: &mut Request, line: &str, base: &Path) -> Result<()> {
     let (word, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let rest = rest.trim();
     match (word, &mut request.body) {
         ("json", None) if !rest.is_empty() => {
             request.body = Some(Body::Json(
                 match rest.strip_prefix("file ").map(str::trim) {
-                    Some(path) if !path.is_empty() => Part::File(path.into()),
+                    Some(path) if !path.is_empty() => Part::File(base.to_path_buf(), path.into()),
                     _ => Part::Text(rest.into()),
                 },
             ));
@@ -563,7 +696,9 @@ fn detail(request: &mut Request, line: &str) -> Result<()> {
                 .filter(|(name, _)| !name.is_empty())
                 .context("write a form field as: form name = value, or form name = file path")?;
             let part = match value.strip_prefix("file ") {
-                Some(path) if !path.trim().is_empty() => Part::File(path.trim().into()),
+                Some(path) if !path.trim().is_empty() => {
+                    Part::File(base.to_path_buf(), path.trim().into())
+                }
                 _ => Part::Text(unquoted(value).into()),
             };
             match &mut request.body {
@@ -589,7 +724,7 @@ fn detail(request: &mut Request, line: &str) -> Result<()> {
     Ok(())
 }
 
-fn given_files(definition: &str) -> Result<Option<Files>> {
+fn given_files(definition: &str, base: &Path) -> Result<Option<With>> {
     let Some((key, value)) = definition.split_once('=') else {
         return Ok(None);
     };
@@ -600,26 +735,27 @@ fn given_files(definition: &str) -> Result<Option<Files>> {
         _ => return Ok(None),
     };
     let key = key.trim();
+    let mut parts = Path::new(key).components();
     anyhow::ensure!(
-        !key.is_empty() && !key.contains('"'),
+        matches!(
+            (parts.next(), parts.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) && !key.contains('"'),
         "write it as: with name = file path, or with name = zip folder"
     );
-    let paths = paths
+    let paths: Vec<String> = paths
         .split(',')
         .map(str::trim)
         .filter(|path| !path.is_empty())
-        .map(|path| {
-            std::path::absolute(path)
-                .map(|absolute| absolute.to_string_lossy().into_owned())
-                .with_context(|| format!("cannot find {path}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(str::to_owned)
+        .collect();
     anyhow::ensure!(!paths.is_empty(), "write it as: with name = file path");
     anyhow::ensure!(!zip || paths.len() == 1, "with name = zip takes one folder");
-    Ok(Some(Files {
+    Ok(Some(With::Files {
         key: key.into(),
         paths,
         zip,
+        base: base.to_path_buf(),
     }))
 }
 
@@ -662,9 +798,7 @@ pub(super) fn is_name(text: &str) -> bool {
 }
 
 pub(super) fn taken(script: &Script, key: &str) -> bool {
-    script.inputs.iter().any(|given| given.key == key)
-        || script.files.iter().any(|given| given.key == key)
-        || script.commands.iter().any(|(given, _)| given == key)
+    script.withs.iter().any(|with| with.key() == key)
 }
 
 fn duration(text: &str) -> Option<Duration> {
@@ -688,7 +822,7 @@ fn unquoted(text: &str) -> &str {
         .unwrap_or(text)
 }
 
-fn input(definition: &str) -> Result<Input> {
+fn input(definition: &str) -> Result<With> {
     let (key, value) = definition
         .split_once('=')
         .context("write it as: with name = value")?;
@@ -697,21 +831,55 @@ fn input(definition: &str) -> Result<Input> {
         !key.is_empty() && !key.contains('"'),
         "write it as: with name = value"
     );
-    match value.strip_prefix('$') {
-        Some(variable) => Ok(Input {
-            key: key.into(),
-            text: std::env::var(variable)
-                .ok()
-                .filter(|text| !text.is_empty())
-                .with_context(|| format!("set the environment variable {variable}"))?,
-            secret: true,
-        }),
-        None => Ok(Input {
-            key: key.into(),
-            text: unquoted(value).into(),
-            secret: false,
-        }),
+    let text = match unquoted(value) {
+        quoted if quoted.len() < value.len() => quoted.replace('$', "$$"),
+        _ => value.to_owned(),
+    };
+    Ok(With::Value {
+        key: key.into(),
+        text,
+    })
+}
+
+fn add(script: &mut Script, with: With, number: usize) -> Result<()> {
+    if !script.withs.contains(&with) {
+        anyhow::ensure!(
+            !taken(script, with.key()),
+            "line {number}: {:?} already has a value",
+            with.key()
+        );
+        script.withs.push(with);
     }
+    Ok(())
+}
+
+pub(super) fn resolved(
+    text: &str,
+    given: &[Input],
+    read: &mut Vec<Input>,
+) -> Result<(String, bool)> {
+    let mut secret = false;
+    let text = substitute(text, |name, _| {
+        let text = value_of(name, given, read)?;
+        secret |= given
+            .iter()
+            .chain(read.iter())
+            .any(|input| input.key == name && input.secret);
+        Ok(text)
+    })?;
+    Ok((text, secret))
+}
+
+pub(super) fn located_path(
+    base: &Path,
+    path: &str,
+    given: &[Input],
+    read: &mut Vec<Input>,
+) -> Result<String> {
+    let (path, _) = resolved(path, given, read)?;
+    std::path::absolute(base.join(&path))
+        .map(|absolute| absolute.to_string_lossy().into_owned())
+        .with_context(|| format!("cannot find {path}"))
 }
 
 #[cfg(test)]
@@ -754,22 +922,55 @@ mod tests {
                 (8, Step::See("Total".into())),
             ]
         );
-        assert_eq!(script.inputs[0].text, "qa@example.com");
-        assert!(script.inputs[1].secret && !script.inputs[1].text.is_empty());
+        assert_eq!(texts(&script), ["qa@example.com", "$PATH"]);
         let quoted =
             parse("with query = say \"hi\"\nwith height = \"6'2\"\"\nsee \"He said \"hi\"\"")
                 .unwrap();
-        let texts: Vec<_> = quoted
-            .inputs
-            .iter()
-            .map(|input| input.text.as_str())
-            .collect();
-        assert_eq!(texts, ["say \"hi\"", "6'2\""]);
+        assert_eq!(texts(&quoted), ["say \"hi\"", "6'2\""]);
+        let price = parse("with price = \"$5\"\ndo pay").unwrap();
         assert_eq!(
-            parse("with price = \"$5\"\ndo pay").unwrap().inputs[0].text,
-            "$5"
+            resolved(texts(&price)[0], &[], &mut Vec::new()).unwrap(),
+            ("$5".into(), false)
         );
         assert_eq!(quoted.steps[0].1, Step::See("He said \"hi\"".into()));
+    }
+
+    fn texts(script: &Script) -> Vec<&str> {
+        script
+            .withs
+            .iter()
+            .filter_map(|with| match with {
+                With::Value { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_with_value_or_path_reads_names_anywhere_in_it() {
+        let home = std::env::var("HOME").unwrap();
+        let given = [Input {
+            key: "host".into(),
+            text: "localhost".into(),
+            secret: false,
+        }];
+        let mut read = Vec::new();
+        for (text, value, secret) in [
+            (
+                "http://$host:$$9/x",
+                "http://localhost:$9/x".to_owned(),
+                false,
+            ),
+            ("$HOME/report", format!("{home}/report"), true),
+            ("$5", "$5".to_owned(), false),
+        ] {
+            assert_eq!(resolved(text, &given, &mut read).unwrap(), (value, secret));
+        }
+        assert_eq!(
+            located_path(Path::new("/e2e"), "$HOME/a.pdf", &given, &mut read).unwrap(),
+            format!("{home}/a.pdf")
+        );
+        assert!(read.iter().any(|input| input.key == "HOME" && input.secret));
     }
 
     #[test]
@@ -786,12 +987,22 @@ mod tests {
                 secret: false,
             },
         ];
-        let inputs = inputs("search for \"red shirt\" in \"Shop\" as \"email\"", &given);
+        let inputs = inputs(
+            "search for \"red shirt\" in \"Shop\" as \"email\"",
+            &given,
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
         let texts: Vec<_> = inputs.iter().map(|input| input.text.as_str()).collect();
         assert_eq!(texts, ["red shirt", "Shop", "email", "qa@example.com"]);
         let keys: HashSet<_> = inputs.iter().map(|input| input.key.as_str()).collect();
         assert_eq!(keys.len(), inputs.len());
-        assert!(super::inputs("set the height to 6'2\" tall", &[]).is_empty());
+        assert!(
+            super::inputs("set the height to 6'2\" tall", &[], &[], &mut Vec::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -813,22 +1024,21 @@ mod tests {
         assert!(parse("with \"city\" = Paris\ndo go").is_err());
         let quoted =
             parse("with reply = \"run late\"\nwith label = \"file not found\"\ndo go").unwrap();
-        assert!(quoted.commands.is_empty() && quoted.files.is_empty());
-        assert_eq!(
-            quoted
-                .inputs
-                .iter()
-                .map(|input| input.text.as_str())
-                .collect::<Vec<_>>(),
-            ["run late", "file not found"]
-        );
+        assert_eq!(texts(&quoted), ["run late", "file not found"]);
+        assert_eq!(quoted.withs.len(), 2);
         assert!(format!("{:#}", parse("with nothing").unwrap_err()).contains("line 1"));
+        for wrong in ["with ../out = zip fixtures", "with a/b = file a.txt"] {
+            assert!(
+                format!("{:#}", parse(wrong).unwrap_err())
+                    .contains("line 1: write it as: with name = file path"),
+                "{wrong}"
+            );
+        }
         assert!(
-            format!(
-                "{:#}",
-                parse("with key = $IU2U_UNSET_FOR_TEST").unwrap_err()
-            )
-            .contains("IU2U_UNSET_FOR_TEST")
+            resolved("$IU2U_UNSET_FOR_TEST", &[], &mut Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("IU2U_UNSET_FOR_TEST")
         );
         for wrong in [
             "see \"Saved\" within 1.5s",
@@ -890,7 +1100,10 @@ mod tests {
                         headers: Vec::new(),
                         body: Some(Body::Form(vec![
                             ("name".into(), Part::Text("Campus 2026".into())),
-                            ("files".into(), Part::File("fixtures/a.zip".into())),
+                            (
+                                "files".into(),
+                                Part::File(".".into(), "fixtures/a.zip".into())
+                            ),
                         ])),
                     })
                 ),
@@ -945,7 +1158,10 @@ mod tests {
                 Step::Route(Route {
                     pattern: "*/api/y".into(),
                     once: false,
-                    reply: Reply::Answer(200, Some(Part::File("fixtures/y.json".into()))),
+                    reply: Reply::Answer(
+                        200,
+                        Some(Part::File(".".into(), "fixtures/y.json".into()))
+                    ),
                 }),
                 Step::Route(Route {
                     pattern: "*/diff".into(),
@@ -1021,6 +1237,31 @@ mod tests {
     }
 
     #[test]
+    fn a_value_after_the_question_mark_of_an_address_is_encoded() {
+        let given = [
+            Input {
+                key: "base".into(),
+                text: "http://shop.test:3000".into(),
+                secret: false,
+            },
+            Input {
+                key: "token".into(),
+                text: "ab+c/d= &#ñ".into(),
+                secret: false,
+            },
+        ];
+        assert_eq!(
+            expand_url(
+                "$base/reset?token=$token&next=$base",
+                &given,
+                &mut Vec::new()
+            )
+            .unwrap(),
+            "http://shop.test:3000/reset?token=ab%2Bc%2Fd%3D%20%26%23%C3%B1&next=http%3A%2F%2Fshop.test%3A3000"
+        );
+    }
+
+    #[test]
     fn a_value_inside_a_json_string_is_escaped_and_one_outside_is_not() {
         let value = |key: &str, text: &str| Input {
             key: key.into(),
@@ -1060,8 +1301,7 @@ mod tests {
         )
         .unwrap();
         let script = parse_in("use sign-in.part\nrun echo out\nuse sign-in.part\n", &base).unwrap();
-        assert_eq!(script.inputs.len(), 1);
-        assert_eq!(script.commands.len(), 1);
+        assert_eq!(script.withs.len(), 2);
         assert_eq!(
             script
                 .steps
@@ -1085,6 +1325,23 @@ mod tests {
     }
 
     #[test]
+    fn an_app_given_by_its_path_is_found_beside_the_script() {
+        let steps: Vec<_> = parse_in("app ../build/Foo.app\napp Notes\n", Path::new("/e2e"))
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|(_, step, _)| step)
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                Step::App("/e2e/../build/Foo.app".into()),
+                Step::App("Notes".into())
+            ]
+        );
+    }
+
+    #[test]
     fn commands_services_injections_absences_and_used_files_are_steps() {
         let base = std::env::temp_dir().join(format!("iu2u-use-{}", std::process::id()));
         std::fs::create_dir_all(base.join("parts")).unwrap();
@@ -1095,13 +1352,17 @@ mod tests {
         .unwrap();
         std::fs::write(base.join("more.e2e"), "do sign in\n").unwrap();
         let script = parse_in(
-            "with token = run node token.mjs viewer\nrun curl -s http://x | wc -l within 30s\nstart api = PT_KEY=1 node api.js at http://127.0.0.1:5300/api/health\nstart linear = node fake.mjs\nlogs api\ninject delete window.showDirectoryPicker\nsee no \"Error\" within 2s\nsee \"no results\"\nuse parts/sign-in.e2e\n",
+            "with token = run node token.mjs viewer within 5m\nrun curl -s http://x | wc -l within 30s\nstart api = PT_KEY=1 node api.js at http://127.0.0.1:5300/api/health\nstart linear = node fake.mjs\nlogs api\ninject delete window.showDirectoryPicker\nsee no \"Error\" within 2s\nsee \"no results\"\nuse parts/sign-in.e2e\n",
             &base,
         )
         .unwrap();
         assert_eq!(
-            script.commands,
-            [("token".into(), "node token.mjs viewer".into())]
+            script.withs,
+            [With::Run {
+                key: "token".into(),
+                command: "node token.mjs viewer".into(),
+                within: Some(Duration::from_secs(300)),
+            }]
         );
         assert_eq!(
             parse("extract slug = the prototype address").unwrap().steps,

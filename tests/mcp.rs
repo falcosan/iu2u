@@ -168,8 +168,13 @@ async fn the_server_starts_without_a_model_and_reads_the_config_file_at_each_cal
     assert_eq!(asked, [json!("model-a"), json!("model-b")]);
 }
 
-#[test]
-fn file_tools_resolve_relative_paths_from_the_project_folder() {
+#[tokio::test]
+async fn file_tools_resolve_relative_paths_from_the_project_folder() {
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(reply(json!({ "relevant": yes(0.9) })))
+        .mount(&model)
+        .await;
     let project = temp_path("mcp-project");
     let elsewhere = temp_path("mcp-elsewhere");
     std::fs::create_dir_all(&project).unwrap();
@@ -181,7 +186,7 @@ fn file_tools_resolve_relative_paths_from_the_project_folder() {
         .env_clear()
         .env("CLAUDE_PROJECT_DIR", &project)
         .env("IU2U_MODEL", "model-x")
-        .env("IU2U_BASE_URL", "http://127.0.0.1:9")
+        .env("IU2U_BASE_URL", model.uri())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -199,7 +204,7 @@ fn file_tools_resolve_relative_paths_from_the_project_folder() {
         }}),
         json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
         json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-            "name": "seek", "arguments": { "query": "retries", "files": ["notes.md"] }
+            "name": "seek", "arguments": { "query": "retries", "files": ["notes.md", "./notes.md"] }
         }}),
     ] {
         writeln!(input, "{message}").unwrap();
@@ -213,5 +218,7 @@ fn file_tools_resolve_relative_paths_from_the_project_folder() {
         .to_string();
     server.kill().unwrap();
     server.wait().unwrap();
-    assert!(text.contains("decision model unreachable"), "{text}");
+    let found: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(found["excerpts"], 1, "{text}");
+    assert_eq!(found["matches"][0]["file"], "notes.md", "{text}");
 }

@@ -129,7 +129,7 @@ async fn an_unknown_effort_is_refused_before_claude_runs() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2));
     assert!(
-        stderr.contains("IU2U_EFFORT must be one of low, medium, high, xhigh, max, not hi"),
+        stderr.contains("IU2U_EFFORT must be one of low, medium, high, xhigh, max"),
         "{stderr}"
     );
 }

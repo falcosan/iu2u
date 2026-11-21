@@ -1,24 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use percent_encoding::percent_decode_str;
 
 use crate::clip;
 
-pub(super) const MAX_ELEMENTS: usize = 254;
-const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'!')
-    .remove(b'~')
-    .remove(b'*')
-    .remove(b'\'')
-    .remove(b'(')
-    .remove(b')');
+pub(super) const MAX_ELEMENTS: usize = crate::model::MAX_OPTIONS - 1;
 pub(super) const HEADER: &str = "response header";
 pub(super) const VALUE_CHARS: usize = 200;
 const FOCUSED: &str = " · focused";
+const MAX_REFERENCE_BYTES: usize = 10;
 const SECTIONS: [&str; 14] = [
     "alertdialog",
     "banner",
@@ -78,7 +69,7 @@ pub(super) struct Screen {
     pub(super) text: String,
     pub(super) visible: String,
     pub(super) pages: String,
-    pub(super) addresses: String,
+    pub(super) raw_fields: Vec<String>,
     pub(super) elements: Vec<Element>,
     pub(super) omitted: usize,
     pub(super) candidates: Vec<Candidate>,
@@ -88,6 +79,7 @@ pub(super) struct Screen {
     pub(super) hovers: bool,
     pub(super) spots: bool,
     pub(super) tail: bool,
+    pub(super) fits: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -148,7 +140,59 @@ impl Element {
     }
 }
 
+pub(super) fn named_by_contents(name: &str, role: &str, states: &[&str]) -> bool {
+    name.is_empty() && (role == "row" || states.contains(&"clickable"))
+}
+
+pub(super) fn name_by_contents(nodes: &mut [Node], at: usize) {
+    if named_by_contents(&nodes[at].name, &nodes[at].role, &nodes[at].states) {
+        let mut names = Vec::new();
+        contents(nodes, at, &mut names);
+        nodes[at].name = names.join(" ");
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn withhold_unfinished(nodes: &mut [Node], unfinished: impl IntoIterator<Item = usize>) {
+    let mut parents = vec![None; nodes.len()];
+    for (at, node) in nodes.iter().enumerate() {
+        for &child in &node.children {
+            if let Some(parent) = parents.get_mut(child) {
+                *parent = Some(at);
+            }
+        }
+    }
+    let mut withheld = vec![false; nodes.len()];
+    for mut at in unfinished {
+        while at < nodes.len() && !withheld[at] {
+            withheld[at] = true;
+            let Some(parent) = parents[at] else { break };
+            at = parent;
+        }
+    }
+    for (node, withheld) in nodes.iter_mut().zip(withheld) {
+        if withheld && named_by_contents(&node.name, &node.role, &node.states) {
+            node.kind = None;
+        }
+    }
+}
+
+pub(super) fn contents(arena: &[Node], at: usize, names: &mut Vec<String>) {
+    for &child in &arena[at].children {
+        match arena.get(child) {
+            Some(node) if !node.name.is_empty() => names.push(node.name.clone()),
+            Some(_) => contents(arena, child, names),
+            None => {}
+        }
+    }
+}
+
 impl Screen {
+    pub(super) fn shown(&self) -> usize {
+        let floor = super::decide::SCREEN_CHARS_WITHOUT_CONTEXT;
+        self.fits.map_or(floor, |fits| fits.max(floor))
+    }
+
     pub(super) fn new(nodes: &[Node], secrets: &[(&str, String)]) -> Self {
         let hider = Hider::new(secrets);
         let hide = |text: &str| hider.hide(text);
@@ -183,7 +227,13 @@ impl Screen {
                 screen.shows_secret |= name != node.name
                     || whole_value != node.value
                     || description != node.description;
-                screen.line(node, [&name, &value, &description, &url], depth);
+                screen.line(node, [&name, &whole_value, &description, &url], depth);
+                screen.raw_fields.extend(
+                    [&node.name, &node.value, &node.description, &node.url]
+                        .into_iter()
+                        .filter(|field| !field.is_empty())
+                        .cloned(),
+                );
                 for (field, text, raw) in [
                     ("name", &name, &node.name),
                     ("value", &whole_value, &node.value),
@@ -218,10 +268,13 @@ impl Screen {
                 .filter(|_| !node.states.contains(&"disabled"))
             {
                 let (kind, raw_options) = match kind {
-                    Kind::Choose(options) => (
-                        Kind::Choose(options.iter().map(|option| hide(option)).collect()),
-                        options,
-                    ),
+                    Kind::Choose(options) => {
+                        screen.raw_fields.extend(options.iter().cloned());
+                        (
+                            Kind::Choose(options.iter().map(|option| hide(option)).collect()),
+                            options,
+                        )
+                    }
                     kind => (kind, Vec::new()),
                 };
                 screen.push(Element {
@@ -252,7 +305,7 @@ impl Screen {
             let around = if node.role.is_empty() {
                 parent
             } else {
-                (name.clone(), value.clone())
+                (name.clone(), whole_value.clone())
             };
             stack.extend(
                 node.children
@@ -291,7 +344,7 @@ impl Screen {
     }
 
     fn line(&mut self, node: &Node, [name, value, description, url]: [&str; 4], depth: usize) {
-        let mut line = summary(&node.role, name, value, &node.states);
+        let mut line = summary(&node.role, name, &clip(value, VALUE_CHARS), &node.states);
         if !description.is_empty() {
             write!(line, " · description {description:?}").ok();
         }
@@ -305,9 +358,6 @@ impl Screen {
             words(&format!("{name} {value} {description}"))
         )
         .ok();
-        if !url.is_empty() {
-            write!(self.addresses, "{url} ").ok();
-        }
         if node.role == "page" {
             write!(self.pages, "{url} ").ok();
         }
@@ -327,24 +377,21 @@ impl Screen {
     }
 
     pub(super) fn reveals(&self, secret: &str) -> bool {
-        let squeeze = |text: &str| {
-            text.chars()
-                .filter(|c| !c.is_whitespace())
-                .collect::<String>()
-        };
-        let secret = squeeze(secret);
-        let options = self
-            .elements
+        let (squeezed, spaced) = (squeeze(secret), words(secret));
+        let hidden: usize = self
+            .raw_fields
             .iter()
-            .filter_map(|element| match &element.kind {
-                Kind::Choose(options) => Some(options.join(" ")),
-                _ => None,
-            });
-        !secret.is_empty()
-            && [self.visible.clone(), self.addresses.clone()]
-                .into_iter()
-                .chain(options)
-                .any(|text| squeeze(&text).contains(&secret))
+            .map(|field| {
+                field.matches(secret).count()
+                    + if spaced == secret {
+                        0
+                    } else {
+                        field.matches(spaced.as_str()).count()
+                    }
+            })
+            .sum();
+        let fields: String = self.raw_fields.iter().map(|field| squeeze(field)).collect();
+        !squeezed.is_empty() && fields.matches(squeezed.as_str()).count() > hidden
     }
 
     pub(super) fn fingerprint(&self) -> String {
@@ -420,24 +467,7 @@ impl<'a> Hider<'a> {
         let mut forms: Vec<(String, &str)> = secrets
             .iter()
             .flat_map(|(secret, label)| {
-                let quoted = serde_json::to_string(secret).unwrap_or_default();
-                let escaped = quoted
-                    .get(1..quoted.len().saturating_sub(1))
-                    .unwrap_or_default()
-                    .to_owned();
-                [
-                    (secret.to_string(), label.as_str()),
-                    (words(secret), label),
-                    (escaped, label),
-                    (
-                        form_urlencoded::byte_serialize(secret.as_bytes()).collect(),
-                        label,
-                    ),
-                    (
-                        utf8_percent_encode(secret, URI_COMPONENT).to_string(),
-                        label,
-                    ),
-                ]
+                [(secret.to_string(), label.as_str()), (words(secret), label)]
             })
             .filter(|(form, _)| !form.is_empty())
             .collect();
@@ -447,12 +477,144 @@ impl<'a> Hider<'a> {
     }
 
     pub(super) fn hide(&self, text: &str) -> String {
-        self.forms
+        let bytes = text.as_bytes();
+        let mut spans: Vec<(usize, usize, &str)> = self
+            .forms
             .iter()
-            .fold(text.to_owned(), |text, (form, label)| {
-                text.replace(form, label)
+            .flat_map(|(form, label)| {
+                let mut failed = HashSet::new();
+                (0..bytes.len()).filter_map(move |at| {
+                    Some((at, at + spelled(&bytes[at..], form, &mut failed)?, *label))
+                })
             })
+            .collect();
+        spans.sort_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
+        let mut hidden = String::with_capacity(text.len());
+        let mut kept = 0;
+        for (start, end, label) in spans {
+            if end <= kept {
+                continue;
+            }
+            if start > kept {
+                hidden.push_str(&text[kept..start]);
+            }
+            hidden.push_str(label);
+            kept = end;
+        }
+        hidden.push_str(&text[kept..]);
+        hidden
     }
+}
+
+fn spelled(text: &[u8], form: &str, failed: &mut HashSet<(usize, usize)>) -> Option<usize> {
+    let Some(character) = form.chars().next() else {
+        return Some(0);
+    };
+    let first = form.as_bytes()[0];
+    if !text
+        .first()
+        .is_some_and(|&byte| byte == first || matches!(byte, b'%' | b'&' | b'\\' | b'+'))
+        || failed.contains(&(text.len(), form.len()))
+    {
+        return None;
+    }
+    let rest = &form[character.len_utf8()..];
+    let found = [
+        literal(text, character),
+        plus_for_space(text, character),
+        percent_encoded(text, character),
+        referenced(text, character),
+        unicode_escaped(text, character),
+        json_escaped(text, character),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|length| Some(length + spelled(&text[length..], rest, failed)?));
+    if found.is_none() {
+        failed.insert((text.len(), form.len()));
+    }
+    found
+}
+
+fn literal(text: &[u8], character: char) -> Option<usize> {
+    let mut utf8 = [0; 4];
+    let bytes = character.encode_utf8(&mut utf8).as_bytes();
+    text.starts_with(bytes).then_some(bytes.len())
+}
+
+fn plus_for_space(text: &[u8], character: char) -> Option<usize> {
+    (character == ' ' && text.first() == Some(&b'+')).then_some(1)
+}
+
+fn percent_encoded(text: &[u8], character: char) -> Option<usize> {
+    let mut utf8 = [0; 4];
+    character
+        .encode_utf8(&mut utf8)
+        .bytes()
+        .try_fold(0, |at, byte| match text.get(at..at + 3)? {
+            [b'%', high, low] if hex(&[*high, *low]) == Some(u32::from(byte)) => Some(at + 3),
+            _ => None,
+        })
+}
+
+fn referenced(text: &[u8], character: char) -> Option<usize> {
+    let end = text
+        .iter()
+        .take(MAX_REFERENCE_BYTES)
+        .position(|&byte| byte == b';')?;
+    let name = std::str::from_utf8(text[..end].strip_prefix(b"&")?).ok()?;
+    let named = match name {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => name.strip_prefix('#').and_then(|number| {
+            match number.strip_prefix(['x', 'X']) {
+                Some(digits) => hex(digits.as_bytes()),
+                None => number
+                    .bytes()
+                    .all(|digit| digit.is_ascii_digit())
+                    .then(|| number.parse().ok())
+                    .flatten(),
+            }
+            .and_then(char::from_u32)
+        }),
+    };
+    (named == Some(character)).then_some(end + 1)
+}
+
+fn unicode_escaped(text: &[u8], character: char) -> Option<usize> {
+    let mut units = [0; 2];
+    character
+        .encode_utf16(&mut units)
+        .iter()
+        .try_fold(0, |at, &unit| {
+            let digits = text.get(at..at + 6)?.strip_prefix(b"\\u")?;
+            (hex(digits) == Some(u32::from(unit))).then_some(at + 6)
+        })
+}
+
+fn json_escaped(text: &[u8], character: char) -> Option<usize> {
+    let escape = match character {
+        '"' => b'"',
+        '\\' => b'\\',
+        '/' => b'/',
+        '\n' => b'n',
+        '\t' => b't',
+        '\r' => b'r',
+        '\u{8}' => b'b',
+        '\u{c}' => b'f',
+        _ => return None,
+    };
+    (text.get(..2) == Some(&[b'\\', escape][..])).then_some(2)
+}
+
+fn hex(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
 }
 
 pub(super) fn without_focus(text: &str) -> String {
@@ -559,6 +721,10 @@ fn summary(role: &str, name: &str, value: &str, states: &[&str]) -> String {
     text
 }
 
+pub(super) fn squeeze(text: &str) -> String {
+    text.split_whitespace().collect()
+}
+
 fn tight(text: &str) -> Vec<char> {
     let mut tight: Vec<char> = Vec::new();
     let mut spaced = false;
@@ -616,6 +782,21 @@ mod tests {
     }
 
     #[test]
+    fn a_row_whose_contents_were_not_all_read_is_not_offered() {
+        let row = |children: &[usize]| node("row", "", Some(Kind::Press), children);
+        let mut nodes = [
+            node("", "", None, &[1, 3]),
+            row(&[2]),
+            node("cell", "", None, &[]),
+            row(&[4]),
+            node("text", "Invoice", None, &[]),
+        ];
+        withhold_unfinished(&mut nodes, [2]);
+        let kinds: Vec<_> = nodes.iter().map(|node| node.kind.clone()).collect();
+        assert_eq!(kinds, [None, None, None, Some(Kind::Press), None]);
+    }
+
+    #[test]
     fn text_that_repeats_its_control_is_shown_once() {
         let nodes = [
             node("", "", None, &[1]),
@@ -661,6 +842,20 @@ mod tests {
             Screen::new(&nodes, &[]).text,
             "- textbox \"Email\" = \"old@x.io\"\n"
         );
+        let long = "note ".repeat(60) + "Regards, Ada";
+        let notes = Node {
+            value: long.clone(),
+            ..node("textbox", "Notes", Some(Kind::Type), &[2])
+        };
+        let nodes = [
+            node("", "", None, &[1]),
+            notes,
+            node("text", &long, None, &[]),
+        ];
+        let screen = Screen::new(&nodes, &[]);
+        assert_eq!(screen.text.lines().count(), 1);
+        assert!(!screen.text.contains("Regards, Ada"));
+        assert!(screen.visible.contains("Regards, Ada"));
     }
 
     #[test]
@@ -857,7 +1052,75 @@ mod tests {
             ("abc123XYZ", "(secret \"token\")".to_string()),
             ("a b", "(secret \"pair\")".to_string()),
         ];
-        assert_eq!(Hider::new(&secrets).forms.len(), 4);
+        assert_eq!(Hider::new(&secrets).forms.len(), 2);
+    }
+
+    #[test]
+    fn a_secret_of_repeated_escapes_is_found_without_trying_every_split() {
+        let secret = "\\".repeat(24) + "z";
+        let secrets = [(secret.as_str(), "$A".to_string())];
+        let started = std::time::Instant::now();
+        let hidden = Hider::new(&secrets).hide(&("\\".repeat(48) + "z"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(hidden, "$A");
+    }
+
+    #[test]
+    fn a_secret_is_hidden_however_an_address_encodes_it() {
+        let secrets = [("contraseña @1~", "(secret \"password\")".to_string())];
+        let hider = Hider::new(&secrets);
+        for spelled in [
+            "contrase%C3%B1a%20@1~",
+            "contrase%c3%b1a+%401%7E",
+            "contraseña+%401~",
+            "%63ontraseña%20@1~",
+        ] {
+            assert_eq!(
+                hider.hide(&format!("/login?pw={spelled}&next=ñ")),
+                "/login?pw=(secret \"password\")&next=ñ"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_secrets_and_escaped_spellings_leave_no_piece_shown() {
+        let secrets = [
+            ("abcdef", "(secret \"one\")".to_string()),
+            ("defghi", "(secret \"two\")".to_string()),
+            ("Tr0ub4dor&3'ñ", "(secret \"three\")".to_string()),
+        ];
+        let hider = Hider::new(&secrets);
+        assert_eq!(
+            hider.hide("x abcdefghi y"),
+            "x (secret \"one\")(secret \"two\") y"
+        );
+        for spelled in [
+            "Tr0ub4dor&amp;3&#39;&#241;",
+            "Tr0ub4dor&amp;3&#x27;\\u00f1",
+            "Tr0ub4dor&#38;3&apos;ñ",
+        ] {
+            assert_eq!(
+                hider.hide(&format!("<p>{spelled}</p>")),
+                "<p>(secret \"three\")</p>"
+            );
+        }
+        let split = [
+            node("", "", None, &[1, 2]),
+            node("text", "admin2024", None, &[]),
+            node("text", "secret", None, &[]),
+        ];
+        let secrets = [
+            ("admin", "(secret \"user\")".to_string()),
+            ("admin2024secret", "(secret \"password\")".to_string()),
+        ];
+        let screen = Screen::new(&split, &secrets);
+        assert!(screen.reveals("admin2024secret") && !screen.reveals("admin"));
+        let named = [
+            node("", "", None, &[1]),
+            node("text", "my token here", None, &[]),
+        ];
+        let secrets = [("token", "(secret \"token\")".to_string())];
+        assert!(!Screen::new(&named, &secrets).reveals("token"));
     }
 
     #[test]
@@ -874,6 +1137,10 @@ mod tests {
         )];
         let screen = Screen::new(&[node("", "", None, &[1]), line], &secrets);
         assert!(!screen.text.contains("Secret-Value-42"), "{}", screen.text);
+        let slashed = node("text", r#"{"token":"ab\/cd-long-token"}"#, None, &[]);
+        let secrets = [("ab/cd-long-token", "(secret \"token\")".to_string())];
+        let screen = Screen::new(&[node("", "", None, &[1]), slashed], &secrets);
+        assert!(!screen.text.contains("long-token"), "{}", screen.text);
     }
 
     #[test]
