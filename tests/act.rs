@@ -3213,22 +3213,11 @@ async fn a_press_whose_effect_comes_late_is_not_pressed_again() {
 }
 
 #[tokio::test]
-async fn enter_in_one_field_and_then_in_the_next_is_not_a_repeat() {
+async fn enter_in_a_field_focused_on_a_late_first_frame_and_then_in_the_next_is_not_a_repeat() {
     let model = mock([("Sent", does("done")), ("", does("enter"))]).await;
     let script = script(
         "two-enters",
-        "<!doctype html><label>Code <input value=\"12\" autofocus onkeydown=\"if (event.key === 'Enter') next.focus()\"></label><label>Check <input id=\"next\" value=\"34\" onkeydown=\"if (event.key === 'Enter') out.textContent = 'Sent'\"></label><p id=\"out\"></p>",
-        "open PAGE\ndo submit the code\n",
-    );
-    passes(&script, &model);
-}
-
-#[tokio::test]
-async fn a_field_focused_on_a_late_first_frame_is_read_as_focused() {
-    let model = mock([("Sent", does("done")), ("", does("enter"))]).await;
-    let script = script(
-        "late-frame",
-        "<!doctype html><input aria-label=\"Code\" onkeydown=\"if (event.key === 'Enter') out.textContent = 'Sent'\"><p id=\"out\"></p><script>const frame = requestAnimationFrame; window.requestAnimationFrame = callback => setTimeout(() => frame(callback), 300); requestAnimationFrame(() => document.querySelector('input').focus());</script>",
+        "<!doctype html><label>Code <input value=\"12\" onkeydown=\"if (event.key === 'Enter') next.focus()\"></label><label>Check <input id=\"next\" value=\"34\" onkeydown=\"if (event.key === 'Enter') out.textContent = 'Sent'\"></label><p id=\"out\"></p><script>const frame = requestAnimationFrame; window.requestAnimationFrame = callback => setTimeout(() => frame(callback), 300); requestAnimationFrame(() => document.querySelector('input').focus());</script>",
         "open PAGE\ndo submit the code\n",
     );
     passes(&script, &model);
@@ -5090,15 +5079,22 @@ fn a_service_that_never_answers_says_why() {
 #[test]
 fn a_service_that_answers_only_with_an_error_says_which() {
     let port = free_port();
+    let server = temp_path("not-found.py");
+    std::fs::write(
+        &server,
+        "import socket, sys\nport = int(sys.argv[1])\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', port))\ns.listen()\nwhile True:\n    c, _ = s.accept()\n    c.recv(65536)\n    c.sendall(b'HTTP/1.1 404 Not Found\\r\\ncontent-length: 0\\r\\nconnection: close\\r\\n\\r\\n')\n    c.close()\n",
+    )
+    .unwrap();
     let script = script(
         "not-found",
         "",
         &format!(
-            "start web = python3 -m http.server {port} --bind 127.0.0.1 at http://127.0.0.1:{port}/missing within 10s\n"
+            "start web = python3 {} {port} at http://127.0.0.1:{port}/missing within 2s\n",
+            server.display()
         ),
     );
     let report = exits(2, act(&script, None, false));
-    has(&report, "/error", "answered only 404 Not Found within 10s");
+    has(&report, "/error", "answered only 404 Not Found within 2s");
 }
 
 #[test]
