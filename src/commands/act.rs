@@ -655,7 +655,7 @@ impl Run<'_> {
             self.close().await;
             let browser = Browser::launch(self.suite.headful, &self.suite.dir).await?;
             self.suite.browsers.extend(browser.group());
-            self.surface = Some(Surface::Browser(browser));
+            self.surface = Some(Surface::Browser(Box::new(browser)));
         }
         let Some(Surface::Browser(browser)) = &mut self.surface else {
             unreachable!()

@@ -6,8 +6,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    answer_always, answer_when, client, config, config_home, fail_always, iu2u, temp_path, text,
-    yes,
+    answer_always, answer_when, cleared_env, client, config, config_home, fail_always, iu2u,
+    temp_path, text, yes,
 };
 use futures_util::{StreamExt, stream};
 use iu2u::commands;
@@ -271,7 +271,7 @@ fn config_shows_each_value_and_where_it_comes_from() {
         "config-origins",
         "model = \"decision\"\ntimeout_ms = 5000\n",
     );
-    let file = home.join("iu2u/config.toml");
+    let file = home.join("iu2u").join("config.toml");
     let env = [("IU2U_MODEL", "claude"), ("IU2U_API_KEY", "secret-key")];
     assert_eq!(
         text(&config(&home, &env, &["get", "model"]).stdout),
@@ -403,7 +403,7 @@ fn a_bad_config_file_is_named_with_its_key_or_line_and_left_alone() {
         ("config-syntax", "model = \"x\"\nguard =\n", "line 2"),
     ] {
         let home = config_home(name, written);
-        let file = home.join("iu2u/config.toml");
+        let file = home.join("iu2u").join("config.toml");
         for args in [[].as_slice(), &["set", "guard", "false"]] {
             let output = config(&home, &[], args);
             let stderr = text(&output.stderr);
@@ -460,20 +460,17 @@ fn config_unset_removes_a_key_the_file_got_wrong() {
 
 #[test]
 fn without_a_home_only_the_environment_is_read() {
-    let output = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .args(["config", "path"])
-        .env_clear()
+    let output = cleared_env(Command::new(env!("CARGO_BIN_EXE_iu2u")).args(["config", "path"]))
         .env("XDG_CONFIG_HOME", "relative/dir")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(text(&output.stderr).contains("XDG_CONFIG_HOME"));
-    let effort = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .args(["config", "get", "effort"])
-        .env_clear()
-        .env("IU2U_EFFORT", "high")
-        .output()
-        .unwrap();
+    let effort =
+        cleared_env(Command::new(env!("CARGO_BIN_EXE_iu2u")).args(["config", "get", "effort"]))
+            .env("IU2U_EFFORT", "high")
+            .output()
+            .unwrap();
     assert_eq!(text(&effort.stdout), "high\n");
 }
 

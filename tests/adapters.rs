@@ -8,15 +8,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 async fn filter(lines: &str, env: &[(&str, &str)]) -> Output {
-    let mut filter = Command::new(env!("CARGO_BIN_EXE_iu2u"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_iu2u"));
+    common::cleared_env(command.as_std_mut())
         .args(["filter", "This line reports a problem"])
-        .env_clear()
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    let mut filter = command.spawn().unwrap();
     let mut input = filter.stdin.take().unwrap();
     input.write_all(lines.as_bytes()).await.unwrap();
     drop(input);

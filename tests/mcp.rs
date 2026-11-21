@@ -3,7 +3,7 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
-use common::{client, reply, temp_path, yes};
+use common::{cleared_env, client, reply, temp_path, yes};
 use iu2u::mcp::Server;
 use rmcp::{RoleClient, ServiceExt, model::CallToolRequestParams, service::RunningService};
 use serde_json::{Value, json};
@@ -108,9 +108,7 @@ async fn the_server_starts_without_a_model_and_reads_the_config_file_at_each_cal
         .await;
     let home = temp_path("mcp-config");
     std::fs::create_dir_all(home.join("iu2u")).unwrap();
-    let mut server = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .arg("mcp")
-        .env_clear()
+    let mut server = cleared_env(Command::new(env!("CARGO_BIN_EXE_iu2u")).arg("mcp"))
         .env("XDG_CONFIG_HOME", &home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -180,10 +178,8 @@ async fn file_tools_resolve_relative_paths_from_the_project_folder() {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&elsewhere).unwrap();
     std::fs::write(project.join("notes.md"), "retry every request twice").unwrap();
-    let mut server = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .arg("mcp")
+    let mut server = cleared_env(Command::new(env!("CARGO_BIN_EXE_iu2u")).arg("mcp"))
         .current_dir(&elsewhere)
-        .env_clear()
         .env("CLAUDE_PROJECT_DIR", &project)
         .env("IU2U_MODEL", "model-x")
         .env("IU2U_BASE_URL", model.uri())

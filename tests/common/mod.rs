@@ -94,11 +94,15 @@ pub fn without_model(command: &mut std::process::Command) -> &mut std::process::
         .env("XDG_DATA_HOME", &empty)
 }
 
-pub fn config(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .arg("config")
-        .args(args)
+pub fn cleared_env(command: &mut Command) -> &mut Command {
+    command
         .env_clear()
+        .envs(std::env::var_os("SYSTEMROOT").map(|root| ("SYSTEMROOT", root)))
+}
+
+pub fn config(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
+    cleared_env(Command::new(env!("CARGO_BIN_EXE_iu2u")).arg("config"))
+        .args(args)
         .env("XDG_CONFIG_HOME", home)
         .envs(env.iter().copied())
         .output()

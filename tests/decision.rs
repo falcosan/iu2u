@@ -103,8 +103,7 @@ fn data(base: &Path) -> PathBuf {
 
 fn iu2u(base: &Path, env: &[(&str, &str)]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_iu2u"));
-    command
-        .env_clear()
+    common::cleared_env(&mut command)
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("XDG_CONFIG_HOME", base)
         .env("XDG_DATA_HOME", base.join("data"))
@@ -525,18 +524,17 @@ fn a_process_whose_binary_was_replaced_still_starts_its_server() {
     let copy = base.join("iu2u-before-upgrade");
     std::fs::copy(env!("CARGO_BIN_EXE_iu2u"), &copy).unwrap();
     let env = iu2u(&base, &[]);
-    let mut filter = Command::new(&copy)
-        .args(["filter", "This line reports a problem"])
-        .env_clear()
-        .envs(
-            env.get_envs()
-                .filter_map(|(name, value)| Some((name, value?))),
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut filter =
+        common::cleared_env(Command::new(&copy).args(["filter", "This line reports a problem"]))
+            .envs(
+                env.get_envs()
+                    .filter_map(|(name, value)| Some((name, value?))),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
     std::fs::remove_file(&copy).unwrap();
     filter
         .stdin
@@ -667,9 +665,8 @@ sys.exit(os.waitstatus_to_exitcode(status))
 fn init_on_a_terminal(base: &Path, answers: &str) -> Output {
     let mut child = iu2u(base, &[]);
     let mut terminal = Command::new(python());
-    terminal
+    common::cleared_env(&mut terminal)
         .args(["-c", TERMINAL, env!("CARGO_BIN_EXE_iu2u"), "init"])
-        .env_clear()
         .envs(
             child
                 .get_envs()

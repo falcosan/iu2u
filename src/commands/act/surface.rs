@@ -28,7 +28,7 @@ pub(super) enum Action {
 }
 
 pub(super) enum Surface {
-    Browser(Browser),
+    Browser(Box<Browser>),
     #[cfg(target_os = "macos")]
     Mac(Mac),
 }

@@ -6,8 +6,8 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
 
 use common::{
-    answer_always, answer_when, client, client_with_timeout, config, config_home, fail_always,
-    reply, temp_path, yes,
+    answer_always, answer_when, cleared_env, client, client_with_timeout, config, config_home,
+    fail_always, reply, temp_path, yes,
 };
 use iu2u::{
     hooks::Power,
@@ -34,9 +34,7 @@ fn irreversible() -> Value {
 }
 
 fn hook_output(power: &str, env: &[(&str, &str)], input: &Value) -> Output {
-    let mut hook = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .args(["hook", power])
-        .env_clear()
+    let mut hook = cleared_env(Command::new(env!("CARGO_BIN_EXE_iu2u")).args(["hook", power]))
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -155,7 +153,8 @@ async fn a_bad_config_file_takes_the_cannot_judge_path_and_says_why() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(permission(&String::from_utf8_lossy(&output.stdout)), "ask");
     assert!(
-        stderr.contains("unknown key `colour`") && stderr.contains("iu2u/config.toml"),
+        stderr.contains("unknown key `colour`")
+            && stderr.contains(&home.join("iu2u").join("config.toml").display().to_string()),
         "{stderr}"
     );
     assert_eq!(
@@ -198,9 +197,7 @@ async fn an_empty_plugin_api_key_is_not_replaced_by_the_shell_one() {
 
 #[test]
 fn switched_off_powers_still_read_their_whole_input() {
-    let mut hook = Command::new(env!("CARGO_BIN_EXE_iu2u"))
-        .args(["hook", "trim"])
-        .env_clear()
+    let mut hook = cleared_env(Command::new(env!("CARGO_BIN_EXE_iu2u")).args(["hook", "trim"]))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
