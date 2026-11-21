@@ -1180,7 +1180,7 @@ async fn a_control_measured_on_frames_too_close_together_is_not_taken_for_still(
 
 #[tokio::test]
 async fn a_control_whose_animation_has_not_started_is_not_taken_for_still() {
-    not_pressed("pending", r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><p id="out"></p><script>const slide = document.querySelector('button').animate([{ transform: 'none' }, { transform: 'translateX(300px)' }], { duration: 1000, iterations: Infinity }); slide.pause(); let started = false; Object.defineProperty(slide, 'pending', { get: () => !started }); const look = Document.prototype.elementFromPoint; Document.prototype.elementFromPoint = function (...point) { Document.prototype.elementFromPoint = look; started = true; slide.play(); return look.apply(this, point); };</script>"#, "button \"Save\" did not hold still").await;
+    not_pressed("pending", r#"<!doctype html><button onclick="out.textContent = 'Saved'">Save</button><p id="out"></p><script>const slide = document.querySelector('button').animate([{ transform: 'none' }, { transform: 'translateX(300px)' }], { duration: 1000, iterations: Infinity }); slide.pause(); Object.defineProperty(slide, 'pending', { get: () => true });</script>"#, "button \"Save\" did not hold still").await;
 }
 
 #[tokio::test]

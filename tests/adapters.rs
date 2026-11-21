@@ -17,7 +17,9 @@ async fn filter(lines: &str, env: &[(&str, &str)]) -> Output {
         .stderr(Stdio::piped());
     let mut filter = command.spawn().unwrap();
     let mut input = filter.stdin.take().unwrap();
-    input.write_all(lines.as_bytes()).await.unwrap();
+    if let Err(error) = input.write_all(lines.as_bytes()).await {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+    }
     drop(input);
     filter.wait_with_output().await.unwrap()
 }
