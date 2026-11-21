@@ -12,7 +12,6 @@ use crate::tail::{KEPT_BYTES, from_a_line, read_tail, tail};
 
 const READY_EVERY: Duration = Duration::from_millis(250);
 const GONE_EVERY: Duration = Duration::from_millis(25);
-const READY_ASK_WITHIN: Duration = Duration::from_secs(1);
 const READ_CHUNK: usize = 1 << 16;
 const STOP_WITHIN: Duration = Duration::from_secs(5);
 const READY_REFUSALS: RangeInclusive<u16> = 400..=403;
@@ -128,15 +127,22 @@ pub(super) async fn start(
     dir: &Path,
     within: Duration,
 ) -> Result<Service> {
-    let answers = async |at: &str| client.get(at).timeout(READY_ASK_WITHIN).send().await;
     if let Some(at) = &start.at {
-        anyhow::ensure!(
-            reqwest::Url::parse(at).is_ok_and(|url| matches!(url.scheme(), "http" | "https")),
-            "{at} is not an http or https address"
+        let url = reqwest::Url::parse(at)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .with_context(|| format!("{at} is not an http or https address"))?;
+        let address = format!(
+            "{}:{}",
+            url.host_str().unwrap_or_default(),
+            url.port_or_known_default().unwrap_or_default()
         );
-        if answers(at).await.is_ok() {
+        if tokio::time::timeout(READY_EVERY, tokio::net::TcpStream::connect(address))
+            .await
+            .is_ok_and(|connected| connected.is_ok())
+        {
             bail!(
-                "something already answers at {at}; stop it before {} starts",
+                "something already listens at {at}; stop it before {} starts",
                 start.name
             );
         }
@@ -154,8 +160,17 @@ pub(super) async fn start(
         let started = Instant::now();
         let (mut answered, mut failed) = (None, None);
         loop {
-            match answers(at).await {
-                Ok(response) => {
+            let asked = client
+                .get(at)
+                .timeout(within.saturating_sub(started.elapsed()).max(READY_EVERY))
+                .send();
+            let answer = tokio::select! {
+                biased;
+                answer = asked => Some(answer),
+                _ = child.wait() => None,
+            };
+            match answer {
+                Some(Ok(response)) => {
                     let status = response.status();
                     if status.is_success()
                         || status.is_redirection()
@@ -165,7 +180,8 @@ pub(super) async fn start(
                     }
                     answered = Some(status);
                 }
-                Err(error) => failed = Some(anyhow::Error::new(error)),
+                Some(Err(error)) => failed = Some(anyhow::Error::new(error)),
+                None => {}
             }
             let ended = child.try_wait()?;
             if ended.is_some() || started.elapsed() >= within {

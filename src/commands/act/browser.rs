@@ -1297,6 +1297,12 @@ impl Browser {
             }
         })
         .await;
+        self.call(
+            "Runtime.evaluate",
+            json!({ "expression": format!("new Promise(done => {{ requestAnimationFrame(done); setTimeout(done, {}); }})", FRAMES_WITHIN.as_millis()), "awaitPromise": true }),
+        )
+        .await
+        .ok();
     }
 
     async fn fresh(&self, element: &Element) -> Result<String> {

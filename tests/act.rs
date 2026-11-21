@@ -160,6 +160,14 @@ fn site_script(name: &str, site: &MockServer, steps: &str) -> std::path::PathBuf
     script(name, "", &steps.replace("SITE", &site.uri()))
 }
 
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 fn shop(name: &str) -> std::path::PathBuf {
     script(name, &SHOP.replace("BUTTON", "Sign in"), SCRIPT)
 }
@@ -3216,6 +3224,17 @@ async fn enter_in_one_field_and_then_in_the_next_is_not_a_repeat() {
 }
 
 #[tokio::test]
+async fn a_field_focused_on_a_late_first_frame_is_read_as_focused() {
+    let model = mock([("Sent", does("done")), ("", does("enter"))]).await;
+    let script = script(
+        "late-frame",
+        "<!doctype html><input aria-label=\"Code\" onkeydown=\"if (event.key === 'Enter') out.textContent = 'Sent'\"><p id=\"out\"></p><script>const frame = requestAnimationFrame; window.requestAnimationFrame = callback => setTimeout(() => frame(callback), 300); requestAnimationFrame(() => document.querySelector('input').focus());</script>",
+        "open PAGE\ndo submit the code\n",
+    );
+    passes(&script, &model);
+}
+
+#[tokio::test]
 async fn a_picker_that_opens_after_its_do_gets_none_of_its_files() {
     let note = temp_path("step-note.txt");
     std::fs::write(&note, "note").unwrap();
@@ -3533,11 +3552,7 @@ async fn a_frame_that_shows_up_while_the_model_looks_does_not_move_the_press() {
 
 #[test]
 fn scripts_run_commands_start_services_read_their_logs_and_reuse_steps() {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let site = temp_path("served");
     std::fs::create_dir_all(&site).unwrap();
     std::fs::write(site.join("page.html"), "<!doctype html><p>Served page</p>").unwrap();
@@ -4523,11 +4538,7 @@ async fn a_replay_ignores_numbers_that_change_unless_the_step_mentions_them() {
 
 #[test]
 fn a_before_script_starts_services_and_values_for_every_script() {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let site = temp_path("suite-site");
     std::fs::create_dir_all(&site).unwrap();
     std::fs::write(site.join("page.html"), "<!doctype html><p>Suite page</p>").unwrap();
@@ -4663,11 +4674,7 @@ async fn a_value_from_the_before_script_can_be_typed() {
 #[tokio::test]
 async fn a_start_that_waits_goes_back_to_the_page() {
     let api = site(&[("/api", "from the api")]).await;
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let script = script(
         "start-within",
         "<!doctype html><p>Page text</p>",
@@ -4965,11 +4972,21 @@ fn an_interrupt_stops_a_run_waiting_for_its_script_on_stdin() {
 }
 
 #[tokio::test]
-async fn a_service_whose_address_already_answers_does_not_start() {
+async fn a_service_whose_address_is_already_taken_does_not_start() {
     let busy = site(&[("/", "old server")]).await;
     let script = site_script("taken-address", &busy, "start web = sleep 30 at SITE/\n");
     let report = exits(2, act(&script, None, false));
-    has(&report, "/error", "already answers");
+    has(&report, "/error", "something already listens");
+    let stuck = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = stuck.local_addr().unwrap().port();
+    let script = self::script(
+        "stuck-address",
+        "",
+        &format!("start web = sleep 30 at http://127.0.0.1:{port}/ within 10s\n"),
+    );
+    let report = exits(2, act(&script, None, false));
+    has(&report, "/error", "something already listens");
+    assert!(report["seconds"].as_f64().unwrap() < 5.0, "{report}");
     let bare = self::script(
         "bare-address",
         "",
@@ -5035,49 +5052,78 @@ fn a_command_still_running_at_its_limit_fails_and_leaves_nothing_behind() {
 
 #[test]
 fn a_service_that_never_answers_says_why() {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let script = script(
+    let gives_up = |name: &str, start: String| {
+        let report = exits(
+            2,
+            act(
+                &script(name, "", &format!("{start} within 1s\n")),
+                None,
+                false,
+            ),
+        );
+        has(
+            &report,
+            "/error",
+            "did not answer within 1s: error sending request",
+        );
+        assert!(report["seconds"].as_f64().unwrap() < 3.0, "{name} {report}");
+        report
+    };
+    let port = free_port();
+    let report = gives_up(
         "never-answers",
-        "",
-        &format!("start idle = sleep 300 at http://127.0.0.1:{port}/ within 1s\n"),
+        format!("start idle = sleep 300 at http://127.0.0.1:{port}/"),
     );
-    let report = exits(2, act(&script, None, false));
-    has(
-        &report,
-        "/error",
-        "did not answer within 1s: error sending request",
+    has(&report, "/error", "refused");
+    gives_up(
+        "unreachable",
+        "start idle = sleep 300 at http://192.0.2.1:9/".into(),
+    );
+    gives_up(
+        "hung",
+        format!(
+            "start idle = python3 -c \"import socket, time; s = socket.socket(); s.bind(('127.0.0.1', {port})); s.listen(); time.sleep(300)\" at http://127.0.0.1:{port}/"
+        ),
     );
 }
 
 #[test]
 fn a_service_that_answers_only_with_an_error_says_which() {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let script = script(
         "not-found",
         "",
         &format!(
-            "start web = python3 -m http.server {port} --bind 127.0.0.1 at http://127.0.0.1:{port}/missing within 2s\n"
+            "start web = python3 -m http.server {port} --bind 127.0.0.1 at http://127.0.0.1:{port}/missing within 10s\n"
         ),
     );
     let report = exits(2, act(&script, None, false));
-    has(&report, "/error", "answered only 404 Not Found within 2s");
+    has(&report, "/error", "answered only 404 Not Found within 10s");
+}
+
+#[test]
+fn a_service_slower_to_answer_than_a_second_is_still_ready() {
+    let port = free_port();
+    let server = temp_path("slow.py");
+    std::fs::write(
+        &server,
+        "import socket, sys, threading, time\nport = int(sys.argv[1])\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', port))\ns.listen()\ndef serve(c):\n    c.recv(65536)\n    time.sleep(1.5)\n    c.sendall(b'HTTP/1.1 200 OK\\r\\ncontent-length: 4\\r\\nconnection: close\\r\\n\\r\\nslow')\n    c.close()\nwhile True:\n    c, _ = s.accept()\n    threading.Thread(target=serve, args=(c,), daemon=True).start()\n",
+    )
+    .unwrap();
+    let script = script(
+        "slow-service",
+        "",
+        &format!(
+            "start slow = python3 {} {port} at http://127.0.0.1:{port}/ within 10s\n",
+            server.display()
+        ),
+    );
+    runs(&script);
 }
 
 #[test]
 fn a_service_that_stops_before_it_answers_shows_what_it_said() {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     for (command, said) in [
         (
             "true",
@@ -5087,11 +5133,16 @@ fn a_service_that_stops_before_it_answers_shows_what_it_said() {
             "echo boom; exit 3",
             "quiet stopped (exit status: 3) before http://127.0.0.1:PORT/ answered; quiet said:\nboom",
         ),
+        (
+            "python3 -c \"import socket, time; s = socket.socket(); s.bind(('127.0.0.1', PORT)); s.listen(); time.sleep(300)\" & sleep 1; echo gone; exit 4",
+            "quiet stopped (exit status: 4) before http://127.0.0.1:PORT/ answered; quiet said:\ngone",
+        ),
     ] {
         let script = script(
             "quiet",
             "",
-            &format!("start quiet = {command} at http://127.0.0.1:{port}/\n"),
+            &format!("start quiet = {command} at http://127.0.0.1:PORT/ within 20s\n")
+                .replace("PORT", &port.to_string()),
         );
         let report = exits(2, act(&script, None, false));
         assert!(
@@ -5101,16 +5152,13 @@ fn a_service_that_stops_before_it_answers_shows_what_it_said() {
                 .ends_with(&said.replace("PORT", &port.to_string())),
             "{report}"
         );
+        assert!(report["seconds"].as_f64().unwrap() < 10.0, "{report}");
     }
 }
 
 #[test]
 fn each_request_opens_its_own_connection() {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let server = temp_path("counting.py");
     std::fs::write(
         &server,
@@ -5130,11 +5178,7 @@ fn each_request_opens_its_own_connection() {
 
 #[test]
 fn see_within_keeps_asking_while_the_server_is_down_for_a_moment() {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let server = temp_path("flaky.py");
     std::fs::write(
         &server,
